@@ -2,61 +2,55 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 
 /**
- * 表单行的间距必须与宿主设置页一致。
+ * 表单结构：**一张卡片 + 无分隔线 + 紧凑间距**。
  *
- * 依据是官方 `dsh-client-ui-settings-general` 里的真实 CSS：
+ * 历史（三次改动的来龙去脉，避免以后又改回去）：
  *
- *   .PgWN5G_row {
- *     border-bottom: .5px solid var(--dsw-alias-border-l2);
- *     gap: 24px;
- *     padding: 16px 0;
- *   }
+ *   1. 最初每项都画 `border-bottom`，视觉上是一排贯穿全宽的横杠
+ *      —— 用户："为什么会有横杠杠"。
+ *   2. 改成「每项一张小卡片」，又太碎
+ *      —— 用户："所有的设置一张卡片"。
+ *   3. 现在：外层一张卡片，里面各设置项靠 gap 分隔，**没有任何 border**。
  *
- * 之前我的实现是 `padding: 12px 0` + `margin-top: 2px` + 容器 `gap: 12px`，
- * 相邻两行的实际距离 ≈ 44px，比官方松一倍多。
- *
- * 这组测试**读源码里的真实值**，而不是断言一份常量副本 —— 后者改错了也不会红。
+ * 这组测试同时断言"有卡片"和"项内无边框"，缺一个都会退回旧形态。
  */
 const source = readFileSync('src/client/index.tsx', 'utf8')
 
-/** 在源码里截取某个标记之后的片段，便于断言具体数值。 */
+/** 截取某标记之后的片段。 */
 function sliceAfter(marker: string, length = 900): string {
   const at = source.indexOf(marker)
   return at < 0 ? '' : source.slice(at, at + length)
 }
 
-describe('form row metrics match the host settings page', () => {
-  it('uses the host column gap (24px)', () => {
-    const row = sliceAfter("display: 'grid',", 700)
-    expect(row, '行应是网格布局').not.toBe('')
-    expect(row, "列间距应为 24px（官方 PgWN5G_row）").toContain("columnGap: '24px'")
+describe('settings form layout', () => {
+  // 从 <section 开始截，才能同时看到 border / borderRadius / gap 三行。
+  const card = sliceAfter('      <section\n        style={{', 500)
+
+  it('wraps all settings in a single card', () => {
+    // 卡片特征：描边 + 圆角 + 底色，三样齐全。
+    expect(card).toContain("border: '1px solid var(--dsw-alias-border-l1")
+    expect(card).toContain("borderRadius: 'var(--dsw-radius-lg, 12px)'")
+    expect(card).toContain("background: 'var(--dsw-alias-bg-layer-2, transparent)'")
   })
 
-  it('uses the host block padding (16px)', () => {
-    const row = sliceAfter("display: 'grid',", 900)
-    // 首行下方也留 16px，其余行上下各 16px。
-    // 注意 `?.` 在正则里 `?` 是量词，必须转义成 `\?`。
-    expect(row).toMatch(/padding: spec\.key === FIELDS\[0\]\?\.key \? '0 0 16px' : '16px 0'/)
+  it('does not draw dividers between settings', () => {
+    // 项与项之间不能有分隔线 —— 那正是用户要的"不要分割"。
+    const row = sliceAfter("gridTemplateColumns: '150px minmax(0, 1fr)',", 300)
+    expect(row, '定位失败：没截到设置项').not.toBe('')
+    expect(row, '设置项不应有边框').not.toMatch(/border(Top|Bottom)?:\s*['"]/)
   })
 
-  it('uses a hairline divider, not a full pixel', () => {
-    const row = sliceAfter("display: 'grid',", 1100)
-    expect(row, '官方是 .5px，不是 1px').toContain("'.5px solid var(--dsw-alias-border-l2")
+  it('keeps rows tight', () => {
+    // 卡片内 gap 收紧到 12px，行内列间距 16px。
+    expect(card).toContain("gap: '12px'")
+    const row = sliceAfter("gridTemplateColumns: '150px minmax(0, 1fr)',", 300)
+    expect(row).toContain("columnGap: '16px'")
   })
 
-  it('does not add container gap on top of row padding', () => {
-    // 这是"间隔太大"的根因：行自带 16px padding，容器再加 gap 就叠加了。
-    // 用卡片独有的 `padding: '4px 20px 8px'` 定位 —— 这个组合只出现在卡片上，
-    // 别的标记（如 bg-layer-2）在文件里出现多次，indexOf 会撞到靠前的位置。
-    const card = sliceAfter("padding: '4px 20px 8px',", 300)
-    expect(card, '定位失败：没截到卡片容器').not.toBe('')
-    expect(card, '卡片容器不应再额外加 gap').toContain("gap: '0'")
-  })
-
-  it('neighbour distance stays at twice the row padding (32px)', () => {
-    // 两行之间 = 上行 padding-bottom(16) + 容器 gap(0) + 下行 padding-top(16)
-    expect(16 + 0 + 16).toBe(32)
-    // 旧实现的 44px 明显更松，这个比较说明修的是什么。
-    expect(16 + 0 + 16).toBeLessThan(16 + 12 + 16)
+  it('does not use per-item padding to fake separation', () => {
+    // 每项不再自带 16px 上下 padding（那是横线形态留下的），
+    // 否则「稍微靠近点」又会被撑开。
+    const row = sliceAfter("gridTemplateColumns: '150px minmax(0, 1fr)',", 400)
+    expect(row).not.toMatch(/padding:\s*'16px 0'/)
   })
 })

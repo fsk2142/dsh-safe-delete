@@ -720,6 +720,14 @@ export function SafeZoneSettings(): ReactElement {
           </li>
         ))}
       </ul>
+      {/*
+        指向手写文档。面板里这些行是程序记录的**现象**，而每一步"为什么查它、
+        显示 ✗ 时怎么办"写在 docs/DIAGNOSTICS.md 里 —— 那里能写表格和排查组合，
+        塞进这个面板会喧宾夺主。
+      */}
+      <div style={{ marginTop: '8px', lineHeight: '1.6' }}>
+        各步骤的含义与排查方法见仓库 <code>docs/DIAGNOSTICS.md</code>。
+      </div>
     </details>
   )
 
@@ -795,22 +803,25 @@ export function SafeZoneSettings(): ReactElement {
         "保存成功但回读不到"）恰恰看不到 —— 那些都是 status='ready'。
       */}
       {diagPanel}
-      {/* 卡片：与宿主设置页一致的容器语言（底色 + 描边 + 圆角）。 */}
+      {/*
+        **一张卡片装下所有设置，项与项之间没有分隔线。**
+
+        形态：外层一个带描边+圆角+底色的卡片；里面是标题 + 各设置项，
+        项间只用 12px 垂直间距分开 —— 就是普通设置页的样子。
+        之前每项都带 border-bottom，视觉上是一排贯穿全宽的横杠。
+      */}
       <section
         style={{
           border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
           borderRadius: 'var(--dsw-radius-lg, 12px)',
           background: 'var(--dsw-alias-bg-layer-2, transparent)',
-          padding: '4px 20px 8px',
+          padding: '14px 16px',
           display: 'flex',
           flexDirection: 'column',
-          // gap 为 0：行自带的 `padding: 16px 0` 已经提供了间距。
-          // 之前这里再加 12px，实际行距变成 44px —— 比官方设置页松一倍多，
-          // 这就是"每个设置之间间隔还是太大"的直接原因。
-          gap: '0',
+          gap: '12px',
         }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', padding: '16px 0 12px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
           <span style={{ fontWeight: 600, fontSize: '13px', color: 'var(--dsw-alias-label-primary, inherit)' }}>
             安全区设置
           </span>
@@ -860,25 +871,16 @@ export function SafeZoneSettings(): ReactElement {
             <div
               key={spec.key}
               style={{
-                // 用两列网格代替「label 固定宽度 + 说明硬编码 marginLeft」。
+                // 一项 = 两列网格（标签 | 输入+说明）。
                 //
-                // 为什么改：`marginLeft: '160px'` 在窄容器里会把说明文字挤出卡片，
-                // 换行后与下一字段的行首错位 —— 看上去就像"行间距乱了"。
-                // 网格让说明自动对齐到输入框那一列，且容器变窄时不会溢出。
+                // 不画任何边框/底色：整组设置共用外层那一张卡片，项与项之间靠
+                // 外层 gap 分隔。之前每项都带 border-bottom，视觉上是一排贯穿
+                // 全宽的横杠（用户原话："为什么会有横杠杠"）。
                 display: 'grid',
                 gridTemplateColumns: '150px minmax(0, 1fr)',
-                // 与官方设置页一致：`.PgWN5G_row { gap: 24px; padding: 16px 0 }`
-                columnGap: '24px',
+                columnGap: '16px',
                 rowGap: '4px',
                 alignItems: 'center',
-                // 官方用的是 `border-bottom: .5px solid` 加 `padding: 16px 0`，
-                // 也就是**每行自带上下 padding、分隔线在底部**。之前我用
-                // borderTop + 12px padding + 2px margin，视觉上比官方松且线更粗。
-                padding: spec.key === FIELDS[0]?.key ? '0 0 16px' : '16px 0',
-                borderBottom:
-                  spec.key === FIELDS[FIELDS.length - 1]?.key
-                    ? 'none'
-                    : '.5px solid var(--dsw-alias-border-l2, #e3e8f0)',
               }}
             >
               <label
