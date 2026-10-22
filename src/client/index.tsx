@@ -290,6 +290,19 @@ function unwrapRemote(result: unknown): { ok: true; value: unknown } | { ok: fal
 let settingsRemote: SettingsRemote | undefined
 
 /**
+ * 注入 remote（**仅测试用**）。
+ *
+ * 为什么需要它：组件通过模块变量拿 remote，`apply` 才能在真实宿主里填这个值。
+ * 但测试里没有宿主，没有这个入口就无法把组件挂到真实 DOM 上驱动交互 ——
+ * 而「只测纯函数、不测交互」正是「单位选了存不进去」连续两版没被发现的原因。
+ *
+ * @param remote 假的 settings remote。
+ */
+export function __setRemoteForTest(remote: SettingsRemote | undefined): void {
+  settingsRemote = remote
+}
+
+/**
  * 表单组件里取 remote。
  *
  * @returns 宿主提供的 settings remote；不可用时 `undefined`。
@@ -397,20 +410,33 @@ export function SafeZoneSettings(): ReactElement {
     setSaved(false)
   }, [])
 
-  /** 校验并转成实际值；返回 undefined 表示不合法。 */
+  /**
+   * 校验并转成实际值；返回 undefined 表示不合法。
+   *
+   * ## 顺序至关重要
+   *
+   * 必须**先换算成字节/毫秒，再和 min/max 比较**。反过来的话，`min`/`max` 是
+   * 以毫秒计的（如 60000），而用户填的是显示单位下的数字（如 2 天）——
+   * 2 < 60000，于是任何正常输入都被判定非法，保存永远失败，界面只给一句
+   * 「填一个不小于下限的数字」。这正是「定时清理间隔写不进去」的根因。
+   *
+   * @param spec 字段。
+   * @param raw 输入框里的原始文本（显示单位下的数字）。
+   * @returns 换算后的字节/毫秒；不合法时 undefined。
+   */
   const coerce = useCallback((spec: FieldSpec, raw: unknown): number | undefined => {
     const text = typeof raw === 'string' ? raw.trim() : String(raw ?? '')
     if (text === '') return spec.min === 0 ? 0 : undefined
     const amount = Number(text)
     if (!Number.isFinite(amount) || amount < 0) return undefined
-    if (spec.min !== undefined && amount < spec.min) return undefined
-    if (spec.max !== undefined && amount > spec.max) return undefined
+
+    // 第一步：把显示数值换算成真实单位（字节 / 毫秒）。
+    let value: number
     if (spec.kind === 'bytes') {
       // 单位跟着输入框一起存在 values 里（`<key>.unit`），由用户切换。
       const unit = values[`${spec.key}.unit`] === 'MB' ? MB : GB
-      return Math.round(amount * unit)
-    }
-    if (spec.kind === 'duration') {
+      value = Math.round(amount * unit)
+    } else if (spec.kind === 'duration') {
       // 单位来自独立的 `.unit` 键（用户在下拉里选）。
       //
       // 兜底必须与**显示侧**用同一个判定，否则会出现「显示 24 小时、保存成 24 天」
@@ -426,9 +452,15 @@ export function SafeZoneSettings(): ReactElement {
             : naturalDurationUnit(numericOf(values, spec.key, 0)) === 'day'
               ? day
               : 60 * 60 * 1000
-      return Math.round(amount * unit)
+      value = Math.round(amount * unit)
+    } else {
+      value = amount
     }
-    return amount
+
+    // 第二步：拿**换算后**的值和边界比较。
+    if (spec.min !== undefined && value < spec.min) return undefined
+    if (spec.max !== undefined && value > spec.max) return undefined
+    return value
   }, [values])
 
   /**
@@ -731,27 +763,36 @@ export function SafeZoneSettings(): ReactElement {
             <div
               key={spec.key}
               style={{
-                display: 'flex',
-                flexDirection: 'column',
-                // 标签行与说明行之间的间距：原来 6px 偏松，收紧到 2px 让两行读成一组。
-                gap: '2px',
+                // 用两列网格代替「label 固定宽度 + 说明硬编码 marginLeft」。
+                //
+                // 为什么改：`marginLeft: '160px'` 在窄容器里会把说明文字挤出卡片，
+                // 换行后与下一字段的行首错位 —— 看上去就像"行间距乱了"。
+                // 网格让说明自动对齐到输入框那一列，且容器变窄时不会溢出。
+                display: 'grid',
+                gridTemplateColumns: '150px minmax(0, 1fr)',
+                columnGap: '10px',
+                rowGap: '3px',
+                alignItems: 'center',
                 // 条目之间用细分隔线分组，而不是靠大间距 —— 设置页的常见做法。
-                paddingTop: spec.key === FIELDS[0]?.key ? '0' : '10px',
+                paddingTop: spec.key === FIELDS[0]?.key ? '0' : '12px',
                 borderTop:
                   spec.key === FIELDS[0]?.key ? 'none' : '1px solid var(--dsw-alias-border-l1, #edeff4)',
+                // 分隔线与上方内容留出呼吸，否则线会贴着上一行文字。
+                marginTop: spec.key === FIELDS[0]?.key ? '0' : '2px',
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                <label
-                  htmlFor={`dsd-${spec.key}`}
-                  style={{
-                    fontSize: '13px',
-                    minWidth: '150px',
-                    color: 'var(--dsw-alias-label-primary, inherit)',
-                  }}
-                >
-                  {spec.label}
-                </label>
+              <label
+                htmlFor={`dsd-${spec.key}`}
+                style={{
+                  fontSize: '13px',
+                  color: 'var(--dsw-alias-label-primary, inherit)',
+                  // 与输入框baseline对齐更好看；网格行内居中已足够，这里不额外加。
+                  lineHeight: '1.4',
+                }}
+              >
+                {spec.label}
+              </label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                 <input
                   id={`dsd-${spec.key}`}
                   aria-label={spec.label}
@@ -792,13 +833,14 @@ export function SafeZoneSettings(): ReactElement {
                   <span style={{ fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>{unit}</span>
                 ) : null}
               </div>
+              {/* 第二列（说明/错误）：放在网格第 2 列，自动与输入框左边缘对齐。 */}
               <span
                 style={{
+                  gridColumn: '2',
                   fontSize: '12px',
                   lineHeight: '1.45',
                   color: 'var(--dsw-alias-label-caption, #8a94a6)',
-                  // 与输入框左边缘对齐（label 的 minWidth + gap）。
-                  marginLeft: '160px',
+                  marginTop: '1px',
                 }}
               >
                 {spec.hint}
@@ -806,9 +848,9 @@ export function SafeZoneSettings(): ReactElement {
               {errors[spec.key] !== undefined ? (
                 <span
                   style={{
+                    gridColumn: '2',
                     fontSize: '12px',
                     color: 'var(--dsw-alias-state-error-primary, #d33)',
-                    marginLeft: '160px',
                   }}
                 >
                   {errors[spec.key]}
