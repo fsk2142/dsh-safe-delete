@@ -38,9 +38,18 @@ dsh plugin --profile <profile> add link:<本地路径>
 dsh plugin --profile <profile> add dsh-safe-delete
 ```
 
-**前提**：会话的审批策略必须是 `ask`。在 `never` 下（例如 `danger-full-access`
-权限预设），`ask` 会被直接驳回、卡片不出现 —— 拦车闸仍然工作，但安全删除不可用。
-这是刻意的 fail-closed：**没有审批通道，就不许删。**
+**审批策略**：审批卡片只在会话策略为 `ask` 时出现。在 `never` 下（例如
+`danger-full-access` 权限预设），宿主会在派发前驳回 `ask`，卡片根本不会显示。
+
+此时本插件**降级为放行**：文件照常移入安全区、照常可以取回，但**危险路径
+（家目录、profile 清单、`node_modules`、安装目录）失去那一次当面确认**，
+只剩「可恢复」这一层保护。
+
+这是有意的取舍：`never` 通常意味着用户就是要连续干活，此时把删除全部禁掉
+只会让人关掉整个插件。代价必须说清楚 —— **如果你需要在删除危险路径时被当面
+问一次，请把权限预设换成使用 `ask` 的那种。**
+
+拦车闸（裸 shell 删除）与写入保护不受审批策略影响，始终生效。
 
 ## 用
 
@@ -156,8 +165,9 @@ dsh-safe-delete journal
 ```bash
 pnpm install
 pnpm typecheck     # 类型检查
-pnpm vitest run    # 测试
+pnpm vitest run    # 全部测试
 pnpm build         # 产物到 lib/（必须一起提交）
+node scripts/clean-test-tmp.mjs   # 清掉测试遗留的临时目录
 ```
 
 `lib/` 是发布产物且**必须进版本库**：`main` 与 `cordis.patch.yml` 都指向它。
@@ -187,18 +197,7 @@ pnpm build         # 产物到 lib/（必须一起提交）
 - **需要审批的删除在终端里做不到**：CLI 没有审批通道，`delete` 遇到这类路径会
   拒绝并提示改用 DSH 内的 `/safe-delete`。
 - **配置改动需重启生效**：值本身立即写入，但拦截线是在启动时装配的。
-
-## 开发
-
-```bash
-pnpm install
-pnpm typecheck     # 类型检查
-pnpm vitest run    # 73 个测试
-pnpm build         # 产物到 lib/（必须一起提交）
-node scripts/clean-test-tmp.mjs   # 清掉测试遗留的临时目录
-```
-
-`lib/` 是发布产物且**必须进版本库**：`main` 与 `cordis.patch.yml` 都指向它，
-不提交的话克隆下来直接安装会加载不到。改完 `src/` 记得重新 `pnpm build`。
+- **`schemastery` 由宿主提供**：它是 peer 依赖，`link:` 裸装时能否解析取决于
+  宿主环境；用 `dsh plugin add` 安装则由宿主的依赖解析兜住。
 
 验收清单见 [`docs/VERIFY.md`](docs/VERIFY.md)。

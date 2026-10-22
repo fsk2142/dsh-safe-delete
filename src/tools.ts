@@ -72,6 +72,13 @@ export interface ToolDeps {
   /** 单次删除的字节数阈值：超过就额外要一次人工确认。`0` 表示不启用。 */
   confirmBytes?: number
   /**
+   * 跨卷时是否允许「复制 + 删源」。
+   *
+   * 从配置透传到删除核心 —— 不透传的话这个开关只在 schema 与 README 里存在，
+   * 用户打开它毫无效果。
+   */
+  crossVolumeCopy?: boolean
+  /**
    * 提前清理阈值（0-100）。
    *
    * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
@@ -256,6 +263,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           retentionDays: deps.retentionDays,
           confirmFileCount: deps.confirmFileCount ?? 0,
           confirmBytes: deps.confirmBytes ?? 0,
+          ...(deps.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
           requestApproval: deps.requestApproval,
           now,
           afterMove: () => pruneNow(),
