@@ -385,6 +385,14 @@ export function SafeZoneSettings(): ReactElement {
           }
         }
         note('host namespaces', namespaceSeen, seen.length === 0 ? 'empty list' : seen.join(', '))
+        // 原始形状（截断）：如果宿主返回的字段名不是 ns/id、或者 value 被投影剥离，
+        // 只有看原始 JSON 才能知道。这一步是为了结束"读源码推断"。
+        try {
+          const raw = JSON.stringify(payload)
+          note('describe() raw', true, raw.length > 400 ? `${raw.slice(0, 400)}…` : raw)
+        } catch {
+          note('describe() raw', false, 'not serializable')
+        }
         note(
           'picked namespace value',
           namespaceSeen,
@@ -753,6 +761,12 @@ export function SafeZoneSettings(): ReactElement {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '4px 0' }}>
+      {/*
+        诊断面板在 **ready 状态也要显示**。
+        原来只放在 loading / error 分支里，于是最需要它的场景（"读到了但读的是空"、
+        "保存成功但回读不到"）恰恰看不到 —— 那些都是 status='ready'。
+      */}
+      {diagPanel}
       {/* 卡片：与宿主设置页一致的容器语言（底色 + 描边 + 圆角）。 */}
       <section
         style={{
