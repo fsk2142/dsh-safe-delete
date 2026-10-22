@@ -1,0 +1,22 @@
+fix: align the settings form with the host remote contract
+
+Verified against the shape dsh-llm-account recorded from a real host; the
+previous version was written from the docs alone and would have failed
+silently.
+
+- describe() returns an object with `namespaces`, and a namespace is
+  identified by `ns`, not `name`. The old code looked for `name`, so it
+  never matched: the form would render defaults and ignore stored values.
+- mutate() is `mutate(ns, ops, revision)` with `{op:'set', path:[key],
+  value}` entries, not a flat `{name, value}` object.
+- host failures resolve as `{ ok:false, error }` instead of rejecting, so
+  a rejected save was reported as success. Now unwrapped.
+- the revision read with the snapshot is now carried into the write and
+  refreshed after it, otherwise a second save collides with the revision
+  its own first save produced.
+- shape is validated before field access: a null entry in the array used
+  to throw and leave the panel stuck on "loading" with no message.
+- a synchronous ref guards the save button; `saving` state alone lets two
+  clicks in one frame both pass and issue competing writes.
+- apply() wraps each step in a named guard, matching the host rule that
+  one throw marks the whole client bundle as failed to activate.

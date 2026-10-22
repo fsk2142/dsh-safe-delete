@@ -15,7 +15,7 @@
  * @module dsh-safe-delete/client
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 
 /** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
@@ -92,10 +92,16 @@ const FIELDS: FieldSpec[] = [
   },
 ]
 
-/** 宿主 settings 远程面的最小形状。 */
+/** 宿主 settings 远程面的最小形状（与宿主真实契约一致）。 */
 interface SettingsRemote {
+  /** 返回 `{ writable, hasDocument, namespaces }`；命名空间身份字段是 `ns`。 */
   describe?: () => Promise<unknown>
-  mutate?: (request: unknown) => Promise<unknown>
+  /** `mutate(ns, ops, revision)`；ops 为 `{op:'set', path:[key], value}`。 */
+  mutate?: (
+    ns: string,
+    ops: readonly { op: 'set'; path: readonly string[]; value: unknown }[],
+    revision?: number,
+  ) => Promise<unknown>
 }
 
 /** 客户端上下文的最小形状。 */
@@ -134,34 +140,89 @@ function numericOf(source: Record<string, unknown>, key: string, fallback: numbe
 }
 
 /**
- * 从 `describe()` 的返回里找出本命名空间的配置值。
+ * 从 `describe()` 的返回里取出本命名空间的视图。
  *
- * 形状随宿主版本可能不同（顶层数组 / `{namespaces}` / 直接对象），
- * 所以三种都认 —— 认不出就当成空对象，让界面显示默认值而不是崩掉。
+ * 宿主实际返回的是**一个对象**（不是裸数组）：
+ * ```js
+ * { writable, hasDocument, namespaces: [ { ns, schema, value, revision, … } ] }
+ * ```
+ * 注意名字空间的身份字段是 **`ns`**，不是 `name` / `id` —— 用错字段就永远匹配不上，
+ * 表现是「页面显示不出设置」，且不报错。
+ *
+ * 兼容处理：裸数组、以及带 `ns` 的单个对象也认，认不出就返回空，让界面显示默认值。
  */
-function pickNamespace(payload: unknown): Record<string, unknown> {
-  const dig = (node: unknown, depth: number): Record<string, unknown> | undefined => {
-    if (depth > 4 || node === null || typeof node !== 'object') return undefined
-    const record = node as Record<string, unknown>
-    if (Array.isArray(record.namespaces)) {
-      const found = record.namespaces.find(
-        (item) => item !== null && typeof item === 'object' && (item as Record<string, unknown>).name === NAMESPACE,
-      )
-      if (found !== undefined) {
-        const value = (found as Record<string, unknown>).value
-        return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {}
-      }
+interface NamespaceView {
+  value: Record<string, unknown>
+  revision: number | undefined
+}
+
+function pickNamespace(payload: unknown): NamespaceView {
+  const empty: NamespaceView = { value: {}, revision: undefined }
+
+  const fromEntry = (entry: unknown): NamespaceView | undefined => {
+    // 形状不可信：宿主返回的数组里可能混进 null 或非对象。直接读 `entry.ns`
+    // 会抛 TypeError，而调用点在一个 effect 里 —— 一个坏元素就能让设置页永远
+    // 停在「正在读取配置…」，且没有任何提示。先验形状，再读字段。
+    if (entry === null || typeof entry !== 'object') return undefined
+    const record = entry as Record<string, unknown>
+    // 身份字段是 `ns`；`id` 是另一套（profile 行 id）。这里两者都认，
+    // 因为本插件的包名、行 id 与命名空间恰好相同，用哪个都能命中。
+    const name = typeof record['ns'] === 'string' ? record['ns'] : record['id']
+    if (name !== NAMESPACE) return undefined
+    const value = record['value']
+    return {
+      value: value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {},
+      revision: typeof record['revision'] === 'number' ? record['revision'] : undefined,
     }
-    if (record.name === NAMESPACE && record.value !== null && typeof record.value === 'object') {
-      return record.value as Record<string, unknown>
-    }
-    for (const value of Object.values(record)) {
-      const deeper = dig(value, depth + 1)
-      if (deeper !== undefined) return deeper
-    }
-    return undefined
   }
-  return dig(payload, 0) ?? {}
+
+  if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      const found = fromEntry(entry)
+      if (found !== undefined) return found
+    }
+    return empty
+  }
+
+  if (payload !== null && typeof payload === 'object') {
+    const record = payload as Record<string, unknown>
+    if (Array.isArray(record['namespaces'])) {
+      for (const entry of record['namespaces']) {
+        const found = fromEntry(entry)
+        if (found !== undefined) return found
+      }
+      return empty
+    }
+    const direct = fromEntry(payload)
+    if (direct !== undefined) return direct
+  }
+
+  return empty
+}
+
+/**
+ * 拆宿主的远程信封。
+ *
+ * 宿主契约：**失败不 reject，而是 resolve 成 `{ ok: false, error }`**。
+ * 不拆就会把一次被拒绝的保存当成成功 —— 用户以为存上了，实际没有。
+ */
+function unwrapRemote(result: unknown): { ok: true; value: unknown } | { ok: false; error: string } {
+  if (result === null || typeof result !== 'object' || !('ok' in (result as object))) {
+    return { ok: true, value: result }
+  }
+  const envelope = result as { ok?: unknown; value?: unknown; error?: unknown }
+  if (envelope.ok === true) return { ok: true, value: envelope.value }
+  if (envelope.ok === false) {
+    const error = envelope.error
+    const text =
+      typeof error === 'string'
+        ? error
+        : error !== null && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string'
+          ? `${String((error as { code?: unknown }).code ?? '')} ${(error as { message: string }).message}`.trim()
+          : '宿主拒绝了这次保存'
+    return { ok: false, error: text }
+  }
+  return { ok: true, value: result }
 }
 
 /** 表单组件。 */
@@ -172,6 +233,16 @@ export function SafeZoneSettings(): ReactElement {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  /** 读到的修订号：宿主的并发围栏，写入必须带上它。 */
+  const [revision, setRevision] = useState<number | undefined>(undefined)
+  /**
+   * 写入在途的**同步**守卫。
+   *
+   * 为什么不能只靠 `saving`：它是 state，同一帧里连点两次时两次都会读到
+   * `saving === false`，于是发出两份写入 —— 第二份拿着过期修订号，会被宿主
+   * 当作冲突拒绝，用户看到「刚改的又被改回去」。
+   */
+  const savingRef = useRef(false)
 
   const remote = useMemo<SettingsRemote | undefined>(() => {
     const ctx = (globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx
@@ -191,8 +262,17 @@ export function SafeZoneSettings(): ReactElement {
       try {
         const payload = await remote.describe()
         if (!alive) return
-        setValues(pickNamespace(payload))
+        const view = pickNamespace(payload)
+        setValues(view.value)
+        setRevision(view.revision)
+        // 「读到了但没这个命名空间」不等于「配置全空」——那是两种不同的病因。
+        // 前者说明插件没装进 profile 或命名空间不匹配，后者只是还没改过配置。
+        // 混为一谈会让人以为「配置丢了」，而实际什么都没发生。
+        const namespaceSeen = Object.keys(view.value).length > 0
         setStatus('ready')
+        if (!namespaceSeen) {
+          setMessage('没有读到本插件的配置（显示的是默认值）。若刚安装，重启 DSH 后再看。')
+        }
       } catch (error) {
         if (!alive) return
         setStatus('error')
@@ -261,18 +341,52 @@ export function SafeZoneSettings(): ReactElement {
       return
     }
 
+    // 同步守卫：同一帧内的第二次点击在这里被挡掉。
+    if (savingRef.current) return
+    savingRef.current = true
     setSaving(true)
     setMessage('')
     try {
-      await remote.mutate({ name: NAMESPACE, value: payload })
+      // 真实契约：`mutate(ns, ops, revision)`，ops 是 `{ op:'set', path:[key], value }`
+      // 的数组，不是 `{ name, value }` 这种扁平形状。
+      const ops = Object.entries(payload).map(([key, value]) => ({
+        op: 'set' as const,
+        path: [key],
+        value,
+      }))
+      const result = await remote.mutate(NAMESPACE, ops, revision)
+      // 宿主契约：失败**不 reject**，而是 resolve 成 `{ ok:false, error }`。
+      // 不拆信封就会把被拒绝的保存当成成功。
+      const unwrapped = unwrapRemote(result)
+      if (!unwrapped.ok) {
+        setMessage(`保存失败：${unwrapped.error}`)
+        return
+      }
+      // 成功后重新读一次，拿到新的修订号；否则连续两次保存会撞上自己上一次
+      // 产生的修订号，第二次被当作冲突拒绝。
+      try {
+        const refreshed = remote.describe === undefined ? undefined : await remote.describe()
+        if (refreshed !== undefined) {
+          const view = pickNamespace(refreshed)
+          setRevision(view.revision)
+          // 清掉草稿：现在它们已经和磁盘一致了。
+          setValues(
+            Object.fromEntries(Object.entries(view.value).filter(([key]) => !key.endsWith('.draft'))),
+          )
+        }
+      } catch {
+        /* 重新读取失败不影响「已保存」这个结论 */
+      }
       setSaved(true)
       setMessage('已保存。重启 DSH 生效。')
     } catch (error) {
       setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
+      // 两处都要复位：state 驱动按钮外观，ref 驱动同步守卫。
+      savingRef.current = false
       setSaving(false)
     }
-  }, [coerce, remote, values])
+  }, [coerce, remote, revision, values])
 
   if (status === 'loading') return <div style={{ padding: '12px 0' }}>正在读取配置…</div>
   if (status === 'error') {
@@ -393,19 +507,26 @@ export const inject = ['slots', 'locale', 'remote.settings']
 /**
  * 注册表单到插件页。
  *
- * 每一步单独兜住：`apply` 里任何一处抛错都会让宿主把整个客户端包判为「激活失败」，
- * 表现是插件页里什么都没有、控制台只有一行。分开捕获后，失败的那一步会被指出来，
- * 其余照常。
+ * 每一步单独兜住：`apply` 里任何一处抛错都会让宿主把**整个客户端包**判为
+ * 「激活失败」，表现是插件页里什么都没有、控制台只有一行。分开捕获后，
+ * 失败的那一步会被指名道姓地打出来，其余步骤照常。
  */
 export function apply(ctx: ClientContext): void {
-  try {
-    // 表单组件要从模块作用域拿到 remote.settings，这里把它挂上去。
-    ;(globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx = ctx
-  } catch {
-    /* 不重要 */
+  const guarded = (step: string, run: () => void): void => {
+    try {
+      run()
+    } catch (error) {
+      // 用 console.error 而不是 warn：激活失败要能在控制台里一眼看到。
+      console.error(`[dsh-safe-delete] ${step} failed:`, error)
+    }
   }
 
-  try {
+  guarded('expose settings remote to the form', () => {
+    // 表单组件要从模块作用域拿到 remote.settings，这里把它挂上去。
+    ;(globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx = ctx
+  })
+
+  guarded('register the settings form on the plugin page', () => {
     ctx.slots?.inject?.('plugins.row.config', () => {
       ctx.slots?.register?.(
         {
@@ -415,11 +536,9 @@ export function apply(ctx: ClientContext): void {
         },
         // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
         // 传一个 `{ view, panel }` 的对象是错的 —— 宿主会把它当成组件去调用，
-        // 结果是一个不可渲染的对象，表单根本不出现（而且不报错）。
+        // 结果是一个不可渲染的值，表单根本不出现（而且不报错）。
         ({ view }: { view?: string }) => (view === 'summary' ? '安全区设置' : <SafeZoneSettings />),
       )
     })
-  } catch (error) {
-    console.warn('[dsh-safe-delete] 注册设置表单失败', error)
-  }
+  })
 }
