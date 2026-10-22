@@ -20,10 +20,12 @@
 import os from 'node:os'
 import path from 'node:path'
 
+import { appendAudit } from './audit'
 import type { ClassifyEnv } from './classify'
 import { classifyPath, requiresApproval } from './classify'
 import { isUnresolvableTarget, parseCommand } from './command'
 import { describeTarget } from './describe'
+import { appliesStop, recordDenial, stopClause } from './escalate'
 import { createTools, type ApprovalOutcome, type ToolDefinition } from './tools'
 
 export const name = 'dsh-safe-delete'
@@ -53,6 +55,14 @@ export interface SafeDeleteConfig {
   crossVolumeCopy?: boolean
   /** 拦截开关；默认 true。 */
   blockShellDeletes?: boolean
+  /** 是否拦截对启动关键路径的写入；默认 true。 */
+  blockProtectedWrites?: boolean
+  /**
+   * 覆盖用户主目录（测试用）。
+   *
+   * 生产环境不该设置它 —— 分类器默认取 `os.homedir()`。
+   */
+  homeDir?: string
 }
 
 /** 插件上下文的最小结构；真实 cordis Context 是它的超集。 */
@@ -83,10 +93,41 @@ function resolveDshHome(): string {
   return path.join(os.homedir(), '.dsh')
 }
 
+/**
+ * 从一个写入类工具调用里取出它要写的绝对路径。
+ *
+ * 已核实的参数字段：`write` / `edit` 用 `file_path`，`str_replace_editor` 用 `path`。
+ *
+ * @returns 目标路径；不是写入操作（例如 `str_replace_editor view`）或取不到路径时返回 `null`。
+ */
+function writeTargetOf(toolName: string, args: Record<string, unknown> | undefined): string | null {
+  if (args === undefined) return null
+
+  if (toolName === 'write' || toolName === 'edit') {
+    const raw = args['file_path']
+    if (typeof raw !== 'string' || raw === '') return null
+    return path.resolve(raw)
+  }
+
+  if (toolName === 'str_replace_editor') {
+    // `view` 是只读命令，不拦。
+    const command = args['command']
+    if (command === 'view') return null
+    const raw = args['path']
+    if (typeof raw !== 'string' || raw === '') return null
+    return path.resolve(raw)
+  }
+
+  return null
+}
+
 function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
-  const dshHome = resolveDshHome()
+  // `homeDir` 一旦显式给出，`dshHome` 也从它推导 —— 否则两者会指向不同的树，
+  // 分类器判定的"DSH 目录"就不是配置所指向的那个（测试里尤其明显）。
+  const homeDir = config.homeDir ?? os.homedir()
+  const dshHome = config.homeDir !== undefined ? path.join(config.homeDir, '.dsh') : resolveDshHome()
   const stateDir = path.resolve(config.stateDir ?? path.join(dshHome, '.dsh-safe-delete'))
-  const env: ClassifyEnv = { home: os.homedir(), workdir: process.cwd(), dshHome }
+  const env: ClassifyEnv = { home: homeDir, workdir: process.cwd(), dshHome, safeZoneDir: stateDir }
 
   const retentionDays = typeof config.retentionDays === 'number' && config.retentionDays > 0 ? config.retentionDays : 7
   const maxBytes =
@@ -164,6 +205,49 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     const toolName = exec?.name
     if (toolName === undefined) return next()
 
+    // ── 写保护：启动关键路径不许被写坏 ──────────────────────────────────
+    //
+    // 为什么它比删除保护更靠前：删掉一个文件还能从安全区拿回来；把
+    // `cordis.patch.yml` 或 profile 的 `package.json` 写坏，DSH 下次根本起不来，
+    // 而那时插件也加载不了 —— 没有任何自救通道。所以这一类写入直接拒绝。
+    //
+    // 只拦 `protected`，不拦 `confirm`：家目录里的普通文档可以照常编辑，
+    // 那里只对**删除**要求授权。
+    if (config.blockProtectedWrites !== false) {
+      const writeTarget = writeTargetOf(toolName, exec.arguments)
+      if (writeTarget !== null) {
+        let classification
+        try {
+          classification = classifyPath(writeTarget, env)
+        } catch {
+          classification = undefined
+        }
+        if (classification === 'protected') {
+          const attempts = recordDenial(writeTarget)
+          appendAudit(stateDir, {
+            event: 'block-write',
+            target: writeTarget,
+            tool: toolName,
+            detail: `protected (attempt ${attempts})`,
+          })
+          const escalate = appliesStop(writeTarget)
+          return {
+            kind: 'deny',
+            reason:
+              `Blocked a write to "${writeTarget}": it is boot-critical (a profile manifest, a patch layer, a lockfile, ` +
+              `node_modules, the DSH install directory, or the safe zone's own state). Corrupting it can make DSH fail to ` +
+              `start — and a DSH that does not start cannot load this plugin to help you recover. ` +
+              `If this change is really intended, ask the user to make it themselves; do NOT try to write it through another tool.` +
+              (escalate ? stopClause(attempts) : ''),
+            displayReason: {
+              en: `Blocked a write to a boot-critical file: ${writeTarget}. Ask the user to make this change.`,
+              zh: `已拦下对启动关键文件 ${writeTarget} 的写入。这类改动请让用户自己完成。`,
+            },
+          }
+        }
+      }
+    }
+
     // 自己的删除通道不拦，但危险路径要在这里升成 ask。
     if (toolName === 'safe_delete') {
       const rawPath = exec.arguments?.['path']
@@ -230,6 +314,11 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     // 目标解析不出来（变量、管道、通配）不是"误拦"，而是"看不清"——
     // 交给人类在卡片上看原文决定，而不是替他猜一个路径然后拒绝。
     if (verdict.target === null || isUnresolvableTarget(verdict.target)) {
+      appendAudit(stateDir, {
+        event: 'ask',
+        tool: toolName,
+        detail: `unresolvable target: ${text.trim().slice(0, 200)}`,
+      })
       return {
         kind: 'ask',
         reason:
@@ -242,13 +331,23 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       }
     }
 
+    const attempts = recordDenial(verdict.target)
+    appendAudit(stateDir, {
+      event: 'block-shell',
+      target: verdict.target,
+      tool: toolName,
+      detail: `${verdict.recursive ? 'recursive' : 'non-recursive'} (attempt ${attempts})`,
+    })
+    const escalate = appliesStop(verdict.target)
+
     return {
       kind: 'deny',
       reason:
         `Blocked a raw shell delete of "${verdict.target}" (${verdict.recursive ? 'recursive' : 'non-recursive'}). ` +
         'Deleting through the shell erases data permanently. Use the `safe_delete` tool instead: it moves the target into the ' +
         'safe zone, where it can be restored for a while. Run `safe_delete` with preview:true to see exactly what would be moved, ' +
-        'then call it again to do it. Do not retry this shell command or look for another way around the block.',
+        'then call it again to do it. Do not retry this shell command or look for another way around the block.' +
+        (escalate ? stopClause(attempts) : ''),
       displayReason: {
         en: `Blocked a raw shell delete of "${verdict.target}". Use safe_delete so it can be restored.`,
         zh: `已拦下对 "${verdict.target}" 的原始 shell 删除。请改用 safe_delete，这样还能取回。`,

@@ -26,10 +26,12 @@ export interface FakeCtxOptions {
   /** 传 `undefined` 表示部署里没有审批服务（fail-closed 场景）。 */
   approval?: { request: (req: unknown) => Promise<ApprovalOutcome> } | undefined
   /** 模拟工具注册抛错，验证 fail-soft。 */
-  toolsRegisterRaws?: boolean
+  toolsRegisterRaw?: boolean
   toolsRegisterThrows?: boolean
   /** 会话的审批策略；`never` 表示审批请求会被直接驳回。 */
   approvalPolicy?: 'ask' | 'never'
+  /** 模拟的用户主目录；默认取当前进程的 home。 */
+  home?: string
 }
 
 export interface FakeCtx {
