@@ -367,6 +367,29 @@ export function SafeZoneSettings(): ReactElement {
         // 混为一谈会让人以为「配置丢了」，而实际什么都没发生。
         const namespaceSeen = Object.keys(view.value).length > 0
         setStatus('ready')
+        // 诊断：把宿主**实际返回**的命名空间列表记下来。
+        // 「磁盘上有值但界面显示默认值」这种病，靠读源码推断过两轮都没定位，
+        // 只有把宿主真实返回的形状摆出来才能判断是"没这个 ns"还是"ns 里没值"。
+        const seen: string[] = []
+        const list = Array.isArray(payload)
+          ? payload
+          : (payload as { namespaces?: unknown } | undefined)?.namespaces
+        if (Array.isArray(list)) {
+          for (const item of list) {
+            if (item === null || typeof item !== 'object') continue
+            const rec = item as Record<string, unknown>
+            const name = typeof rec['ns'] === 'string' ? rec['ns'] : rec['id']
+            const value = rec['value']
+            const keys = value !== null && typeof value === 'object' ? Object.keys(value as object) : []
+            seen.push(`${String(name)}(${keys.length} keys)`)
+          }
+        }
+        note('host namespaces', namespaceSeen, seen.length === 0 ? 'empty list' : seen.join(', '))
+        note(
+          'picked namespace value',
+          namespaceSeen,
+          `${Object.keys(view.value).length} keys, revision=${String(view.revision)}`,
+        )
         if (!namespaceSeen) {
           setMessage('没有读到本插件的配置（显示的是默认值）。若刚安装，重启 DSH 后再看。')
         }
@@ -545,21 +568,44 @@ export function SafeZoneSettings(): ReactElement {
       }
       // 成功后重新读一次，拿到新的修订号；否则连续两次保存会撞上自己上一次
       // 产生的修订号，第二次被当作冲突拒绝。
+      // 保存成功后重新读一次，拿到新的修订号。
+      //
+      // ## 为什么不拿刷新结果直接覆盖界面
+      //
+      // 宿主的 `describe()` 在 mutate 之后**可能仍返回旧快照**（写盘成功但内存
+      // 视图未刷新）。原来的代码无条件 `setValues(view.value)`，于是用户看到
+      // 「点保存 → 值瞬间变回原来的」—— 明明保存成功了。
+      //
+      // 现在的规则：**只有当刷新读到的值确实包含我们刚写入的每一项时**，才用它
+      // 覆盖界面；否则只更新 revision，保留用户眼前的输入。宁可显示"未确认"，
+      // 也不要把用户刚改的值抹掉。
       try {
         const refreshed = activeRemote.describe === undefined ? undefined : await activeRemote.describe()
         if (refreshed !== undefined) {
           const view = pickNamespace(refreshed)
           setRevision(view.revision)
-          // 清掉草稿：现在它们已经和磁盘一致了。
-          setValues(
-            Object.fromEntries(Object.entries(view.value).filter(([key]) => !key.endsWith('.draft'))),
-          )
+          const wroteSomething = Object.keys(payload).length > 0
+          const confirmed =
+            wroteSomething &&
+            Object.entries(payload).every(([key, expected]) => {
+              const actual = view.value[key]
+              return typeof actual === 'number' && typeof expected === 'number'
+                ? actual === expected
+                : actual === expected
+            })
+          if (confirmed) {
+            // 读到了新值：清掉草稿，界面与磁盘一致。
+            setValues(Object.fromEntries(Object.entries(view.value).filter(([key]) => !key.endsWith('.draft'))))
+            setMessage('已保存。重启 DSH 生效。')
+          } else {
+            // 没读到新值：保留用户输入，并如实说明「已写入但未能回读确认」。
+            setMessage('已提交保存，但宿主回读到的仍是旧值。重启 DSH 后再确认。')
+          }
         }
       } catch {
         /* 重新读取失败不影响「已保存」这个结论 */
       }
       setSaved(true)
-      setMessage('已保存。重启 DSH 生效。')
     } catch (error) {
       setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
@@ -692,7 +738,10 @@ export function SafeZoneSettings(): ReactElement {
   /** 共享的输入框样式：贴合宿主设计 token，而不是裸默认样式。 */
   const fieldStyle = (invalid: boolean): Record<string, string> => ({
     width: '108px',
-    padding: '6px 10px',
+    // 固定高度：`<input>` 与 `<select>` 的默认内边距/行高不同，不锁高度时
+    // 「定时清理间隔」那一行的数字框和单位下拉会一高一低，看上去像行距错乱。
+    height: '32px',
+    padding: '0 10px',
     borderRadius: 'var(--dsw-radius-md, 8px)',
     border: `1px solid ${invalid ? 'var(--dsw-alias-state-error-primary, #d33)' : 'var(--dsw-alias-border-l2, #c9d1e0)'}`,
     background: 'var(--dsw-alias-bg-layer-1, transparent)',
