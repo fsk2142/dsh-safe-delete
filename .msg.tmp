@@ -1,0 +1,14 @@
+chore: align release tooling and package metadata with team conventions
+
+Fills the gaps identified in the alignment ticket. No business code touched.
+
+- manifest gains repository / homepage / bugs, pointing at the remote
+  verified with `git remote -v`, plus a MIT license field
+- LICENSE (MIT, copyright fsk2142) added at the package root
+- release.mjs, next-version.mjs, next-version.d.mts and find-dead-code.mjs
+  copied from the template; verified none of them hardcode a package name
+  or an absolute path
+- npm scripts version:next / release / dead-code wired up
+
+next-version.mjs correctly reads v0.1.0 as the starting point and derives
+0.2.0 (4 feat commits over 13 since the tag).

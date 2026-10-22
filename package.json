@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Reversible deletion for DeepSeek Harness: shell deletes are intercepted, dangerous paths need in-UI approval, and deletions land in a safe zone you can restore.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fsk2142/dsh-safe-delete.git"
+  },
+  "homepage": "https://github.com/fsk2142/dsh-safe-delete#readme",
+  "bugs": {
+    "url": "https://github.com/fsk2142/dsh-safe-delete/issues"
+  },
   "icon": "./icon.svg",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -55,7 +64,10 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "version:next": "node scripts/next-version.mjs",
+    "release": "node scripts/release.mjs",
+    "dead-code": "node scripts/find-dead-code.mjs ."
   },
   "peerDependencies": {
     "@deepseek-ai/schemastery": "^3.18.2"
