@@ -215,28 +215,35 @@ async function main(argv) {
         process.stdout.write('nothing to prune\n')
         return 0
       }
-      const freed = safeZoneBytes(selected)
+      const totalSelectedBytes = safeZoneBytes(selected)
       if (dryRun) {
         for (const entry of selected) {
           process.stdout.write(`would move to recycle bin ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
         }
-        process.stdout.write(`total: ${selected.length} entr(ies), ${humanBytes(freed)} (dry run — nothing changed)\n`)
+        process.stdout.write(
+          `total: ${selected.length} entr(ies), ${humanBytes(totalSelectedBytes)} (dry run — nothing changed)\n`,
+        )
         return 0
       }
       // 移入系统回收站：失败的条目留在安全区，不永久删除。
+      //
+      // 字节数只能累加**成功移动**的条目。在循环前统计总数会把被跳过的条目也算进
+      // 「已释放」，而它其实还在盘上 —— 那是个会误导人的数字。
       let moved = 0
       let failed = 0
+      let movedBytes = 0
       for (const entry of selected) {
         const result = await store.destroyEntry(stateDir(), entry.id)
         if (result.ok) {
           moved += 1
+          movedBytes += entry.bytes
           process.stdout.write(`recycled ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
         } else {
           failed += 1
           process.stderr.write(`skipped ${entry.id} (${entry.originalPath}): ${result.reason}\n`)
         }
       }
-      process.stdout.write(`total: ${moved} entr(ies) moved to the recycle bin, ${humanBytes(freed)}\n`)
+      process.stdout.write(`total: ${moved} entr(ies) moved to the recycle bin, ${humanBytes(movedBytes)}\n`)
       if (failed > 0) {
         process.stdout.write(
           `${failed} entr(ies) left in the safe zone because the recycle bin was unavailable.\n`,

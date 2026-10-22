@@ -201,6 +201,30 @@ describe('runCommand', () => {
     expect(reply.text).toMatch(/没有需要清理/)
   })
 
+  it('surfaces entries the recycle bin refused', async () => {
+    // 被跳过 ≠ 清理完成。用户必须知道有条目还在安全区、磁盘没释放。
+    const reply = await runCommand('clean', deps({
+      clean: async () => ({
+        removed: ['C:\\a (id1)'],
+        freedBytes: 10,
+        failures: ['C:\\b (id2): recycle bin unavailable'],
+      }),
+    }))
+    expect(reply.kind).toBe('error')
+    expect(reply.text).toContain('未能移入回收站')
+    expect(reply.text).toContain('留在安全区')
+    expect(reply.text).toContain('recycle bin unavailable')
+  })
+
+  it('says the recycle bin is reversible after a clean', async () => {
+    const reply = await runCommand('clean', deps({
+      clean: async () => ({ removed: ['C:\\a (id1)'], freedBytes: 10, failures: [] }),
+    }))
+    expect(reply.kind).toBe('success')
+    expect(reply.text).toContain('已移入回收站')
+    expect(reply.text).toMatch(/清空之前都能还原/)
+  })
+
   it('lists safe-zone entries with their ids', async () => {
     const reply = await runCommand('list', deps({
       listSafeZone: async () => [{ id: 'abc', originalPath: 'C:\\x', expiresAt: Date.now() }],

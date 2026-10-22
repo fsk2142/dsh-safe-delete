@@ -55,14 +55,75 @@ export function canRecycle(): boolean {
 const COMMAND_TIMEOUT_MS = 20_000
 
 /**
+ * 连续失败多少次后熔断。
+ *
+ * 为什么需要：`moveToSystemRecycleBin` 是**同步阻塞**调用（`execFileSync`），
+ * 而且跑在索引串行队列里。如果系统 shell 出了毛病（COM 损坏、超大文件触发
+ * 系统确认对话框），每个条目都可能耗掉 20 秒，一次清理 N 个条目就会卡 N×20 秒，
+ * 期间所有并发的安全区操作都在排队。
+ *
+ * 连续 3 次失败基本可以断定是环境问题而不是偶发，此时熔断：剩下的条目直接
+ * 判定为「跳过」，让调用方带着「回收站不可用」的结果立刻返回，而不是逐个等超时。
+ */
+const FAILURE_BREAKER_THRESHOLD = 3
+
+/** 当前连续失败次数（进程内）。成功一次就归零。 */
+let consecutiveFailures = 0
+
+/**
+ * 回收站是否已被熔断。
+ *
+ * @returns 连续失败达到阈值时返回 `true`。
+ */
+export function recycleIsTripped(): boolean {
+  return consecutiveFailures >= FAILURE_BREAKER_THRESHOLD
+}
+
+/**
+ * 重置熔断状态（测试用，或用户在状态命令里主动重试时）。
+ */
+export function resetRecycleBreaker(): void {
+  consecutiveFailures = 0
+}
+
+/**
  * 把一个路径移入系统回收站。
  *
  * @param absPath 要移入的绝对路径（文件或目录）。
  * @returns 结果；失败时带原因，调用方**不可**据此永久删除。
  */
 export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
-  if (!existsSync(absPath)) return { ok: false, reason: `path does not exist: ${absPath}` }
+  // 熔断：连续失败已达阈值时立刻返回，不再逐个等超时。
+  if (recycleIsTripped()) {
+    return {
+      ok: false,
+      reason:
+        `recycle bin unavailable after ${consecutiveFailures} consecutive failures; ` +
+        'entries stay in the safe zone. Restart DSH to retry.',
+    }
+  }
 
+  if (!existsSync(absPath)) {
+    // 路径本来就不在不算「失败」，不该触发熔断。
+    return { ok: false, reason: `path does not exist: ${absPath}` }
+  }
+
+  const outcome = attemptRecycle(absPath)
+  if (outcome.ok) {
+    consecutiveFailures = 0
+  } else {
+    consecutiveFailures += 1
+  }
+  return outcome
+}
+
+/**
+ * 真正尝试一次回收（不含熔断判定）。
+ *
+ * @param absPath 绝对路径。
+ * @returns 结果。
+ */
+function attemptRecycle(absPath: string): RecycleOutcome {
   try {
     if (process.platform === 'win32') return recycleOnWindows(absPath)
     if (process.platform === 'darwin') return recycleOnMac(absPath)

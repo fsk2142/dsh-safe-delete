@@ -17,7 +17,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, r
 import path from 'node:path'
 
 import { describeTarget } from './describe'
-import { moveToSystemRecycleBin, type Recycler } from './recycle'
+import { moveToSystemRecycleBin, type RecycleOutcome, type Recycler } from './recycle'
 import type { TrashEntry } from './types'
 
 /** 移入选项。 */
@@ -344,7 +344,15 @@ export async function destroyEntry(
     let via: 'recycle' | 'permanent' = 'permanent'
     if (options.permanent !== true) {
       const recycler = options.recycler ?? moveToSystemRecycleBin
-      const outcome = recycler(dir)
+      // 包一层 try：recycler 自身抛错（假实现、平台 API 异常）也必须降级成
+      // 「跳过这一条」，不能让异常冒出去中断整轮清理 —— 那样后面的条目连尝试
+      // 都没有，而且调用方拿不到任何说明。
+      let outcome: RecycleOutcome
+      try {
+        outcome = recycler(dir)
+      } catch (error) {
+        outcome = { ok: false, reason: error instanceof Error ? error.message : String(error) }
+      }
       if (!outcome.ok) {
         // 关键：不删除，把原因带回去。
         return { ok: false, reason: outcome.reason }

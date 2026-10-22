@@ -28,10 +28,16 @@ export interface CommandDeps {
     ok: false;
     error: string;
   }>;
-  /** 现在清理一次；`dryRun` 只报告。 */
+  /**
+   * 现在清理一次；`dryRun` 只报告。
+   *
+   * `failures` 是**移入回收站失败、因此仍留在安全区**的条目及原因。
+   * 必须显示给用户：否则他会以为清理成功，而磁盘没释放、条目其实还在。
+   */
   clean: (dryRun: boolean) => Promise<{
     removed: readonly string[];
     freedBytes: number;
+    failures?: readonly string[];
   }>;
   /** 读当前配置。 */
   readConfig: () => Promise<Record<string, unknown>>;

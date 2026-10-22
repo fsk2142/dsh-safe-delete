@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { destroyEntry, listSafeZone, moveToSafeZone, restoreFromSafeZone } from '../src/store'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { scratchDir } from './support/tmpdir'
@@ -96,7 +96,21 @@ describe('destroyEntry', () => {
     const file = join(work, 'a.txt')
     writeFileSync(file, 'hello')
     const entry = await moveToSafeZone(state, file, { retentionDays: 7 })
-    await destroyEntry(state, entry.id)
+
+    // **必须注入假回收器。** 不注入就会走真实的 Shell 调用：
+    //   - 慢（一次约 1–20 秒，取决于系统状态）；
+    //   - 偶发超时 → 测试变红但代码没问题（第九轮实测到过一次）；
+    //   - 往用户真实回收站里扔东西。
+    // 真实路径的行为由 scripts/verify-recycle-e2e.ts 覆盖，那里是显式的 e2e。
+    //
+    // 替身要**真的把内容移走**：`destroyEntry` 在 recycler 返回 ok 后只写索引，
+    // 不负责删磁盘。替身什么都不做会留下孤儿目录，让测试的临时目录清理变成假象。
+    await destroyEntry(state, entry.id, {
+      recycler: (absPath) => {
+        rmSync(absPath, { recursive: true, force: true })
+        return { ok: true }
+      },
+    })
     expect(await listSafeZone(state)).toHaveLength(0)
   })
 })
