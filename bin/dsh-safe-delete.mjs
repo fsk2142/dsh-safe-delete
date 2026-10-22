@@ -1,0 +1,171 @@
+#!/usr/bin/env node
+/**
+ * dsh-safe-delete 的独立命令行。
+ *
+ * 存在的理由：**取回被删的东西不能依赖 DSH 正在运行**。如果插件没加载、DSH 打不开、
+ * 或者你根本在终端里，`undo` 仍然必须能用。
+ *
+ * 命令：
+ *   list                列出安全区内容
+ *   undo <id>           把某条取回原位（原位被占用时落到 .restored-<时间戳>）
+ *   prune [--dry-run]   按策略清理（时间 + 容量），--dry-run 只报告不动手
+ *   check               只读体检（不写任何文件）
+ *   status              安全区概况
+ */
+
+import os from 'node:os'
+import path from 'node:path'
+
+const USAGE = `dsh-safe-delete — inspect and undo deletions made through the safe zone
+
+Usage:
+  dsh-safe-delete list                 List what is in the safe zone
+  dsh-safe-delete undo <id>            Restore one entry to where it came from
+  dsh-safe-delete prune [--dry-run]    Destroy expired / over-capacity entries
+  dsh-safe-delete status               Show safe-zone size, retention and capacity
+  dsh-safe-delete check                Read-only composition health check
+
+Environment:
+  DSH_HOME   DSH home directory (default: ~/.dsh)
+`
+
+/** 解析 DSH_HOME。 */
+function dshHome() {
+  const fromEnv = process.env.DSH_HOME
+  if (fromEnv !== undefined && fromEnv !== '') return path.resolve(fromEnv)
+  return path.join(os.homedir(), '.dsh')
+}
+
+/** 状态目录。 */
+function stateDir() {
+  return path.join(dshHome(), '.dsh-safe-delete')
+}
+
+function humanBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let index = 0
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024
+    index += 1
+  }
+  return `${value.toFixed(1)} ${units[index]}`
+}
+
+async function main(argv) {
+  const [command, ...rest] = argv
+
+  // 按需加载：插件入口带着 cordis 接线，一个只跑 `undo` 的命令行不该拉它进来。
+  // 构建产物缺失时给出可操作的提示，而不是一个 ESM 解析栈。
+  const store = await import('../lib/store.js').catch(() => undefined)
+  const missingBuild = () => {
+    process.stderr.write('lib/ is missing — run `pnpm build` first\n')
+    return 1
+  }
+
+  switch (command) {
+    case undefined:
+    case '-h':
+    case '--help':
+    case 'help': {
+      process.stdout.write(USAGE)
+      return 0
+    }
+
+    case 'list': {
+      if (store === undefined) return missingBuild()
+      const entries = await store.listSafeZone(stateDir())
+      if (entries.length === 0) {
+        process.stdout.write('safe zone is empty\n')
+        return 0
+      }
+      for (const entry of entries) {
+        const expires = new Date(entry.expiresAt).toISOString().slice(0, 10)
+        process.stdout.write(
+          `${entry.id}  ${entry.isDirectory ? '[dir] ' : '[file]'}  ${humanBytes(entry.bytes)}  ` +
+            `expires ${expires}  ${entry.originalPath}\n`,
+        )
+      }
+      return 0
+    }
+
+    case 'undo': {
+      const id = rest[0]
+      if (id === undefined) {
+        process.stderr.write('usage: dsh-safe-delete undo <id>\n')
+        return 2
+      }
+      if (store === undefined) return missingBuild()
+      const { restoredTo } = await store.restoreFromSafeZone(stateDir(), id)
+      process.stdout.write(`restored to: ${restoredTo}\n`)
+      return 0
+    }
+
+    case 'prune': {
+      if (store === undefined) return missingBuild()
+      const dryRun = rest.includes('--dry-run')
+      const entries = await store.listSafeZone(stateDir())
+      const { selectForPrune, safeZoneBytes } = await import('../lib/prune.js')
+      const selected = selectForPrune(entries, { now: Date.now(), maxBytes: 20 * 1024 ** 3 })
+      if (selected.length === 0) {
+        process.stdout.write('nothing to prune\n')
+        return 0
+      }
+      const freed = safeZoneBytes(selected)
+      if (dryRun) {
+        for (const entry of selected) {
+          process.stdout.write(`would destroy ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+        }
+        process.stdout.write(`total: ${selected.length} entr(ies), ${humanBytes(freed)} (dry run — nothing changed)\n`)
+        return 0
+      }
+      for (const entry of selected) {
+        await store.destroyEntry(stateDir(), entry.id)
+        process.stdout.write(`destroyed ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+      }
+      process.stdout.write(`total: ${selected.length} entr(ies), ${humanBytes(freed)}\n`)
+      return 0
+    }
+
+    case 'status': {
+      if (store === undefined) return missingBuild()
+      const entries = await store.listSafeZone(stateDir())
+      const total = entries.reduce((sum, e) => sum + e.bytes, 0)
+      process.stdout.write(
+        [
+          `state dir: ${stateDir()}`,
+          `entries: ${entries.length}`,
+          `total size: ${humanBytes(total)}`,
+          `capacity cap: ${humanBytes(20 * 1024 ** 3)}`,
+          `retention: 7 days`,
+          entries.length > 0 ? `oldest expires: ${new Date(entries[0].expiresAt).toISOString()}` : 'safe zone is empty',
+        ].join('\n') + '\n',
+      )
+      return 0
+    }
+
+    case 'check': {
+      const { checkComposition } = await import('../lib/tools.js')
+      process.stdout.write(
+        `${checkComposition({ home: os.homedir(), workdir: process.cwd(), dshHome: dshHome() })}\n`,
+      )
+      return 0
+    }
+
+    default: {
+      process.stderr.write(`unknown command: ${command}\n\n${USAGE}`)
+      return 2
+    }
+  }
+}
+
+main(process.argv.slice(2)).then(
+  (code) => {
+    process.exitCode = code
+  },
+  (error) => {
+    process.stderr.write(`[dsh-safe-delete] ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+  },
+)

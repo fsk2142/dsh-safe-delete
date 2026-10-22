@@ -1,0 +1,58 @@
+{
+  "name": "dsh-safe-delete",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reversible deletion for DeepSeek Harness: shell deletes are intercepted, dangerous paths need in-UI approval, and deletions land in a safe zone you can restore.",
+  "icon": "./icon.svg",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./store": {
+      "types": "./lib/store.d.ts",
+      "default": "./lib/store.js"
+    },
+    "./prune": {
+      "types": "./lib/prune.d.ts",
+      "default": "./lib/prune.js"
+    },
+    "./tools": {
+      "types": "./lib/tools.d.ts",
+      "default": "./lib/tools.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-safe-delete": "bin/dsh-safe-delete.mjs"
+  },
+  "files": [
+    "lib/",
+    "bin/",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsdown": "^0.23.1",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.4"
+  }
+}

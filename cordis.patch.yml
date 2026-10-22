@@ -1,0 +1,11 @@
+# dsh-safe-delete 的 bundle 层：向 profile 插入一行。
+#
+# 安装流程（官方）：
+#   dsh plugin --profile <name> add <pkg>        # npm 已发布
+#   dsh plugin --profile <name> add link:<abs>   # 本地仓库（开发期）
+#
+# 行 id 只能出现在**一个**层里：不要同时在 profile 或 home 的 cordis.patch.yml
+# 里再写一次 `dsh-safe-delete`，否则跨层重复会让下次启动失败。
+- insert:
+    - id: dsh-safe-delete
+      name: 'dsh-safe-delete'
