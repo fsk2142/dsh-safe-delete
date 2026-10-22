@@ -68,6 +68,13 @@ export interface ToolDeps {
   /** 单次删除的字节数阈值：超过就额外要一次人工确认。`0` 表示不启用。 */
   confirmBytes?: number
   /**
+   * 提前清理阈值（0-100）。
+   *
+   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
+   * `0` 表示只在超过 `maxBytes` 时才清。
+   */
+  pruneAtPercent?: number
+  /**
    * 自动清理的检查间隔（毫秒）。默认 1 小时。
    *
    * 为什么需要它：原先清理只在"执行一次安全删除"时顺带发生 —— 长期不删东西，
@@ -173,6 +180,14 @@ function describeThresholds(deps: ToolDeps): string {
   return parts.join(' or ')
 }
 
+/** 描述清理的触发点。 */
+function describePruneTrigger(deps: ToolDeps): string {
+  const percent = deps.pruneAtPercent ?? 0
+  if (percent <= 0 || percent >= 100) return `when it exceeds ${humanBytes(deps.maxBytes)}`
+  const trigger = Math.floor((deps.maxBytes * percent) / 100)
+  return `at ${percent}% (${humanBytes(trigger)}) of the ${humanBytes(deps.maxBytes)} cap`
+}
+
 /** 驱动盘根判定（`C:\`、`C:/`、`/`）。 */
 function isDriveRoot(p: string): boolean {
   const resolved = path.resolve(p)
@@ -210,7 +225,11 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   const pruneNow = async (): Promise<TrashEntry[]> => {
     if (deps.autoPrune === false) return []
     const entries = await listSafeZone(deps.stateDir)
-    const selected = selectForPrune(entries, { now: now(), maxBytes: deps.maxBytes })
+    const selected = selectForPrune(entries, {
+      now: now(),
+      maxBytes: deps.maxBytes,
+      ...(deps.pruneAtPercent !== undefined ? { pruneAtPercent: deps.pruneAtPercent } : {}),
+    })
     for (const entry of selected) {
       await destroyEntry(deps.stateDir, entry.id)
       appendAudit(deps.stateDir, {
@@ -424,6 +443,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           `capacity cap: ${humanBytes(deps.maxBytes)}`,
           `retention: ${deps.retentionDays} days`,
           `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : `on, checked every ${describeInterval(pruneIntervalMs)}`}`,
+          `prune trigger: ${deps.autoPrune === false ? 'n/a' : describePruneTrigger(deps)}`,
           `confirm when a single delete exceeds: ${describeThresholds(deps)}`,
           next !== undefined ? `oldest entry expires: ${new Date(next.expiresAt).toISOString()}` : 'safe zone is empty',
         ].join('\n'),

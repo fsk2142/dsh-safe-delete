@@ -3,11 +3,27 @@ import { defineConfig, type UserConfig } from 'tsdown'
 const PACKAGE_NAME = 'dsh-safe-delete'
 
 /**
- * 只有 host 一个入口：本插件不提供浏览器端产物（审批卡片由 DSH 自带的
- * `@deepseek-ai/dsh-client-ui-approval` 渲染，本包不写 UI）。
+ * 宿主运行时提供的包：必须保持 external。
+ *
+ * 为什么：这些包的实例身份由宿主决定。inline 一份进去会得到**不同的类身份**，
+ * 宿主那边的 `instanceof` / 服务注册就会认不出来 —— 表现是「插件加载了但什么都不生效」。
+ *
+ * `schemastery` 尤其关键：`.volatile()` 的引用语义依赖同一个实现。
+ */
+const HOST_PROVIDED = ['@deepseek-ai/schemastery']
+
+/**
+ * 浏览器端由宿主 loader 用 `require` 注入的包。
+ *
+ * react 不随本包安装（宿主提供），所以客户端 bundle 必须把它当外部依赖。
+ */
+const CLIENT_EXTERNALS = ['react', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives']
+
+/**
+ * Host 入口。
  *
  * `entry` 必须是对象映射：数组形式会让产物落到 `lib/src/...`，与 package.json
- * 里声明的 `./lib/index.js` 对不上（dsh-llm-account 踩过这个坑）。
+ * 里声明的 `./lib/index.js` 对不上。
  */
 const hostConfig: UserConfig = {
   name: `${PACKAGE_NAME}/host`,
@@ -19,6 +35,7 @@ const hostConfig: UserConfig = {
     prune: 'src/prune.ts',
     tools: 'src/tools.ts',
     audit: 'src/audit.ts',
+    config: 'src/config.ts',
   },
   outDir: 'lib',
   format: 'esm',
@@ -29,6 +46,38 @@ const hostConfig: UserConfig = {
   // tsdown 在 node 平台默认强制 `.mjs`；本包是 `type: module`，
   // 且 cordis.patch.yml 按包名解析 main → lib/index.js。
   fixedExtension: false,
+  deps: { neverBundle: HOST_PROVIDED },
 }
 
-export default defineConfig([hostConfig])
+/**
+ * 浏览器入口：插件页里的设置表单。
+ *
+ * 为什么是 CJS 而不是 ESM：宿主 loader 用 `window.__ModuleLoader__.load({id, factory})`
+ * 包装这个产物，`require` 由 loader 注入，最后读 `module.exports` 上的 `{ apply, inject }`。
+ */
+const clientConfig: UserConfig = {
+  name: `${PACKAGE_NAME}/client`,
+  entry: { client: 'src/client/index.tsx' },
+  outDir: 'lib',
+  format: 'cjs',
+  platform: 'browser',
+  // 别漏：否则按 engines.node 编译，浏览器跑不了。
+  target: 'es2022',
+  dts: false,
+  // 不能清空 host 产物。
+  clean: false,
+  outputOptions: {
+    entryFileNames: 'client.js',
+    // 复现宿主 loader 约定的包装格式。
+    banner: [
+      'window.__ModuleLoader__.load({',
+      `\tid: ${JSON.stringify(PACKAGE_NAME)},`,
+      '\tfactory: (require) => {',
+    ].join('\n'),
+    intro: '\t\tvar module = { exports: {} };\n\t\tvar exports = module.exports;',
+    footer: '\t\treturn module.exports;\n\t}\n});',
+  },
+  deps: { neverBundle: [...CLIENT_EXTERNALS, ...HOST_PROVIDED] },
+}
+
+export default defineConfig([hostConfig, clientConfig])

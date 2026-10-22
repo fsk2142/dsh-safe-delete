@@ -1,3 +1,4 @@
+import { Config } from "./config.js";
 //#region src/index.d.ts
 /**
  * dsh-safe-delete host half.
@@ -38,6 +39,14 @@ export interface SafeDeleteConfig {
   /** 是否自动清理；默认 true。关掉后只剩手动清理。 */
   autoPrune?: boolean;
   /**
+   * 提前清理阈值（0-100）；默认 90。
+   *
+   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
+   * 例如上限 20 GB、阈值 90 → 用到 18 GB 就动手，而不是等撑满。
+   * 设为 `0` 或 `>= 100` 表示只在超过 `maxBytes` 本身时才清。
+   */
+  pruneAtPercent?: number;
+  /**
    * 单次删除的条目数阈值；超过就额外要一次人工确认。默认 `5000`。
    *
    * 与路径分级相互独立：普通工作区路径也会因为"这一单太大"而确认一次。
@@ -72,3 +81,4 @@ export interface PluginContext {
  */
 export declare function apply(ctx: PluginContext, config?: SafeDeleteConfig): void;
 //#endregion
+export { Config };

@@ -6,9 +6,23 @@ export interface PruneOptions {
   now: number;
   /** 安全区容量上限（字节）。 */
   maxBytes: number;
+  /**
+   * 提前清理阈值（0-100）。
+   *
+   * 占用达到 `maxBytes × percent%` 就开始清理。`0` 或省略表示只在超过
+   * `maxBytes` 本身时才清（旧行为）。
+   */
+  pruneAtPercent?: number;
 }
 /** 安全区条目总字节数。 */
 export declare function safeZoneBytes(entries: TrashEntry[]): number;
+/**
+ * 实际触发清理的字节阈值。
+ *
+ * @param opts 清理参数。
+ * @returns 生效上限；阈值不合法时退回 `maxBytes`。
+ */
+export declare function effectiveCapBytes(opts: PruneOptions): number;
 /**
  * 选出应当销毁的条目，按销毁顺序排列（最旧优先）。
  *
