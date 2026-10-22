@@ -507,20 +507,20 @@ export function SafeZoneSettings(): ReactElement {
   )
 
   /**
-   * 立即按当前策略清理一次。
+   * 说明清理是什么、怎么做。
    *
-   * ## 为什么这里只是引导，不是真的执行
+   * ## 为什么这里不能直接执行
    *
-   * 宿主没有给插件一个「从浏览器触发清理」的接口，原因也合理：
-   *   - `remote.settings` 只有 describe/mutate，没有 clean；
-   *   - `commands/execute` 需要 `agentId`（会话身份），而配置页不属于任何会话；
-   *   - 自定义 remote 需要 typert 代码生成器，宿主只发了 loader、没发 generator。
+   * 配置页拿不到「跑一次清理」的接口：
+   *   - `remote.settings` 只有 describe/mutate；
+   *   - `commands/execute` 需要 agentId，配置页不属于任何会话；
+   *   - 自定义 remote 需要 typert 生成器，宿主只发了 loader。
    *
-   * 所以按钮做的是**把正确做法告诉用户**，而不是假装能一键清理。假装能清会出现
-   * 「点了没反应」这种更糟的体验 —— 而 /safe-delete clean 确实是一条命令就能做完的事。
+   * 但更重要的是**把语义讲清楚**：两处清理都是移入系统回收站，不是永久删除。
+   * 用户点这个按钮时最该知道的就是这一点。
    */
   const runClean = useCallback(async (): Promise<void> => {
-    setMessage('清理请用 /safe-delete clean 或 safe_zone_status 查看当前占用。')
+    setMessage('清理会把过期条目移入系统回收站（不是永久删除）。执行：/safe-delete clean')
     setSaved(false)
   }, [])
 
@@ -797,14 +797,14 @@ export function SafeZoneSettings(): ReactElement {
           </button>
         ) : null}
         {/*
-          「清理」不是配置项，所以常驻；但它无法一键执行（宿主没提供这个接口），
-          所以文案直接写命令，而不是给一个点了没反应的按钮。
+          「清理」不是配置项，所以常驻；但它无法一键执行（宿主没给配置页开这个接口），
+          所以文案直接写命令，并说明清理的真实语义（进回收站，非永久删除）。
         */}
         <button
           type="button"
           onClick={() => void runClean()}
           disabled={status !== 'ready'}
-          title="把清理命令告诉你（宿主未向插件开放浏览器端清理接口）"
+          title="过期的安全区条目会被移入系统回收站，不是永久删除"
           style={{
             padding: '6px 18px',
             borderRadius: 'var(--dsw-radius-md, 8px)',
@@ -817,7 +817,7 @@ export function SafeZoneSettings(): ReactElement {
             opacity: status !== 'ready' ? 0.55 : 1,
           }}
         >
-          如何清理
+          清理说明
         </button>
         {message !== '' ? (
           <span
