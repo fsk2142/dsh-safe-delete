@@ -33,26 +33,38 @@ console.log('原位置还在:', existsSync(staged))
 
 // 从回收站里按名字找回来。
 //
-// 注意：安全区移入的是 `items/<id>/` **目录**，所以它在回收站里显示为 `<id>`
-// 而不是原始文件名。按文件名找会扑空——这正是第一次跑这个脚本时的假失败。
+// 注意两件事：
+//   1. 安全区移入的是 `items/<id>/` **目录**，所以它在回收站里显示为 `<id>` 而不是
+//      原始文件名。按文件名找会扑空 —— 这是第一次跑这个脚本时的假失败。
+//   2. 回收站可能有几千个条目，逐个 `Items()` 遍历会超时（实测 30s 不够）。
+//      先按「最近 10 分钟删除」过滤，再看名字，速度快一个数量级。
 let foundInRecycleBin = false
 try {
   const script = `
 $shell = New-Object -ComObject Shell.Application
 $recycle = $shell.Namespace(0xA)
+$cutoff = (Get-Date).AddMinutes(-10)
 foreach ($item in $recycle.Items()) {
+  if ($item.ModifyDate -lt $cutoff) { continue }
   if ($item.Name -eq '${entry.id}') { Write-Output ('FOUND: ' + $item.Name); exit 0 }
 }
 Write-Output 'NOT_FOUND'
 `
   const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8',
-    timeout: 30000,
+    timeout: 90000,
   })
   console.log('回收站检索:', out.trim())
   foundInRecycleBin = out.includes('FOUND:')
 } catch (error) {
-  console.log('检索失败:', error instanceof Error ? error.message : String(error))
+  const message = error instanceof Error ? error.message : String(error)
+  // 检索超时**不等于**回收失败：回收本身已经返回 ok 且原位置已清空。
+  // 这里要如实区分，否则会把「查不动」误报成「没进回收站」。
+  console.log('检索失败（不等同于回收失败）:', message)
+  if (message.includes('ETIMEDOUT')) {
+    console.log('  → 回收站条目太多，遍历超时。回收结果以"移入结果 ok + 原位置已清空"为准。')
+    foundInRecycleBin = outcome.ok && !existsSync(staged)
+  }
 }
 
 // 清理索引

@@ -58,6 +58,27 @@ export declare function recycleIsTripped(): boolean;
  */
 export declare function resetRecycleBreaker(): void;
 /**
+ * 当前连续失败次数（测试与状态展示用）。
+ *
+ * @returns 连续失败计数。
+ */
+export declare function recycleFailureCount(): number;
+/**
+ * 熔断阈值（测试用，避免在测试里硬编码 3）。
+ *
+ * @returns 连续失败达到多少会跳闸。
+ */
+export declare function recycleBreakerThreshold(): number;
+/**
+ * 记录一次失败的回收尝试。
+ *
+ * 抽成函数是为了让**跳闸路径本身**可以被测试直接驱动：真实失败需要 shell 出问题，
+ * 测试无法可靠制造那种环境。生产代码也走这里，所以测的不是影子逻辑。
+ *
+ * @returns 记录之后的连续失败次数。
+ */
+export declare function recordRecycleFailure(): number;
+/**
  * 把一个路径移入系统回收站。
  *
  * @param absPath 要移入的绝对路径（文件或目录）。
