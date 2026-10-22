@@ -176,6 +176,13 @@ function mentionsOnly(command: string): boolean {
     if (isDeleteVerb(head)) return false
   }
 
+  // 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与 `echo \`rm -rf /tmp/x\``
+  // 都不是"仅在参数里提到删除"，而是「先执行里面的删除，再把输出交给 echo」。
+  // 只看段首会漏掉这一类，所以把替换内容也当作一段来判。
+  for (const inner of commandSubstitutions(stripped)) {
+    if (containsDeleteCommand(inner)) return false
+  }
+
   const tokens = tokenize(segments[0] ?? '')
   const first = tokens[0]?.toLowerCase()
   if (first === undefined) return false
@@ -237,11 +244,94 @@ function mentionsOnly(command: string): boolean {
  */
 const DELETES_VIA_ARGUMENT = new Set(['xargs', 'find', 'foreach-object', 'foreach', 'start-job', 'start-threadjob'])
 
-/** 判断一个 token 是否就是删除动词（去引号、按 basename 比）。 */
+/**
+ * 取出所有命令替换的内容：`$(...)` 与反引号 `` `...` ``。
+ *
+ * 为什么必须单独处理：这两种写法在真实 shell 里是**先执行**再取输出。
+ * `echo $(rm -rf /tmp/x)` 的段首是 `echo`（只读），但删除真会发生。
+ *
+ * @param text 命令文本。
+ * @returns 每处替换内部的文本（可能为空数组）。
+ */
+function commandSubstitutions(text: string): string[] {
+  const found: string[] = []
+
+  // `$( ... )`：按括号配对，支持嵌套。
+  for (let i = 0; i < text.length - 1; i += 1) {
+    if (text[i] !== '$' || text[i + 1] !== '(') continue
+    let depth = 1
+    let j = i + 2
+    for (; j < text.length && depth > 0; j += 1) {
+      if (text[j] === '(') depth += 1
+      else if (text[j] === ')') depth -= 1
+    }
+    if (depth === 0) found.push(text.slice(i + 2, j - 1))
+  }
+
+  // 反引号：成对出现，非贪婪。
+  for (const match of text.matchAll(/`([^`]*)`/g)) {
+    found.push(match[1] ?? '')
+  }
+
+  return found
+}
+
+/**
+ * 一段文本里是否含有会执行删除的命令。
+ *
+ * 不用 `tokenize` 来做主判断：它会把 `$(rm -rf x)` 整体当成一个 token，
+ * 于是里面的动词摸不到。这里同时看「切分后的 token」和「原始子串」两条线。
+ *
+ * @param text 一段命令文本。
+ * @returns 含有删除命令时为 `true`。
+ */
+function containsDeleteCommand(text: string): boolean {
+  const segments = text
+    .split(/;|&&|\|\||\||\n|\r|&/)
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+
+  for (const segment of segments) {
+    const tokens = tokenize(segment).map((t) => t.toLowerCase().replace(/^['"]|['"]$/g, ''))
+
+    // 1) 任一词是删除动词（含完整路径与 .exe 形式）。
+    if (tokens.some((t) => isDeleteVerb(t))) return true
+  }
+
+  // 2) 原始子串兜底：按空白切成裸词再看一次。
+  //
+  // 这一步是必要的：`$(rm -rf x)` 内部再切分时，括号与引号会把 token 粘在一起，
+  // 上面的 token 判断可能摸不到。裸词扫描对 `rm`、`rd`、`del` 这类短动词很可靠。
+  //
+  // **但必须先挖出命令替换、再剥普通引号**：
+  //   - `"unlink"`、`'rm -rf'` 是数据，剥掉免得误伤；
+  //   - `"$(rm -rf x)"` 里虽然有引号，`$()` 仍会被执行 —— 所以替换内容先单独留下。
+  const commandLike = commandSubstitutions(text).join(' ')
+  const withoutQuotes = stripQuotedStrings(text)
+  for (const word of `${withoutQuotes} ${commandLike}`.split(/[\s(){}[\]`$;|&]+/)) {
+    if (word !== '' && isDeleteVerb(word)) return true
+  }
+
+  return false
+}
+
+/**
+ * 去掉被引号包裹的内容（单引号与双引号）。
+ *
+ * @param text 命令文本。
+ * @returns 引号内内容被替换成空格的文本。
+ */
+function stripQuotedStrings(text: string): string {
+  return text.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ')
+}
+
+/** 判断一个 token 是否就是删除动词（去引号、按 basename 比、忽略 .exe/.com）。 */
 function isDeleteVerb(token: string): boolean {
   const cleaned = token.toLowerCase().replace(/^['"]|['"]$/g, '')
   const base = cleaned.split(/[\\/]/).pop() ?? cleaned
-  return (DELETE_VERBS as readonly string[]).includes(base)
+  // Windows 上 `rd.exe` / `del.exe` 与 `rd` / `del` 等同。
+  const withoutExe = base.replace(/\.(exe|com|cmd|bat)$/, '')
+  return (DELETE_VERBS as readonly string[]).includes(base) || (DELETE_VERBS as readonly string[]).includes(withoutExe)
 }
 
 /**
@@ -497,8 +587,11 @@ export function parseCommand(command: string): CommandVerdict {
   for (const verb of DELETE_VERBS) {
     for (let i = 0; i < tokens.length; i += 1) {
       const token = tokens[i]!.toLowerCase().replace(/^['"]|['"]$/g, '')
-      // 允许动词前面带 `\.\` 之类的路径前缀（如 `C:\Windows\System32\rd.exe` 不判）。
-      if (token === verb) {
+      // 允许动词带路径前缀或可执行后缀：`C:\Windows\System32\rd.exe`、
+      // `/bin/rm`、`rd.exe` 在 shell 里与裸 `rd` / `rm` 等价。
+      // 只做 `token === verb` 精确匹配会漏掉这一整类 —— 而完整路径调用
+      // 比字符串拼接常见得多。
+      if (isDeleteVerb(token)) {
         if (verbIndex === -1 || i < verbIndex) {
           verbIndex = i
           matchedVerb = verb
@@ -526,7 +619,17 @@ export function parseCommand(command: string): CommandVerdict {
     }
   }
 
-  if (verbIndex === -1) return { destructive: false }
+  if (verbIndex === -1) {
+    // 兜底：分词摸不到动词，但文本里确实有会执行的删除命令。
+    //
+    // 典型是命令替换 `echo $(rm -rf /tmp/x)` —— `tokenize` 把 `$(rm` 粘成
+    // 一个 token，主循环认不出 `rm`。这类命令在 shell 里**真的会删**，
+    // 所以宁可判成删除（目标不可解析 → 交给人看），也不能放行。
+    if (containsDeleteCommand(text)) {
+      return { destructive: true, kind: 'delete', recursive: false, target: null }
+    }
+    return { destructive: false }
+  }
 
   // 递归判定。
   //

@@ -139,19 +139,32 @@ export interface PluginContext {
  */
 function resolveInstallDir(): { installDir?: string } {
   try {
-    // 桌面版布局：<install>/resources/app.asar/... —— 取 resources 的父目录。
     const exec = process.execPath
     if (typeof exec !== 'string' || exec === '') return {}
-    const resources = path.join(path.dirname(exec), 'resources')
-    if (fs.existsSync(resources)) return { installDir: path.dirname(exec) }
 
-    // 其它布局：从可执行文件所在目录往上找一层含有 resources 的。
-    let dir = path.dirname(exec)
+    /**
+     * 认定「这确实是 DSH 的安装目录」而不是同名的无关目录。
+     *
+     * 只看有没有 `resources` 子目录太松：任何恰好带 `resources` 的目录都会被
+     * 判成安装目录，那下面所有删除都会要求确认。要求 resources 里出现
+     * `app.asar` 或 `app` 目录才算 —— 这是 Electron 桌面版的确定特征。
+     */
+    const looksLikeInstall = (dir: string): boolean => {
+      const resources = path.join(dir, 'resources')
+      if (!fs.existsSync(resources)) return false
+      return fs.existsSync(path.join(resources, 'app.asar')) || fs.existsSync(path.join(resources, 'app'))
+    }
+
+    const direct = path.dirname(exec)
+    if (looksLikeInstall(direct)) return { installDir: direct }
+
+    // 向上找几层，应对 `resources/app/bin/node` 之类的布局。
+    let dir = direct
     for (let i = 0; i < 4; i += 1) {
-      if (fs.existsSync(path.join(dir, 'resources'))) return { installDir: dir }
       const parent = path.dirname(dir)
       if (parent === dir) break
       dir = parent
+      if (looksLikeInstall(dir)) return { installDir: dir }
     }
     return {}
   } catch {
@@ -389,18 +402,24 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           // 不要用 description.exists 做门控：路径危险度与目标存不存在无关。
           // 删除一个不存在的家目录路径也该先问人（而且 deletePath 会在
           // 存在性检查后直接报 not found，根本走不到审批）。
-          return decideGate(target, describeTarget(target), {
-            env,
-            confirmFileCount: numeric('confirmFileCount', 5000),
-            confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
-          })
+          const description = describeTarget(target)
+          return {
+            decision: decideGate(target, description, {
+              env,
+              confirmFileCount: numeric('confirmFileCount', 5000),
+              confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
+            }),
+            // 留住描述，卡片文案直接复用 —— 大目录的 describeTarget 是全树遍历，
+            // 每次调用算两遍等于翻倍开销。
+            description,
+          }
         } catch {
           return undefined
         }
       })()
 
       if (gate === undefined) return next()
-      if (!gate.needsApproval) return next()
+      if (!gate.decision.needsApproval) return next()
 
       // 审批策略是 never 时不要返回 ask：管线会直接驳回，卡片不会出现，
       // 结果是"什么都不许删"。此时降级为放行到安全删除 —— 文件仍然进安全区、
@@ -411,7 +430,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       // 保留期配长一些，以及定期用 `safe_zone_list` 看一眼。
       if (approvalPolicy() === 'never') return next()
 
-      const description = describeTarget(target)
+      const { description } = gate
       const sizeText = description.isDirectory
         ? ` Directory, ${description.fileCount} entries, ${description.bytes} bytes.`
         : ` File, ${description.bytes} bytes.`
@@ -420,11 +439,11 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         kind: 'ask',
         reason:
           `Delete "${target}"?${sizeText} ` +
-          `Why this needs your OK: ${gate.reasons.join('; ')}. ` +
+          `Why this needs your OK: ${gate.decision.reasons.join('; ')}. ` +
           `It will be moved into the safe zone and can be restored for ${retentionDays} days.`,
         displayReason: {
-          en: `Delete "${target}"? ${gate.reasons.join('; ')}. It moves into the safe zone and can be restored for ${retentionDays} days.`,
-          zh: `删除「${target}」？${gate.reasons.join('；')}。它会移入安全区，${retentionDays} 天内可以取回。`,
+          en: `Delete "${target}"? ${gate.decision.reasons.join('; ')}. It moves into the safe zone and can be restored for ${retentionDays} days.`,
+          zh: `删除「${target}」？${gate.decision.reasons.join('；')}。它会移入安全区，${retentionDays} 天内可以取回。`,
         },
       }
     }

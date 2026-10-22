@@ -66,6 +66,9 @@ function readConfigDefaults() {
     maxBytes: 20 * 1024 ** 3,
     retentionDays: 7,
     pruneAtPercent: 90,
+    confirmFileCount: 5000,
+    confirmBytes: 2 * 1024 ** 3,
+    crossVolumeCopy: false,
     source: 'default',
     note: 'built-in defaults — DSH settings not read (run /safe-delete config inside DSH for live values)',
   }
@@ -87,11 +90,22 @@ function readConfigDefaults() {
       const n = Number(raw)
       return Number.isFinite(n) ? n : fallbackValue
     }
+    const pickFlag = (key, fallbackValue) => {
+      const m = new RegExp(`^\\s+${key}:\\s*(.+?)\\s*$`, 'm').exec(block)
+      if (m === null) return fallbackValue
+      const raw = m[1].replace(/#.*$/, '').trim().toLowerCase()
+      if (raw === 'true' || raw === 'on' || raw === 'yes') return true
+      if (raw === 'false' || raw === 'off' || raw === 'no') return false
+      return fallbackValue
+    }
 
     return {
       maxBytes: pick('maxBytes', fallback.maxBytes),
       retentionDays: pick('retentionDays', fallback.retentionDays),
       pruneAtPercent: pick('pruneAtPercent', fallback.pruneAtPercent),
+      confirmFileCount: pick('confirmFileCount', fallback.confirmFileCount),
+      confirmBytes: pick('confirmBytes', fallback.confirmBytes),
+      crossVolumeCopy: pickFlag('crossVolumeCopy', fallback.crossVolumeCopy),
       source: 'file',
       note: `read from ${patchFile}`,
     }
@@ -250,6 +264,8 @@ async function main(argv) {
         return 2
       }
       const { deletePath, describeMoved, describePreview } = await import('../lib/delete-core.js')
+      const cfg = readConfigDefaults()
+      if (cfg.source !== 'file') process.stdout.write(`(${cfg.note})\n`)
       const result = await deletePath(
         { path: target, preview },
         {
@@ -260,9 +276,11 @@ async function main(argv) {
             dshHome: dshHome(),
             safeZoneDir: stateDir(),
           },
-          retentionDays: 7,
-          confirmFileCount: 5000,
-          confirmBytes: 2 * 1024 ** 3,
+          // 用真实配置，不硬编码：用户把阈值改成 500 条时，CLI 也要按 500 判。
+          retentionDays: cfg.retentionDays,
+          confirmFileCount: cfg.confirmFileCount,
+          confirmBytes: cfg.confirmBytes,
+          crossVolumeCopy: cfg.crossVolumeCopy,
           // 终端里没有 DSH 的审批卡片：需要确认时一律拒绝，并提示改用插件内的命令。
           requestApproval: async () => 'rejected',
           now: () => Date.now(),
