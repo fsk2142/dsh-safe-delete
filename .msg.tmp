@@ -1,0 +1,21 @@
+fix(pkg): declare the dsh engine range and the patch-layer export
+
+Two metadata gaps remained against the team standard.
+
+engines.dsh makes the host decide compatibility from one range instead of
+matching every @deepseek-ai/dsh-* peer. Verified against the host's own
+implementation in app-boot: when engines.dsh is present it decides alone
+and peerDependencies are ignored entirely, so a host upgrade no longer
+needs a matching edit here. The lower bound accepts the version in use
+(0.2.1-rc.2); the upper bound stops a future 0.3 from being installed
+silently and misbehaving instead of being reported as incompatible.
+
+Also exports ./cordis.patch.yml. The host reads that file by path rather
+than through exports, so this changes no behaviour; it makes the package
+contents fully visible from the exports map.
+
+scripts/verify-dsh-range.mjs pins the range semantics, including one
+detail worth knowing: the host evaluates ranges with includePrerelease,
+so the upper bound admits 0.3.0-rc.1 and only rejects 0.3.0 onwards. Range
+semantics belong to semver, not to this package, but the script records it
+rather than leaving it to be discovered later.
