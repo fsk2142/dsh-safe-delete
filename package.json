@@ -1,6 +1,6 @@
 {
   "name": "dsh-safe-delete",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "private": true,
   "type": "module",
   "description": "Reversible deletion for DeepSeek Harness: shell deletes are intercepted, dangerous paths need in-UI approval, and deletions land in a safe zone you can restore.",
