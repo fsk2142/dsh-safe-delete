@@ -96,6 +96,18 @@ function unwrapExecutedCommand(command: string): string | null {
     return stripOuterQuotes(wrapper[1]!.trim())
   }
 
+  // 解释器内联脚本：`python -c '...'`、`node -e '...'`、`perl -e '...'`。
+  //
+  // 为什么要收：这些会把整段脚本粘成一个 token，动词扫描摸不到内部。
+  // `python -c 'import shutil; shutil.rmtree("/tmp/x")'` 的删除动词是**静态可见**的，
+  // 只是被引号包住了 —— 与「运行时动态构造的命令」那种真正看不清的情况不同。
+  // 脚本体交给嵌套解析处理（分号/换行切分已经就绪）。
+  const interpreter =
+    /^(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)\s+(?:-c|-e|-E|-r)\s+([\s\S]+)$/i.exec(trimmed)
+  if (interpreter !== null) {
+    return stripOuterQuotes(interpreter[1]!.trim())
+  }
+
   return null
 }
 
@@ -288,20 +300,50 @@ function commandSubstitutions(text: string): string[] {
 /**
  * 标记每个字符是否处在单引号区间内。
  *
+ * ## 为什么要处理双引号里的单引号
+ *
+ * `echo "'$(rm -rf x)'"` 里那个单引号在**双引号内部**，不是单引号字符串的开始 ——
+ * POSIX 会照常执行 `$()`。如果朴素地"见到单引号就翻转状态"，这段会被判成
+ * 单引号区间，替换就被漏掉了（第四轮审查实测确认）。
+ *
+ * 规则：双引号区间内的单引号当普通字符；只有双引号**之外**的单引号才开启区间。
+ *
  * @param text 命令文本。
  * @returns 与 text 等长的布尔数组。
  */
 function singleQuoteMask(text: string): boolean[] {
   const mask = new Array<boolean>(text.length).fill(false)
-  let inside = false
+  let inSingle = false
+  let inDouble = false
+
   for (let i = 0; i < text.length; i += 1) {
-    if (text[i] === "'") {
-      inside = !inside
-      mask[i] = inside
+    const ch = text[i]
+
+    if (inSingle) {
+      mask[i] = true
+      if (ch === "'") inSingle = false
       continue
     }
-    mask[i] = inside
+    if (inDouble) {
+      // 双引号区内：单引号是普通字符，不开启单引号区间。
+      if (ch === '"') inDouble = false
+      mask[i] = false
+      continue
+    }
+
+    if (ch === "'") {
+      inSingle = true
+      mask[i] = true
+      continue
+    }
+    if (ch === '"') {
+      inDouble = true
+      mask[i] = false
+      continue
+    }
+    mask[i] = false
   }
+
   return mask
 }
 
