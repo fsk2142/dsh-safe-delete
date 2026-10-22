@@ -69,10 +69,18 @@ function fakeRemote(initial: Record<string, unknown>): {
   return {
     calls,
     remote: {
+      // **必须返回信封** `{ ok: true, value: {...} }` —— 这是真实宿主的契约。
+      //
+      // 之前这里返回裸对象，于是"describe 忘了拆信封"的 bug 在测试里完全看不出来：
+      // 替身说裸的、生产代码按裸的读，两边自洽，只有真实宿主会露馅。
+      // 那正是「写入成功但界面永远显示默认值」活过好几轮的原因。
       describe: async () => ({
-        writable: true,
-        hasDocument: false,
-        namespaces: [{ ns: 'dsh-safe-delete', value: { ...state }, revision }],
+        ok: true,
+        value: {
+          writable: true,
+          hasDocument: false,
+          namespaces: [{ ns: 'dsh-safe-delete', value: { ...state }, revision }],
+        },
       }),
       mutate: async (ns: string, ops: MutateCall['ops'], rev?: number) => {
         calls.push({ ns, ops })
@@ -117,8 +125,11 @@ describe('SafeZoneSettings interaction', () => {
     }
 
     const { remote, calls } = fakeRemote({
-      maxBytes: 20 * GB,
-      pruneAtPercent: 90,
+      // 刻意用**非默认值**：如果 describe 没读到配置，界面会回落到默认值
+      // (20 GB / 90 / 1 小时 / 5000 / 2 GB)，与这里的 30 GB / 77 明显不同。
+      // 用默认值做初始值时，"读到了"和"没读到"在界面上完全一样，测不出来。
+      maxBytes: 30 * GB,
+      pruneAtPercent: 77,
       autoPruneIntervalMs: HOUR,
       confirmFileCount: 5000,
       confirmBytes: 2 * GB,
@@ -145,6 +156,17 @@ describe('SafeZoneSettings interaction', () => {
     // 断言要在 unmount 之前取，否则读到的是空 DOM。
     expect(inputCount).toBe(5)
     expect(selectCount).toBe(3)
+
+    // ── 信封回归：界面必须显示 describe() 返回的**真实配置值** ──
+    //
+    // 宿主 describe 返回 `{ ok: true, value: { namespaces: [...] } }`。
+    // 不拆信封时 pickNamespace 什么都找不到，界面回落到默认值（20 GB / 90），
+    // 与替身给的（30 GB / 77）明显不同 —— 这条断言专门抓那个 bug。
+    const capacityInput = document.querySelector<HTMLInputElement>('#dsd-maxBytes')
+    const percentInput = document.querySelector<HTMLInputElement>('#dsd-pruneAtPercent')
+    console.log('容量显示:', capacityInput?.value, ' 阈值显示:', percentInput?.value)
+    expect(capacityInput?.value, '应显示 describe 返回的 30，而非默认的 20').toBe('30')
+    expect(percentInput?.value, '应显示 describe 返回的 77，而非默认的 90').toBe('77')
 
     // 关键：找到「定时清理间隔」的输入框与其单位下拉框。
     const intervalInput = document.querySelector<HTMLInputElement>('#dsd-autoPruneIntervalMs')
@@ -230,8 +252,11 @@ describe('SafeZoneSettings interaction', () => {
     }
 
     const { remote, calls } = fakeRemote({
-      maxBytes: 20 * GB,
-      pruneAtPercent: 90,
+      // 刻意用**非默认值**：如果 describe 没读到配置，界面会回落到默认值
+      // (20 GB / 90 / 1 小时 / 5000 / 2 GB)，与这里的 30 GB / 77 明显不同。
+      // 用默认值做初始值时，"读到了"和"没读到"在界面上完全一样，测不出来。
+      maxBytes: 30 * GB,
+      pruneAtPercent: 77,
       autoPruneIntervalMs: HOUR,
       confirmFileCount: 5000,
       confirmBytes: 2 * GB,
