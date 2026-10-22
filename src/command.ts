@@ -148,7 +148,35 @@ function stripComments(command: string): string {
  * 都不是删除动词，但它们会真的删东西。只有明确"只读/只打印"的命令才可豁免。
  */
 function mentionsOnly(command: string): boolean {
-  const tokens = tokenize(stripComments(command))
+  const stripped = stripComments(command)
+
+  /**
+   * 按 shell 的命令分隔符切段。
+   *
+   * 为什么必须切：`echo hi; rm -rf /tmp/x` 里第一段只是打印，第二段是**真删除**。
+   * 只看整条的第一个词，就会把这类命令整体豁免 —— 而 `;`、`&&`、换行、管道
+   * 都是最常见的串联方式，等于给了一条不需要任何技巧的绕过通道。
+   */
+  const segments = stripped
+    // `;` `&&` `||` `|` 换行，以及 Windows 单 `&`（同样能串联命令）。
+    // 注意 `&&` 要排在 `&` 前面，否则会被切成两段空的。
+    .split(/;|&&|\|\||\||\n|\r|&/)
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+
+  if (segments.length === 0) return false
+
+  // 除第一段外，任何一段自己就是删除命令，就不算"仅提及"。
+  for (const segment of segments.slice(1)) {
+    const segTokens = tokenize(segment)
+    const head = segTokens[0]?.toLowerCase()
+    if (head === undefined) continue
+    // `cat list | xargs rm -rf`：管道的下游是 `xargs rm ...`，动词在参数里。
+    if (DELETES_VIA_ARGUMENT.has(head) && segTokens.some((t) => isDeleteVerb(t))) return false
+    if (isDeleteVerb(head)) return false
+  }
+
+  const tokens = tokenize(segments[0] ?? '')
   const first = tokens[0]?.toLowerCase()
   if (first === undefined) return false
 
@@ -199,6 +227,21 @@ function mentionsOnly(command: string): boolean {
   ])
 
   return READ_ONLY_COMMANDS.has(first)
+}
+
+/**
+ * 把"删除"作为参数转发的工具。
+ *
+ * `find ... -exec rm {} \;`、`cat list | xargs rm`、`Get-Content | ForEach-Object { Remove-Item }`
+ * —— 这些命令自己的名字不含删除动词，但会把删除执行掉。
+ */
+const DELETES_VIA_ARGUMENT = new Set(['xargs', 'find', 'foreach-object', 'foreach', 'start-job', 'start-threadjob'])
+
+/** 判断一个 token 是否就是删除动词（去引号、按 basename 比）。 */
+function isDeleteVerb(token: string): boolean {
+  const cleaned = token.toLowerCase().replace(/^['"]|['"]$/g, '')
+  const base = cleaned.split(/[\\/]/).pop() ?? cleaned
+  return (DELETE_VERBS as readonly string[]).includes(base)
 }
 
 /**

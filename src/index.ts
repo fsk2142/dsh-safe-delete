@@ -22,11 +22,11 @@ import path from 'node:path'
 
 import { appendAudit } from './audit'
 import type { ClassifyEnv } from './classify'
-import { classifyPath, requiresApproval } from './classify'
+import { classifyPath } from './classify'
 import { isUnresolvableTarget, parseCommand } from './command'
 import { runCommand } from './commands'
 import { Config, unwrapConfig } from './config'
-import { deletePath, describeMoved, describePreview, humanBytes } from './delete-core'
+import { decideGate, deletePath, describeMoved, describePreview, humanBytes } from './delete-core'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { selectForPrune } from './prune'
@@ -321,21 +321,38 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       }
     }
 
-    // 自己的删除通道不拦，但危险路径要在这里升成 ask。
+    // 自己的删除通道不拦，但危险路径与"太大量"要在这里升成 ask。
     if (toolName === 'safe_delete') {
       const rawPath = exec.arguments?.['path']
       const preview = exec.arguments?.['preview'] === true
       if (preview || typeof rawPath !== 'string' || rawPath === '') return next()
 
       const target = path.resolve(rawPath)
-      let classification
-      try {
-        classification = classifyPath(target, env)
-      } catch {
-        return next()
-      }
-      // `requiresApproval` 为假时直接放行；为真则升级为审批。
-      if (!requiresApproval(classification)) return next()
+
+      // 两个理由相互独立，任一命中都要问：
+      //   a) 路径危险（家目录、profile 清单、node_modules…）；
+      //   b) 这一单太大量（条目数或字节数超阈值）。
+      //
+      // b 必须在这里算。`deletePath` 内部虽然也有阈值判断，但它的
+      // `requestApproval` 在生产接线里恒返回 allowed-once —— 那条确认永远
+      // 不会真的问人。只在 deletePath 里判，等于这个功能完全不存在。
+      const gate = (() => {
+        try {
+          // 不要用 description.exists 做门控：路径危险度与目标存不存在无关。
+          // 删除一个不存在的家目录路径也该先问人（而且 deletePath 会在
+          // 存在性检查后直接报 not found，根本走不到审批）。
+          return decideGate(target, describeTarget(target), {
+            env,
+            confirmFileCount: numeric('confirmFileCount', 5000),
+            confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
+          })
+        } catch {
+          return undefined
+        }
+      })()
+
+      if (gate === undefined) return next()
+      if (!gate.needsApproval) return next()
 
       // 审批策略是 never 时不要返回 ask：管线会直接驳回，卡片不会出现，
       // 结果是"什么都不许删"。此时降级为放行到安全删除 —— 文件仍然进安全区、
@@ -346,25 +363,20 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       // 保留期配长一些，以及定期用 `safe_zone_list` 看一眼。
       if (approvalPolicy() === 'never') return next()
 
-      let description
-      try {
-        description = describeTarget(target)
-      } catch {
-        description = undefined
-      }
-      const sizeText =
-        description === undefined
-          ? ''
-          : ` ${description.isDirectory ? 'Directory' : 'File'}, ${description.fileCount} entries, ${description.bytes} bytes.`
+      const description = describeTarget(target)
+      const sizeText = description.isDirectory
+        ? ` Directory, ${description.fileCount} entries, ${description.bytes} bytes.`
+        : ` File, ${description.bytes} bytes.`
 
       return {
         kind: 'ask',
         reason:
           `Delete "${target}"?${sizeText} ` +
+          `Why this needs your OK: ${gate.reasons.join('; ')}. ` +
           `It will be moved into the safe zone and can be restored for ${retentionDays} days.`,
         displayReason: {
-          en: `Delete "${target}"? It moves into the safe zone and can be restored for ${retentionDays} days.`,
-          zh: `删除“${target}”？它会移入安全区，${retentionDays} 天内可以取回。`,
+          en: `Delete "${target}"? ${gate.reasons.join('; ')}. It moves into the safe zone and can be restored for ${retentionDays} days.`,
+          zh: `删除「${target}」？${gate.reasons.join('；')}。它会移入安全区，${retentionDays} 天内可以取回。`,
         },
       }
     }
