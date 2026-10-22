@@ -13,6 +13,7 @@ const AVAILABLE_SERVICES = new Set(['slots', 'locale', 'commands', 'systemPrompt
 // remote.* 不在这里 —— 它们是 ctx.remote 的命名空间，不是 inject 服务名。
 
 let exportBag = {}
+const localeRegistry = {}
 const registrations = []
 const injections = []
 const errors = []
@@ -82,7 +83,15 @@ const ctx = {
     callback(scoped)
     return () => {}
   },
-  locale: { getSnapshot: () => ({ revision: 1 }), subscribe: () => () => {} },
+  locale: {
+    getSnapshot: () => ({ revision: 1 }),
+    subscribe: () => () => {},
+    // 真实宿主有 register；槽位的 locale 标签靠它解析。
+    register: (ns, dict) => {
+      localeRegistry[ns] = dict
+      return () => {}
+    },
+  },
   remote: { settings: {} },
   effect: (fn) => {
     fn()
