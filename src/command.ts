@@ -103,10 +103,11 @@ function unwrapExecutedCommand(command: string): string | null {
   // 只是被引号包住了 —— 与「运行时动态构造的命令」那种真正看不清的情况不同。
   // 脚本体交给嵌套解析处理（分号/换行切分已经就绪）。
   //
-  // 细节：允许可选路径前缀（`/usr/bin/python`）与标志后无空格（`python -c'...'`）——
-  // 两者都是合法 shell 写法，朴素匹配会漏。
+  // 细节：允许可选路径前缀（`/usr/bin/python`）、可执行后缀（`python.exe`）
+  // 与标志后无空格（`python -c'...'`）—— 三者都是合法 shell 写法，朴素匹配会漏。
+  // `python.exe -c` 在 Windows 上尤其自然，与 `isDeleteVerb` 忽略 `.exe` 的做法一致。
   const interpreter =
-    /^(?:[^\s]*[\\/])?(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)\s*(?:-c|-e|-E|-r)\s*([\s\S]+)$/i.exec(trimmed)
+    /^(?:[^\s]*[\\/])?(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)(?:\.(?:exe|com|bat|cmd))?\s*(?:-c|-e|-E|-r)\s*([\s\S]+)$/i.exec(trimmed)
   if (interpreter !== null) {
     return stripOuterQuotes(interpreter[1]!.trim())
   }
@@ -728,7 +729,7 @@ function isPlainlyHarmless(body: string): boolean {
   // `containsDeleteCommand` 只看"命令位的动词"，摸不到这种写法 —— 而
   // `node -e 'require("fs").rmSync("/x")'` 正是它。漏了这条就会把真删除
   // 判成无害（本轮改动一度造成这个回归）。
-  if (CALL_STYLE_DELETE.test(body)) return false
+  if (hasCallStyleDelete(body)) return false
 
   // 命令替换里可能藏着删除，看不清就不算无害。
   if (commandSubstitutions(body).length > 0) return false
@@ -740,9 +741,50 @@ function isPlainlyHarmless(body: string): boolean {
  * 函数式删除调用。
  *
  * 覆盖语言标准库里"名字里就写着删除"的方法：`rmSync`、`rmtree`、`unlinkSync`、
- * `remove`、`File.delete`、`os.remove`…
+ * `os.remove`、`File.delete`、`fs.unlink`…
+ *
+ * ## 为什么分成两个正则
+ *
+ * `.delete(` 必须**大小写敏感**：`Map.delete("k")`、`Set.delete(1)` 是容器操作，
+ * 不碰文件系统。如果把 `.delete(` 放进带 `/i` 的那条里，大写 `.Delete(` 的模式
+ * 会反过来匹配小写 —— 误伤面就被重新打开（第六轮审查实测确认）。
+ *
+ * 所以：无歧义的名字走 `/i`（`rmSync`、`rmtree`、`os.remove`…），
+ * 有歧义的名字走大小写敏感（`File.delete`、`.Delete(`）。
  */
-const CALL_STYLE_DELETE = /(?:^|[^\w])(?:rm|rmdir|removedir|unlink)(?:sync|_sync)?\s*\(|(?:rmtree|shutil\s*\.\s*rmtree)\s*\(|\.delete\s*\(|(?:os|fs|shutil)\s*\.\s*(?:remove|unlink|rmdir)\s*\(/i
+const CALL_STYLE_DELETE_ANY_CASE = new RegExp(
+  [
+    // 语言方法名里带 rm / unlink / rmtree 的，大小写不敏感也安全。
+    String.raw`(?:^|[^\w])(?:rm|rmdir|removedir|unlink)(?:sync|_sync)?\s*\(`,
+    String.raw`(?:rmtree|shutil\s*\.\s*rmtree)\s*\(`,
+    // 资源路径限定的删除：os.remove / fs.unlink / shutil.rmtree。
+    String.raw`(?:os|fs|shutil)\s*\.\s*(?:remove|unlink|rmdir)\s*\(`,
+  ].join('|'),
+  'i',
+)
+
+/**
+ * 有歧义的 `.delete(` —— 只有明确是文件 API 的写法才算删除。
+ *
+ * 覆盖：
+ *   - `File.delete(`（Ruby）
+ *   - `.Delete(`（大写 D，C# / PowerShell 风格）
+ *   - `[System.IO.File]::Delete(`（.NET 静态调用，双冒号）
+ *
+ * 排除容器操作：`Map.delete(`、`Set.delete(`、`cache.delete(`。
+ */
+const CALL_STYLE_DELETE_CASE_SENSITIVE =
+  /(?:System\s*\.\s*IO\s*\.\s*)?File\]?\s*(?:\.|::)\s*[Dd]elete\s*\(|\.Delete\s*\(/
+
+/**
+ * 判断脚本体里是否有函数式删除调用。
+ *
+ * @param body 脚本体。
+ * @returns 含删除调用时为 `true`。
+ */
+function hasCallStyleDelete(body: string): boolean {
+  return CALL_STYLE_DELETE_ANY_CASE.test(body) || CALL_STYLE_DELETE_CASE_SENSITIVE.test(body)
+}
 
 /**
  * 解析命令文本。
