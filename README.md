@@ -51,7 +51,8 @@ dsh plugin --profile <profile> add dsh-safe-delete
 | `safe_delete` | 唯一的删除通道。`preview:true` 先看，再去掉执行 |
 | `safe_zone_list` | 安全区里有什么 |
 | `safe_zone_restore` | 按 id 取回（原路径被占用时落到 `.restored-<时间戳>`） |
-| `safe_zone_status` | 条目数、占用、保留期、容量上限 |
+| `safe_zone_status` | 条目数、占用、保留期、容量上限、确认阈值 |
+| `safe_zone_journal` | 审计流水：被拦的删除、被拦的写入、删除、取回、清理，最新在前 |
 | `safe_zone_check` | 只读体检：profile 清单能否解析、行 id 是否跨层重复 |
 
 人侧命令行（**不依赖 DSH 运行**）：
