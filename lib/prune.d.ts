@@ -1,4 +1,4 @@
-import { t as TrashEntry } from "./types-ugdJ4LRq.js";
+import { r as TrashEntry } from "./types-CLsWRquy.js";
 //#region src/prune.d.ts
 /** 清理参数。 */
 export interface PruneOptions {

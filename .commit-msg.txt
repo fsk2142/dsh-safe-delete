@@ -1,22 +1,33 @@
-fix: align the settings form with the host remote contract
+feat: add slash commands and a CLI delete, sharing one delete core
 
-Verified against the shape dsh-llm-account recorded from a real host; the
-previous version was written from the docs alone and would have failed
-silently.
+Deletion was previously reachable only by the model through a tool. Users
+now have two direct routes, and both write the same safe zone:
 
-- describe() returns an object with `namespaces`, and a namespace is
-  identified by `ns`, not `name`. The old code looked for `name`, so it
-  never matched: the form would render defaults and ignore stored values.
-- mutate() is `mutate(ns, ops, revision)` with `{op:'set', path:[key],
-  value}` entries, not a flat `{name, value}` object.
-- host failures resolve as `{ ok:false, error }` instead of rejecting, so
-  a rejected save was reported as success. Now unwrapped.
-- the revision read with the snapshot is now carried into the write and
-  refreshed after it, otherwise a second save collides with the revision
-  its own first save produced.
-- shape is validated before field access: a null entry in the array used
-  to throw and leave the panel stuck on "loading" with no message.
-- a synchronous ref guards the save button; `saving` state alone lets two
-  clicks in one frame both pass and issue competing writes.
-- apply() wraps each step in a named guard, matching the host rule that
-  one throw marks the whole client bundle as failed to activate.
+- /safe-delete <path>      move into the safe zone (--preview to look first)
+- /safe-delete list        what is recoverable
+- /safe-delete restore <id>  put it back
+- /safe-delete clean       prune now (--dry-run to look first)
+- /safe-delete config      every setting with its current value, what it
+                           does, what changing it does, and its valid range
+- /safe-delete config <key> <value>   change one setting
+- dsh-safe-delete delete <path> [--preview]  from a terminal
+
+The slash commands and the plugin-page form read and write through the same
+host settings service, so a change made in either place shows up in the
+other after a restart. There is no second copy to reconcile.
+
+delete-core.ts is extracted so the tool, the command and the CLI cannot
+drift apart on who needs approval, how thresholds are computed, or what
+counts as off-limits. The CLI refuses anything that needs interactive
+approval instead of silently allowing it: a terminal has no approval
+channel, and pretending otherwise would be the exact failure this plugin
+exists to prevent.
+
+Two defects found while testing:
+
+- the command parser split on the first word, so `/safe-delete C:\Work\x`
+  was read as the subcommand "c:\work\x" and refused. It now only treats
+  the first word as a subcommand when that word is a known one.
+- `restore` appeared in the help text and the subcommand list but had no
+  handler, so it was treated as a path and would have tried to delete a
+  file named after the id.

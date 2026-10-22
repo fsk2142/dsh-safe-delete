@@ -1,4 +1,4 @@
-import { t as TrashEntry } from "./types-ugdJ4LRq.js";
+import { r as TrashEntry } from "./types-CLsWRquy.js";
 //#region src/store.d.ts
 /** 移入选项。 */
 export interface MoveOptions {

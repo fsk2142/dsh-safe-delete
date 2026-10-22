@@ -55,15 +55,39 @@ dsh plugin --profile <profile> add dsh-safe-delete
 | `safe_zone_journal` | 审计流水：被拦的删除、被拦的写入、删除、取回、清理，最新在前 |
 | `safe_zone_check` | 只读体检：profile 清单能否解析、行 id 是否跨层重复 |
 
-人侧命令行（**不依赖 DSH 运行**）：
+## 在 DSH 里用命令
+
+不用经过模型，直接敲命令：
+
+```
+/safe-delete <路径>              把文件或目录移入安全区（保留期内可取回）
+/safe-delete <路径> --preview    只看会发生什么，不真的移动
+/safe-delete list                列出安全区里的条目
+/safe-delete restore <id>        把某个条目取回原位
+/safe-delete clean               立即清理安全区（过期与超容量部分）
+/safe-delete clean --dry-run     只报告会清理什么，不动手
+/safe-delete config              查看所有配置项：当前值、作用、影响、范围
+/safe-delete config <项> <值>     修改一项（例如 config maxBytes 30GB）
+/safe-delete status              安全区概况
+```
+
+命令与插件页的设置表单**写的是同一份配置**，所以在任一处理完成、重启 DSH 后，
+另一处看到的都是新值。
+
+## 命令行工具（**不依赖 DSH 运行**）
 
 ```bash
+dsh-safe-delete delete <路径> [--preview]
 dsh-safe-delete list
 dsh-safe-delete undo <id>
 dsh-safe-delete prune --dry-run
 dsh-safe-delete status
 dsh-safe-delete check
+dsh-safe-delete journal
 ```
+
+> 终端里没有审批通道，所以 `delete` 遇到需要人工确认的路径会**拒绝**并提示改用
+> DSH 里的 `/safe-delete`。这不是缺陷 —— 它保证「需要你点头的删除」永远先问到你。
 
 ## 分级
 

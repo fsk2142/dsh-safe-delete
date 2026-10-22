@@ -12,12 +12,16 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 
 import { appendAudit, readAudit } from './audit'
-
-import { classifyPath, requiresApproval, type ClassifyEnv } from './classify'
-import { describeTarget } from './describe'
+import type { ClassifyEnv } from './classify'
+import {
+  deletePath,
+  describeMoved,
+  describePreview,
+  humanBytes,
+} from './delete-core'
 import { selectForPrune, safeZoneBytes } from './prune'
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
-import type { Classification, TrashEntry } from './types'
+import type { TrashEntry } from './types'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
@@ -147,18 +151,6 @@ function makeTool(spec: {
   }
 }
 
-/** 人类可读的体积。 */
-function humanBytes(bytes: number): string {  if (bytes < 1024) return `${bytes} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
-  let value = bytes / 1024
-  let unitIndex = 0
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024
-    unitIndex += 1
-  }
-  return `${value.toFixed(1)} ${units[unitIndex]}`
-}
-
 /** 人类可读的时长。 */
 function describeInterval(ms: number): string {
   if (ms <= 0) return 'every call'
@@ -186,31 +178,6 @@ function describePruneTrigger(deps: ToolDeps): string {
   if (percent <= 0 || percent >= 100) return `when it exceeds ${humanBytes(deps.maxBytes)}`
   const trigger = Math.floor((deps.maxBytes * percent) / 100)
   return `at ${percent}% (${humanBytes(trigger)}) of the ${humanBytes(deps.maxBytes)} cap`
-}
-
-/** 驱动盘根判定（`C:\`、`C:/`、`/`）。 */
-function isDriveRoot(p: string): boolean {
-  const resolved = path.resolve(p)
-  const parsed = path.parse(resolved)
-  return parsed.root === resolved
-}
-
-/**
- * 把审批结果翻译成给模型看的、可区分的错误文本。
- *
- * 「人说不」和「没有审批通道」必须是两句不同的话 —— 模型据此决定是停手还是报告。
- */
-function approvalFailureText(outcome: ApprovalOutcome, target: string): string {
-  switch (outcome) {
-    case 'rejected':
-      return `the user rejected deleting "${target}". Do not retry; ask the user what they actually want.`
-    case 'cancelled':
-      return `the approval request for "${target}" was cancelled.`
-    case 'unavailable':
-      return `"${target}" needs approval, but no approval channel is available (the session approval policy is likely "never"). Ask the user to switch the permission preset to one that uses "ask".`
-    case 'allowed-once':
-      return ''
-  }
 }
 
 /** 创建全部工具。 */
@@ -277,107 +244,28 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     },
     beforeExecute: pruneIfDue,
     async execute(args) {
-      const raw = String(args.path ?? '')
-      if (raw === '') return { ok: false, text: '', error: 'path is required' }
-      const target = path.resolve(raw)
+      const result = await deletePath(
+        {
+          path: String(args.path ?? ''),
+          preview: args.preview === true,
+          ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
+        },
+        {
+          stateDir: deps.stateDir,
+          env: deps.env,
+          retentionDays: deps.retentionDays,
+          confirmFileCount: deps.confirmFileCount ?? 0,
+          confirmBytes: deps.confirmBytes ?? 0,
+          requestApproval: deps.requestApproval,
+          now,
+          afterMove: () => pruneNow(),
+        },
+      )
 
-      // 1. 禁区：盘符根、安全区自身。
-      if (isDriveRoot(target)) {
-        return { ok: false, text: '', error: `refusing to trash a filesystem root "${target}"` }
-      }
-      const stateResolved = path.resolve(deps.stateDir)
-      if (target === stateResolved || target.startsWith(stateResolved + path.sep)) {
-        return {
-          ok: false,
-          text: '',
-          error: `refusing to delete "${target}": it is the safe zone's own state directory`,
-        }
-      }
-
-      // 2. 存在性。
-      if (!existsSync(target)) {
-        return { ok: false, text: '', error: `not found: ${target}` }
-      }
-
-      // 3. 描述。
-      const description = describeTarget(target)
-      const summary =
-        `${target}\n` +
-        `${description.isDirectory ? 'directory' : 'file'}: ${description.fileCount} entr${description.fileCount === 1 ? 'y' : 'ies'}, ${humanBytes(description.bytes)}` +
-        (description.topEntries.length > 0
-          ? `\n  ${description.topEntries.slice(0, 10).join('\n  ')}${description.truncated ? `\n  … and ${description.fileCount - 10} more` : ''}`
-          : '')
-
-      // 4. 预览：只说不做。
-      if (args.preview === true) {
-        const classification: Classification = classifyPath(target, deps.env)
-        return {
-          ok: true,
-          text:
-            `PREVIEW (nothing moved):\n${summary}\n\n` +
-            `classification: ${classification}` +
-            (requiresApproval(classification) ? ' — will require your approval in the UI' : ' — moves without asking') +
-            `\nretention: ${deps.retentionDays} days\nRun safe_delete again without preview to move it into the safe zone.`,
-        }
-      }
-
-      // 5. 分类与授权。
-      //
-      // 两个**相互独立**的理由都可能导致要人确认：
-      //   a) 路径是危险路径（家目录、profile 清单、node_modules…）；
-      //   b) 这一单"太大量"：条目数或字节数超过阈值。
-      // 两者任一命中就问一次 —— 不叠加问两次，那只是骚扰。
-      const classification = classifyPath(target, deps.env)
-      const countLimit = deps.confirmFileCount ?? 0
-      const bytesLimit = deps.confirmBytes ?? 0
-      const exceedsCount = countLimit > 0 && description.fileCount > countLimit
-      const exceedsBytes = bytesLimit > 0 && description.bytes > bytesLimit
-
-      if (requiresApproval(classification) || exceedsCount || exceedsBytes) {
-        // 说清是哪一条触发的 —— 用户需要知道自己在为什么签字。
-        const reasons: string[] = []
-        if (requiresApproval(classification)) reasons.push(`it is a ${classification} path`)
-        if (exceedsCount) reasons.push(`${description.fileCount} entries exceeds the limit of ${countLimit}`)
-        if (exceedsBytes) reasons.push(`${humanBytes(description.bytes)} exceeds the limit of ${humanBytes(bytesLimit)}`)
-
-        // `force` 在这里被刻意无视：它只作为兼容参数存在，不参与任何判定。
-        const outcome = await deps.requestApproval(
-          `Delete "${target}"? ${description.isDirectory ? `Directory, ${description.fileCount} entries, ` : 'File, '}${humanBytes(description.bytes)}. ` +
-            `Why this needs your OK: ${reasons.join('; ')}. ` +
-            `It will be moved into the safe zone and can be restored for ${deps.retentionDays} days.`,
-        )
-        if (outcome !== 'allowed-once') {
-          return { ok: false, text: '', error: approvalFailureText(outcome, target) }
-        }
-      }
-
-      // 6. 移入安全区。
-      const reason = typeof args.reason === 'string' ? args.reason : undefined
-      const entry = await moveToSafeZone(deps.stateDir, target, {
-        retentionDays: deps.retentionDays,
-        now: now(),
-        ...(reason !== undefined && reason !== '' ? { reason } : {}),
-      })
-
-      appendAudit(deps.stateDir, {
-        event: 'delete',
-        target,
-        tool: 'safe_delete',
-        detail: `id=${entry.id} cls=${classification}${reason === undefined || reason === '' ? '' : ` reason=${reason}`}`,
-      })
-
-      // 7. 顺带清理（时间 + 容量）。
-      const pruned = await pruneNow()
-
-      return {
-        ok: true,
-        text:
-          `moved to the safe zone: ${target}\n` +
-          `id: ${entry.id}\n${summary}\n` +
-          `restore with: safe_zone_restore id=${entry.id}\n` +
-          `expires: ${new Date(entry.expiresAt).toISOString()} (${deps.retentionDays} days)` +
-          (pruned.length > 0 ? `\npruned ${pruned.length} expired/over-cap entr${pruned.length === 1 ? 'y' : 'ies'}` : ''),
-      }
+      if (!result.ok) return { ok: false, text: '', error: result.error }
+      return result.kind === 'preview'
+        ? { ok: true, text: describePreview(result, deps.retentionDays) }
+        : { ok: true, text: describeMoved(result, deps.retentionDays) }
     },
   })
 

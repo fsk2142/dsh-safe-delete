@@ -78,10 +78,19 @@ for (const name of uniqueTools) {
 }
 
 console.log('\n=== README 的 CLI 命令是否都存在 ===')
-for (const cmd of ['list', 'undo', 'prune', 'status', 'check', 'journal']) {
+for (const cmd of ['delete', 'list', 'undo', 'prune', 'status', 'check', 'journal']) {
   const exists = cliSrc.includes(`case '${cmd}'`)
   console.log(`${exists ? 'ok  ' : 'MISSING'}  ${cmd}`)
   if (!exists) mismatches.push(`cli:${cmd}: README 提到但不存在`)
+}
+
+// 斜杠命令的子命令必须都能在 commands.ts 里处理到。
+console.log('\n=== 斜杠命令的子命令是否都已实现 ===')
+const commandsSrc = readFileSync('src/commands.ts', 'utf8')
+for (const sub of ['list', 'restore', 'clean', 'config', 'status']) {
+  const exists = commandsSrc.includes(`verb === '${sub}'`) || commandsSrc.includes(`'${sub}'`)
+  console.log(`${exists ? 'ok  ' : 'MISSING'}  ${sub}`)
+  if (!exists) mismatches.push(`slash:${sub}: 未实现`)
 }
 
 console.log('')
