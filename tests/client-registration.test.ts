@@ -19,30 +19,28 @@ import { makeFakeCtx } from './support/fake-ctx'
  * 之前失效的真正原因。
  */
 describe('client apply', () => {
-  it('declares both remote and remote.settings', () => {
-    // cordis 的守卫对 `ctx.remote.settings` 会**先**检查 `remote`、**再**取 `settings`。
-    // 只声明 `remote.settings` 时，第一步就抛 `cannot get property "remote"
-    // without inject`（`?.` 拦不住，因为错误发生在属性求值处，整棵子树被丢掉）。
-    //
-    // api-gateway 里 `super(ctx, "remote")` 与
-    // `super(ctx, remoteServiceKey(ns))` 是**两个独立服务**，
-    // 官方 dsh-client-ui-settings-general 因此两个都声明。
-    expect(inject).toContain('remote')
-    expect(inject).toContain('remote.settings')
+  it('keeps the top-level inject minimal', () => {
+    // 顶层 inject 缺服务的代价是**整个插件**停在 pending、apply 永不执行。
+    // 所以这里只留宿主一定提供的两个；其余服务走 ctx.inject 子插件获取，
+    // 缺了只让那一步降级，不影响整体激活。
+    expect(inject).toEqual(['slots', 'locale'])
   })
 
-  it('declares every other service it accesses, and only real ones', () => {
-    // 这条规则被误解过三次：
-    //
-    //   声明了宿主不提供的服务 → fiber 停在 pending，apply 永不执行；
-    //   访问了未声明的服务     → guard 在属性**求值**处抛错（`?.` 拦不住），
-    //                            组件子树被错误边界丢掉，界面一片空白。
-    //
-    // 官方 dsh-client-ui-settings-general 声明了
-    // ['slots','locale','connection','remote','remote.settings','configForms',…]
-    expect(inject).toContain('slots')
-    expect(inject).toContain('locale')
-    expect(inject).toContain('configForms')
+  it('requests remote together with remote.settings via ctx.inject', () => {
+    // `ctx.remote.settings` 是两步属性求值：先 `remote`，再 `settings`。
+    // 只请求 `remote.settings` 会在第一步抛
+    // `cannot get property "remote" without inject` —— 0.2.12 的诊断原文。
+    const ctx = makeFakeCtx()
+    const requested: string[][] = []
+    const original = ctx.inject
+    ctx.inject = (services, callback) => {
+      requested.push(services)
+      return original?.(services, callback)
+    }
+    apply(ctx as never)
+    const remoteRequest = requested.find((s) => s.includes('remote.settings'))
+    expect(remoteRequest).toBeDefined()
+    expect(remoteRequest).toContain('remote')
   })
 
   it('registers on plugins.bundle.config, keyed by the package name', () => {
