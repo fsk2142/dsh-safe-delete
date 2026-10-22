@@ -32,6 +32,17 @@ export interface FakeCtxOptions {
   approvalPolicy?: 'ask' | 'never'
   /** 模拟的用户主目录；默认取当前进程的 home。 */
   home?: string
+  /**
+   * 是否提供 cordis 的 `ctx.inject`。
+   *
+   * cordis 里 `commands` 是**服务**，晚于 apply 就绪；直接读 `ctx.commands`
+   * 可能拿到 undefined，于是命令静默不注册。这里两种部署都要能测：
+   *   - `true`：模拟服务晚到（真实情况）
+   *   - `false`：模拟服务已就绪（兜底路径）
+   */
+  withInject?: boolean
+  /** 是否提供服务 `commands`（用于测「服务缺席时不炸」）。 */
+  withCommands?: boolean
 }
 
 export interface FakeCtx {
@@ -43,6 +54,8 @@ export interface FakeCtx {
   registeredTools: FakeRegisteredTool[]
   /** 已注册的系统提示段（断言插件注入了行为约定）。 */
   systemPromptSections: Array<{ name: string; order?: number; text: string }>
+  /** 已注册的斜杠命令（断言命令真的挂上了）。 */
+  registeredCommands: Array<{ name: string; description: string }>
   /** 触发一次 `tools/pre-execute` 瀑布，返回最终决策。 */
   preExecute(exec: { name: string; arguments: Record<string, unknown> }): Promise<FakeDecision>
 }
@@ -50,12 +63,22 @@ export interface FakeCtx {
 export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
   const warnings: string[] = []
   const registeredTools: FakeRegisteredTool[] = []
+  const registeredCommands: Array<{ name: string; description: string }> = []
   const systemPromptSections: Array<{ name: string; order?: number; text: string }> = []
   const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
+
+  /** commands 服务的最小形状。 */
+  const commandRegistry = {
+    register(spec: { name: string; description: string }) {
+      registeredCommands.push({ name: spec.name, description: spec.description })
+      return () => {}
+    },
+  }
 
   const ctx: FakeCtx = {
     warnings,
     registeredTools,
+    registeredCommands,
     systemPromptSections,
     logger: {
       warn: (message: string) => {
@@ -75,6 +98,7 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
       }
       // 与真实 cordis 一致：已挂载的服务既能用 `ctx.x` 访问，也能用 `ctx.get('x')` 取。
       if (id === 'tools') return (ctx as unknown as { tools?: unknown }).tools
+      if (id === 'commands') return commandRegistry
       if (id === 'systemPrompt') return (ctx as unknown as { systemPrompt?: unknown }).systemPrompt
       if (id === 'logger') return ctx.logger
       return undefined
@@ -124,8 +148,32 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
     },
   }
 
-  const withServices = ctx as FakeCtx & { tools: typeof tools; systemPrompt: typeof systemPrompt }
+  const withServices = ctx as FakeCtx & {
+    tools: typeof tools
+    systemPrompt: typeof systemPrompt
+    commands?: typeof commandRegistry
+    inject?: (services: string[], callback: (scoped: { commands?: typeof commandRegistry }) => void) => unknown
+  }
   withServices.tools = tools
   withServices.systemPrompt = systemPrompt
+
+  // 服务 `commands`：默认缺席时的行为也要能测，所以由 options 控制。
+  if (options.withCommands !== false) {
+    withServices.commands = commandRegistry
+  }
+
+  // `ctx.inject`：服务晚到时的正确姿势。默认提供，因为这是真实部署的形态。
+  if (options.withInject !== false) {
+    withServices.inject = (services, callback) => {
+      // 真实 cordis 会等服务就绪后回调；这里同步回调，语义等价。
+      const scoped: { commands?: typeof commandRegistry } = {}
+      if (services.includes('commands') && withServices.commands !== undefined) {
+        scoped.commands = withServices.commands
+      }
+      callback(scoped)
+      return () => {}
+    }
+  }
+
   return withServices
 }

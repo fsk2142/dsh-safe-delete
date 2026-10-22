@@ -15,6 +15,31 @@ describe('apply', () => {
     )
   })
 
+  it('registers the slash command through ctx.inject (service may arrive late)', () => {
+    // `commands` 是 cordis 服务，可能在 apply 之后才就绪。用 ctx.inject 等它，
+    // 而不是直接读 ctx.commands —— 后者在服务未就绪时是 undefined，
+    // 会让命令静默不注册，用户敲 /safe-delete 只得到「未知命令」。
+    const ctx = makeFakeCtx({ withInject: true })
+    apply(ctx as never, { stateDir: 'C:\\tmp\\state' })
+    expect(ctx.registeredCommands.map((c) => c.name)).toContain('safe-delete')
+  })
+
+  it('registers the slash command even without ctx.inject (fallback path)', () => {
+    // 服务已就绪的部署：没有 inject 也要能挂上。
+    const ctx = makeFakeCtx({ withInject: false })
+    apply(ctx as never, { stateDir: 'C:\\tmp\\state' })
+    expect(ctx.registeredCommands.map((c) => c.name)).toContain('safe-delete')
+  })
+
+  it('does not throw when the commands service is absent entirely', () => {
+    // 部署里没装 commands 服务：插件其余部分照常，命令只是没有。
+    const ctx = makeFakeCtx({ withCommands: false, withInject: true })
+    expect(() => apply(ctx as never, { stateDir: 'C:\\tmp\\state' })).not.toThrow()
+    expect(ctx.registeredCommands).toHaveLength(0)
+    // 工具不受影响。
+    expect(ctx.registeredTools.length).toBeGreaterThan(0)
+  })
+
   it('blocks a recursive shell delete and points at safe_delete', async () => {
     const ctx = makeFakeCtx()
     apply(ctx as never, { stateDir: 'C:\\tmp\\state' })

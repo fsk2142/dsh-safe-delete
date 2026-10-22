@@ -601,23 +601,61 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
 
 /**
  * 注册 `/safe-delete` 斜杠命令。
+/**
+ * 注册 `/safe-delete` 斜杠命令。
  *
  * 与设置页的**配置是同一份**：两者都通过宿主的 settings 服务读写，所以命令行改完、
  * 重启后设置页会显示新值，反之亦然。不存在「两处配置需要对账」。
  *
  * 命令不同于工具：它不经过模型，不消耗 token，用户直接触发。
+ *
+ * ## 为什么用 `ctx.inject(['commands'], …)` 而不是直接读 `ctx.commands`
+ *
+ * `commands` 是 cordis 服务，不是挂在 ctx 上的普通属性。直接在 apply 里访问
+ * `ctx.commands` 的风险是：服务尚未就绪时它是 `undefined`，于是 `?.` 静默跳过，
+ * **命令根本没注册**，而且不报错 —— 用户敲 `/safe-delete` 只会得到「未知命令」。
+ *
+ * `ctx.inject` 会让这段回调等服务就绪后再执行（宿主官方的 permission-presets
+ * 就是这么写的），所以服务晚到也能补上。
  */
 function registerCommands(
-  ctx: PluginContext & { commands?: { register?: (spec: unknown) => unknown } },
+  ctx: PluginContext & {
+    inject?: (services: string[], callback: (scoped: { commands?: CommandRegistry }) => void) => unknown
+  },
   adapter: import('./commands').CommandDeps,
 ): void {
-  const register = ctx.commands?.register
-  if (typeof register !== 'function') return
+  /** 真正做注册的那一步。 */
+  const attach = (registry: CommandRegistry | undefined): void => {
+    const register = registry?.register
+    if (typeof register !== 'function') return
+    register.call(registry, {
+      name: 'safe-delete',
+      description: '安全删除：把文件移入安全区（可恢复），或管理安全区与配置（无参数看用法）',
+      input: { hint: '<路径> | clean | config | list | restore <id> | status' },
+      handler: async ({ rawInput }: { rawInput: string }) => runCommand(rawInput, adapter),
+    })
+  }
 
-  register.call(ctx.commands, {
-    name: 'safe-delete',
-    description: '安全删除：把文件移入安全区（可恢复），或管理安全区与配置（无参数看用法）',
-    input: { hint: '<路径> | clean | config | list | restore <id> | status' },
-    handler: async ({ rawInput }: { rawInput: string }) => runCommand(rawInput, adapter),
-  })
+  // 首选：等服务就绪后注入（服务晚挂也能生效）。
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['commands'], (scoped) => attach(scoped.commands))
+      return
+    } catch {
+      /* 落到下面的直接访问 */
+    }
+  }
+
+  // 兜底：直接读（服务已就绪时可用）。
+  attach((ctx as { commands?: CommandRegistry }).commands)
+}
+
+/** commands 服务的最小形状。 */
+interface CommandRegistry {
+  register?: (spec: {
+    name: string
+    description: string
+    input?: { hint: string }
+    handler: (payload: { rawInput: string }) => Promise<{ kind: 'success' | 'error'; text: string }>
+  }) => unknown
 }
