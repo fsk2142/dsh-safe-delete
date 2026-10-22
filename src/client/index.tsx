@@ -801,13 +801,16 @@ export function SafeZoneSettings(): ReactElement {
           border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
           borderRadius: 'var(--dsw-radius-lg, 12px)',
           background: 'var(--dsw-alias-bg-layer-2, transparent)',
-          padding: '14px 16px',
+          padding: '4px 20px 8px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '12px',
+          // gap 为 0：行自带的 `padding: 16px 0` 已经提供了间距。
+          // 之前这里再加 12px，实际行距变成 44px —— 比官方设置页松一倍多，
+          // 这就是"每个设置之间间隔还是太大"的直接原因。
+          gap: '0',
         }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', padding: '16px 0 12px' }}>
           <span style={{ fontWeight: 600, fontSize: '13px', color: 'var(--dsw-alias-label-primary, inherit)' }}>
             安全区设置
           </span>
@@ -840,11 +843,14 @@ export function SafeZoneSettings(): ReactElement {
           if (spec.kind === 'bytes') {
             unit = toBytesInput(current).unit
           } else if (spec.kind === 'duration') {
-            // 单位由用户选（`.unit`），没有选过就挑一个读起来自然的：
-            // 1 天显示成「1 天」而不是「24 小时」。
+            // 这里**只决定单位后缀**，绝不能再赋值 `display`。
+            //
+            // 之前这里重复算了一遍 `display = toDurationInput(...)`，把上面
+            // "用户正在输入就原样显示"的那个分支覆盖掉了 —— 表现就是
+            // 「定时清理间隔输入时不显示，保存后才出现」：每敲一个字符都被
+            // 换回配置里的旧值，输入框看起来像只读。
             const chosen = values[`${spec.key}.unit`]
             const durationUnit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
-            display = toDurationInput(current, durationUnit)
             unit = durationUnit === 'day' ? '天' : '小时'
           } else if (spec.kind === 'percent') {
             unit = '%'
@@ -861,15 +867,18 @@ export function SafeZoneSettings(): ReactElement {
                 // 网格让说明自动对齐到输入框那一列，且容器变窄时不会溢出。
                 display: 'grid',
                 gridTemplateColumns: '150px minmax(0, 1fr)',
-                columnGap: '10px',
-                rowGap: '3px',
+                // 与官方设置页一致：`.PgWN5G_row { gap: 24px; padding: 16px 0 }`
+                columnGap: '24px',
+                rowGap: '4px',
                 alignItems: 'center',
-                // 条目之间用细分隔线分组，而不是靠大间距 —— 设置页的常见做法。
-                paddingTop: spec.key === FIELDS[0]?.key ? '0' : '12px',
-                borderTop:
-                  spec.key === FIELDS[0]?.key ? 'none' : '1px solid var(--dsw-alias-border-l1, #edeff4)',
-                // 分隔线与上方内容留出呼吸，否则线会贴着上一行文字。
-                marginTop: spec.key === FIELDS[0]?.key ? '0' : '2px',
+                // 官方用的是 `border-bottom: .5px solid` 加 `padding: 16px 0`，
+                // 也就是**每行自带上下 padding、分隔线在底部**。之前我用
+                // borderTop + 12px padding + 2px margin，视觉上比官方松且线更粗。
+                padding: spec.key === FIELDS[0]?.key ? '0 0 16px' : '16px 0',
+                borderBottom:
+                  spec.key === FIELDS[FIELDS.length - 1]?.key
+                    ? 'none'
+                    : '.5px solid var(--dsw-alias-border-l2, #e3e8f0)',
               }}
             >
               <label

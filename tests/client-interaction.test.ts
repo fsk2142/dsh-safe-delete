@@ -192,6 +192,16 @@ describe('SafeZoneSettings interaction', () => {
       }
     })
 
+    // ── 输入即时回显 ──
+    //
+    // 曾经有一个 bug：duration 分支里重复算了一遍 `display = toDurationInput(...)`，
+    // 把「用户正在输入就原样显示 draft」的分支覆盖掉。表现是输入框看起来只读，
+    // 敲什么都没反应，保存后才出现 —— 因为每次渲染都被换回配置里的旧值。
+    //
+    // 这里的断言就是那个 bug 的哨兵：输入 '2' 之后，输入框**必须立刻显示 '2'**。
+    console.log('输入 2 之后输入框显示:', intervalInput?.value)
+    expect(intervalInput?.value, '输入应立刻回显，而不是被换算值覆盖').toBe('2')
+
     await act(async () => {
       if (unitSelect !== null) {
         const proto = Object.getPrototypeOf(unitSelect) as object
@@ -200,6 +210,10 @@ describe('SafeZoneSettings interaction', () => {
         unitSelect.dispatchEvent(new Event('change', { bubbles: true }))
       }
     })
+
+    // 改单位之后，输入的数字也不能被覆盖。
+    console.log('改单位之后输入框显示:', intervalInput?.value)
+    expect(intervalInput?.value, '切单位不应抹掉正在输入的数字').toBe('2')
 
     // 改完应该有保存按钮出现。
     const buttons = [...document.querySelectorAll('button')].map((b) => b.textContent)
