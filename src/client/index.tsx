@@ -462,11 +462,24 @@ export function SafeZoneSettings(): ReactElement {
    * 就能告诉我卡在哪一步。
    */
   const diagPanel = (
-    <details style={{ marginBottom: 12, fontSize: 12, opacity: 0.85 }}>
+    <details
+      style={{
+        marginBottom: '12px',
+        fontSize: '12px',
+        color: 'var(--dsw-alias-label-caption, #8a94a6)',
+      }}
+    >
       <summary style={{ cursor: 'pointer' }}>启动诊断（{diagnostics.length} 步）</summary>
-      <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+      <ul style={{ margin: '8px 0 0', paddingLeft: '18px', lineHeight: '1.7' }}>
         {diagnostics.map((item, index) => (
-          <li key={`${item.step}-${index}`} style={{ color: item.ok ? 'inherit' : '#c0392b' }}>
+          <li
+            key={`${item.step}-${index}`}
+            style={{
+              color: item.ok
+                ? 'var(--dsw-alias-label-secondary, #5c6779)'
+                : 'var(--dsw-alias-state-error-primary, #d33)',
+            }}
+          >
             {item.ok ? '✓' : '✗'} {item.step}
             {item.detail === undefined ? '' : ` — ${item.detail}`}
           </li>
@@ -475,122 +488,221 @@ export function SafeZoneSettings(): ReactElement {
     </details>
   )
 
+  /** 状态卡片：加载中/出错也用同一套容器，避免布局跳动。 */
+  const statusCard = (body: ReactElement): ReactElement => (
+    <section
+      style={{
+        border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
+        borderRadius: 'var(--dsw-radius-lg, 12px)',
+        background: 'var(--dsw-alias-bg-layer-2, transparent)',
+        padding: '16px 18px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '10px',
+      }}
+    >
+      {body}
+    </section>
+  )
+
   if (status === 'loading') {
     return (
-      <div style={{ padding: '12px 0' }}>
+      <div style={{ padding: '4px 0' }}>
         {diagPanel}
-        <div>正在读取配置…</div>
+        {statusCard(
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <span style={{ fontWeight: 600, fontSize: '14px' }}>安全区设置</span>
+            <span style={{ fontSize: '12px', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
+              正在读取配置…
+            </span>
+          </div>,
+        )}
       </div>
     )
   }
   if (status === 'error') {
     return (
-      <div style={{ padding: '12px 0', opacity: 0.8 }}>
+      <div style={{ padding: '4px 0' }}>
         {diagPanel}
-        <div>{message}</div>
+        {statusCard(
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <span style={{ fontWeight: 600, fontSize: '14px' }}>安全区设置</span>
+            <span style={{ fontSize: '12px', lineHeight: '1.6', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>
+              {message}
+            </span>
+          </div>,
+        )}
       </div>
     )
   }
 
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', padding: '4px 0' }}>
-      {FIELDS.map((spec) => {
-        // 显示值有两个来源，必须分清：
-        //   - 用户正在输入的原始文本（`<key>.draft`）—— 原样显示，否则每敲一个
-        //     字符就被换算一次，输入框会跳；
-        //   - 从配置读到的**字节/毫秒**值 —— 必须先换算成 GB/小时再显示，
-        //     否则用户会看到 `21474836480 GB` 这种东西。
-        const draft = values[`${spec.key}.draft`]
-        const current = numericOf(values, spec.key, spec.fallback)
-        let display: string
-        let unit = ''
-        if (typeof draft === 'string') {
-          display = draft
-        } else if (spec.kind === 'bytes') {
-          display = toBytesInput(current).amount
-        } else if (spec.kind === 'duration') {
-          display = toHoursInput(current)
-        } else {
-          display = String(current)
-        }
-        if (spec.kind === 'bytes') {
-          unit = toBytesInput(current).unit
-        } else if (spec.kind === 'duration') {
-          unit = '小时'
-        } else if (spec.kind === 'percent') {
-          unit = '%'
-        }
+  /** 共享的输入框样式：贴合宿主设计 token，而不是裸默认样式。 */
+  const fieldStyle = (invalid: boolean): Record<string, string> => ({
+    width: '108px',
+    padding: '6px 10px',
+    borderRadius: 'var(--dsw-radius-md, 8px)',
+    border: `1px solid ${invalid ? 'var(--dsw-alias-state-error-primary, #d33)' : 'var(--dsw-alias-border-l2, #c9d1e0)'}`,
+    background: 'var(--dsw-alias-bg-layer-1, transparent)',
+    color: 'var(--dsw-alias-label-primary, inherit)',
+    font: 'inherit',
+    outline: 'none',
+    boxSizing: 'border-box',
+  })
 
-        return (
-          <label key={spec.key} style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <span style={{ display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap' }}>
-              <span style={{ fontWeight: 500 }}>{spec.label}</span>
-              <input
-                aria-label={spec.label}
-                value={display}
-                onChange={(event) => setField(spec.key, event.target.value)}
-                inputMode="decimal"
-                style={{
-                  width: '96px',
-                  padding: '4px 8px',
-                  borderRadius: '6px',
-                  border: `1px solid ${errors[spec.key] === undefined ? 'var(--dsw-alias-border-secondary, #c9d1e0)' : 'var(--dsw-alias-state-error-primary, #d33)'}`,
-                  background: 'transparent',
-                  color: 'inherit',
-                  font: 'inherit',
-                }}
-              />
-              {spec.kind === 'bytes' ? (
-                <select
-                  aria-label={`${spec.label}单位`}
-                  value={values[`${spec.key}.unit`] === 'MB' ? 'MB' : 'GB'}
-                  onChange={(event) => setField(`${spec.key}.unit`, event.target.value)}
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', padding: '4px 0' }}>
+      {/* 卡片：与宿主设置页一致的容器语言（底色 + 描边 + 圆角）。 */}
+      <section
+        style={{
+          border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
+          borderRadius: 'var(--dsw-radius-lg, 12px)',
+          background: 'var(--dsw-alias-bg-layer-2, transparent)',
+          padding: '16px 18px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '18px',
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+          <span style={{ fontWeight: 600, fontSize: '14px', color: 'var(--dsw-alias-label-primary, inherit)' }}>
+            安全区设置
+          </span>
+          <span style={{ fontSize: '12px', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
+            保存后需重启 DSH 生效。删除的文件先进安全区，可在保留期内取回。
+          </span>
+        </div>
+
+        {FIELDS.map((spec) => {
+          // 显示值有两个来源，必须分清：
+          //   - 用户正在输入的原始文本（`<key>.draft`）—— 原样显示，否则每敲一个
+          //     字符就被换算一次，输入框会跳；
+          //   - 从配置读到的**字节/毫秒**值 —— 必须先换算成 GB/小时再显示，
+          //     否则用户会看到 `21474836480 GB` 这种东西。
+          const draft = values[`${spec.key}.draft`]
+          const current = numericOf(values, spec.key, spec.fallback)
+          let display: string
+          let unit = ''
+          if (typeof draft === 'string') {
+            display = draft
+          } else if (spec.kind === 'bytes') {
+            display = toBytesInput(current).amount
+          } else if (spec.kind === 'duration') {
+            display = toHoursInput(current)
+          } else {
+            display = String(current)
+          }
+          if (spec.kind === 'bytes') {
+            unit = toBytesInput(current).unit
+          } else if (spec.kind === 'duration') {
+            unit = '小时'
+          } else if (spec.kind === 'percent') {
+            unit = '%'
+          }
+
+          return (
+            <div
+              key={spec.key}
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                // 条目之间用细分隔线分组，而不是靠大间距 —— 设置页的常见做法。
+                paddingTop: spec.key === FIELDS[0]?.key ? '0' : '14px',
+                borderTop:
+                  spec.key === FIELDS[0]?.key ? 'none' : '1px solid var(--dsw-alias-border-l1, #edeff4)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                <label
+                  htmlFor={`dsd-${spec.key}`}
                   style={{
-                    padding: '4px 6px',
-                    borderRadius: '6px',
-                    border: '1px solid var(--dsw-alias-border-secondary, #c9d1e0)',
-                    background: 'transparent',
-                    color: 'inherit',
-                    font: 'inherit',
+                    fontSize: '13px',
+                    minWidth: '150px',
+                    color: 'var(--dsw-alias-label-primary, inherit)',
                   }}
                 >
-                  <option value="GB">GB</option>
-                  <option value="MB">MB</option>
-                </select>
-              ) : unit !== '' ? (
-                <span style={{ opacity: 0.7 }}>{unit}</span>
-              ) : null}
-            </span>
-            <span style={{ fontSize: '12px', opacity: 0.65 }}>{spec.hint}</span>
-            {errors[spec.key] !== undefined ? (
-              <span style={{ fontSize: '12px', color: 'var(--dsw-alias-state-error-primary, #d33)' }}>
-                {errors[spec.key]}
+                  {spec.label}
+                </label>
+                <input
+                  id={`dsd-${spec.key}`}
+                  aria-label={spec.label}
+                  aria-invalid={errors[spec.key] !== undefined}
+                  value={display}
+                  onChange={(event) => setField(spec.key, event.target.value)}
+                  inputMode="decimal"
+                  style={fieldStyle(errors[spec.key] !== undefined)}
+                />
+                {spec.kind === 'bytes' ? (
+                  <select
+                    aria-label={`${spec.label}单位`}
+                    value={values[`${spec.key}.unit`] === 'MB' ? 'MB' : 'GB'}
+                    onChange={(event) => setField(`${spec.key}.unit`, event.target.value)}
+                    style={{ ...fieldStyle(false), width: '76px' }}
+                  >
+                    <option value="GB">GB</option>
+                    <option value="MB">MB</option>
+                  </select>
+                ) : unit !== '' ? (
+                  <span style={{ fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>{unit}</span>
+                ) : null}
+              </div>
+              <span
+                style={{
+                  fontSize: '12px',
+                  lineHeight: '1.5',
+                  color: 'var(--dsw-alias-label-caption, #8a94a6)',
+                  // 与输入框左边缘对齐（label 的 minWidth + gap）。
+                  marginLeft: '162px',
+                }}
+              >
+                {spec.hint}
               </span>
-            ) : null}
-          </label>
-        )
-      })}
+              {errors[spec.key] !== undefined ? (
+                <span
+                  style={{
+                    fontSize: '12px',
+                    color: 'var(--dsw-alias-state-error-primary, #d33)',
+                    marginLeft: '162px',
+                  }}
+                >
+                  {errors[spec.key]}
+                </span>
+              ) : null}
+            </div>
+          )
+        })}
+      </section>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '4px' }}>
+      {/* 操作区：独立一行，与卡片保持呼吸感。 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
         <button
           type="button"
           onClick={() => void save()}
           disabled={saving}
           style={{
-            padding: '6px 16px',
-            borderRadius: '8px',
+            padding: '7px 20px',
+            borderRadius: 'var(--dsw-radius-md, 8px)',
             border: 'none',
             cursor: saving ? 'default' : 'pointer',
-            background: 'var(--dsw-alias-interactive-bg-primary, #3355ff)',
-            color: '#fff',
+            background: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, #3355ff))',
+            color: 'var(--dsw-alias-label-primary-foreground, #fff)',
             font: 'inherit',
+            fontWeight: 500,
             opacity: saving ? 0.6 : 1,
           }}
         >
           {saving ? '保存中…' : '保存'}
         </button>
         {message !== '' ? (
-          <span style={{ fontSize: '12px', opacity: 0.8 }} aria-live="polite">
+          <span
+            aria-live="polite"
+            style={{
+              fontSize: '12px',
+              color: saved
+                ? 'var(--dsw-alias-state-success-primary, #1a7f37)'
+                : 'var(--dsw-alias-label-secondary, #5c6779)',
+            }}
+          >
             {saved ? '✓ ' : ''}
             {message}
           </span>
