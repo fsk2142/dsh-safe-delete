@@ -548,6 +548,33 @@ export function apply(ctx: ClientContext): void {
     }
   }
 
+  // locale 字典必须先注册。
+  //
+  // 槽位注册时传的 `locale: NAMESPACE` 指向这个字典；如果字典不存在，
+  // 宿主解析标签会拿到空字符串，配置入口就可能整条不渲染（而且不报错）。
+  //
+  // 写法与官方插件一致：`ctx.effect(() => ctx.locale.register(NS, {zh, en}), label)`
+  // —— `effect` 的回调里只做注册，清理由 cordis 的作用域负责。
+  guarded('register locale dictionaries', () => {
+    const locale = (ctx as unknown as { locale?: { register?: (ns: string, dict: unknown) => unknown } }).locale
+    if (typeof locale?.register !== 'function') {
+      console.error('[dsh-safe-delete] locale.register is unavailable; slot labels may not resolve.')
+      return
+    }
+    const dictionaries = {
+      zh: { settings: '安全区设置', title: '安全区' },
+      en: { settings: 'Safe-zone settings', title: 'Safe zone' },
+    }
+    const register = (): void => {
+      locale.register?.(NAMESPACE, dictionaries)
+    }
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(register, 'dsh-safe-delete: dictionaries')
+    } else {
+      register()
+    }
+  })
+
   guarded('expose settings remote to the form', () => {
     // 表单组件要从模块作用域拿到 remote.settings，这里把它挂上去。
     ;(globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx = ctx
@@ -582,22 +609,34 @@ export function apply(ctx: ClientContext): void {
       } catch (error) {
         console.error(`[dsh-safe-delete] configForms.get("${NAMESPACE}") threw:`, error)
       }
-      forms.whileServed([NAMESPACE], () => {
-        ctx.slots?.inject?.('plugins.bundle.config', () => {
-          ctx.slots?.register?.(
-            {
-              name: 'plugins.bundle.config',
-              key: NAMESPACE,
-              locale: NAMESPACE,
-            },
-            // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
-            ({ view }: { view?: string }) => {
-              if (view === 'summary') return '安全区设置'
-              return <SafeZoneSettings />
-            },
-          )
-        })
-      })
+      const attach = (): unknown => {
+        // 回调必须**返回** register 的清理句柄：cordis 用它在这个 effect
+        // 失效时注销插槽。返回 undefined 会让注册无法被追踪（官方插件就是
+        // 把 register(...) 的返回值直接返回）。
+        const slot = ctx.slots?.register?.(
+          {
+            name: 'plugins.bundle.config',
+            key: NAMESPACE,
+            locale: NAMESPACE,
+          },
+          // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
+          ({ view }: { view?: string }) => {
+            if (view === 'summary') return '安全区设置'
+            return <SafeZoneSettings />
+          },
+        )
+        console.error('[dsh-safe-delete] registered plugins.bundle.config') // 成功日志：定位用
+        return slot
+      }
+
+      const runWhileServed = (): unknown => forms.whileServed?.([NAMESPACE], () => ctx.slots?.inject?.('plugins.bundle.config', attach))
+
+      // 与官方插件一致：注册动作放在 effect 里，让 cordis 负责生命周期。
+      if (typeof ctx.effect === 'function') {
+        ctx.effect(runWhileServed, 'dsh-safe-delete: plugins-page card')
+      } else {
+        runWhileServed()
+      }
     })
   })
 }
