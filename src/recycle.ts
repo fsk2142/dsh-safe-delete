@@ -87,6 +87,37 @@ export function resetRecycleBreaker(): void {
 }
 
 /**
+ * 当前连续失败次数（测试与状态展示用）。
+ *
+ * @returns 连续失败计数。
+ */
+export function recycleFailureCount(): number {
+  return consecutiveFailures
+}
+
+/**
+ * 熔断阈值（测试用，避免在测试里硬编码 3）。
+ *
+ * @returns 连续失败达到多少会跳闸。
+ */
+export function recycleBreakerThreshold(): number {
+  return FAILURE_BREAKER_THRESHOLD
+}
+
+/**
+ * 记录一次失败的回收尝试。
+ *
+ * 抽成函数是为了让**跳闸路径本身**可以被测试直接驱动：真实失败需要 shell 出问题，
+ * 测试无法可靠制造那种环境。生产代码也走这里，所以测的不是影子逻辑。
+ *
+ * @returns 记录之后的连续失败次数。
+ */
+export function recordRecycleFailure(): number {
+  consecutiveFailures += 1
+  return consecutiveFailures
+}
+
+/**
  * 把一个路径移入系统回收站。
  *
  * @param absPath 要移入的绝对路径（文件或目录）。
@@ -112,7 +143,8 @@ export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
   if (outcome.ok) {
     consecutiveFailures = 0
   } else {
-    consecutiveFailures += 1
+    // 走同一个计数入口，保证测试驱动的路径与生产路径是同一份逻辑。
+    recordRecycleFailure()
   }
   return outcome
 }
