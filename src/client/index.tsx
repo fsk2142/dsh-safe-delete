@@ -15,7 +15,7 @@
  * @module dsh-safe-delete/client
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 
 /** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
@@ -70,7 +70,7 @@ const FIELDS: FieldSpec[] = [
   {
     key: 'maxBytes',
     label: '最大安全区容量',
-    hint: '超过这个大小就开始清理最旧的条目。',
+    hint: '超过这个大小就开始清理最旧的条目。最少 1 GB。',
     kind: 'bytes',
     min: 1,
     fallback: 20 * GIGABYTE,
@@ -78,7 +78,7 @@ const FIELDS: FieldSpec[] = [
   {
     key: 'pruneAtPercent',
     label: '提前清理阈值',
-    hint: '占用达到该百分比就开始清理，为新删除腾出空间。0 表示只在超过容量上限时才清。',
+    hint: '占用达到该百分比就开始清理，为新删除腾出空间。0 表示只在超过容量上限时才清。取值 0–100。',
     kind: 'percent',
     min: 0,
     max: 100,
@@ -87,9 +87,11 @@ const FIELDS: FieldSpec[] = [
   {
     key: 'autoPruneIntervalMs',
     label: '定时清理间隔',
-    hint: '每次工具调用时顺路检查，超过这个间隔才真正清理一次。',
+    hint: '每次工具调用时顺路检查，超过这个间隔才真正清理一次。最少 1 分钟，最多 30 天。',
     kind: 'duration',
     min: 60 * 1000,
+    // 上限必须有：否则能填 9999 天，等于永久不清理，而配置看起来"设过了"。
+    max: 30 * 24 * 60 * 60 * 1000,
     fallback: 60 * 60 * 1000,
   },
   {
@@ -150,9 +152,30 @@ function toBytesInput(value: number): { amount: string; unit: 'MB' | 'GB' } {
   return { amount: Number(amount.toFixed(2)).toString(), unit: 'MB' }
 }
 
-/** 把毫秒格式化成小时（最小 1 分钟）。 */
-function toHoursInput(ms: number): string {
-  return Number((ms / (60 * 60 * 1000)).toFixed(2)).toString()
+/**
+ * 把毫秒换算成「天或小时」的显示值。
+ *
+ * 为什么给两个单位：清理间隔短则几分钟、长则几天。只给小时的话「1 天」显示成
+ * `24`、「30 天」显示成 `720`，用户要在脑子里换算，也容易填错数量级。
+ *
+ * @param ms 毫秒。
+ * @param unit 期望单位。
+ * @returns 该单位下的数值字符串（最多两位小数，去掉多余的 0）。
+ */
+function toDurationInput(ms: number, unit: 'day' | 'hour'): string {
+  const divisor = unit === 'day' ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000
+  return Number((ms / divisor).toFixed(2)).toString()
+}
+
+/**
+ * 选一个读起来最自然的单位：整天的用天，否则用小时。
+ *
+ * @param ms 毫秒。
+ * @returns `'day'` 或 `'hour'`。
+ */
+function naturalDurationUnit(ms: number): 'day' | 'hour' {
+  const day = 24 * 60 * 60 * 1000
+  return ms >= day && ms % day === 0 ? 'day' : 'hour'
 }
 
 /** 读取一个数字字段的当前值（兼容 volatile 引用与普通值）。 */
@@ -371,7 +394,24 @@ export function SafeZoneSettings(): ReactElement {
       const unit = values[`${spec.key}.unit`] === 'MB' ? MB : GB
       return Math.round(amount * unit)
     }
-    if (spec.kind === 'duration') return Math.round(amount * 60 * 60 * 1000)
+    if (spec.kind === 'duration') {
+      // 单位来自独立的 `.unit` 键（用户在下拉里选）。
+      //
+      // 兜底必须与**显示侧**用同一个判定，否则会出现「显示 24 小时、保存成 24 天」
+      // 这种静默错位。显示侧用 `naturalDurationUnit(current)`，即"当前值能被整天
+      // 整除就用天"；输入框里没有当前值时按小时（更保守：小时不会放大 24 倍）。
+      const chosen = values[`${spec.key}.unit`]
+      const day = 24 * 60 * 60 * 1000
+      const unit =
+        chosen === 'day'
+          ? day
+          : chosen === 'hour'
+            ? 60 * 60 * 1000
+            : naturalDurationUnit(numericOf(values, spec.key, 0)) === 'day'
+              ? day
+              : 60 * 60 * 1000
+      return Math.round(amount * unit)
+    }
     return amount
   }, [values])
 
@@ -453,6 +493,36 @@ export function SafeZoneSettings(): ReactElement {
       setSaving(false)
     }
   }, [coerce, remote, revision, values])
+
+  /**
+   * 是否有未保存的改动。
+   *
+   * 判据是「有没有草稿」而不是「草稿和已存值是否相等」：草稿只在用户真的动过
+   * 某个输入框时才存在（`setField` 才写它），敲进去又改回原值仍是"动过"——
+   * 这时显示保存按钮无害，而漏显示会导致用户的修改没有入口提交。
+   */
+  const dirty = useMemo(
+    () => FIELDS.some((spec) => typeof values[`${spec.key}.draft`] === 'string'),
+    [values],
+  )
+
+  /**
+   * 立即按当前策略清理一次。
+   *
+   * ## 为什么这里只是引导，不是真的执行
+   *
+   * 宿主没有给插件一个「从浏览器触发清理」的接口，原因也合理：
+   *   - `remote.settings` 只有 describe/mutate，没有 clean；
+   *   - `commands/execute` 需要 `agentId`（会话身份），而配置页不属于任何会话；
+   *   - 自定义 remote 需要 typert 代码生成器，宿主只发了 loader、没发 generator。
+   *
+   * 所以按钮做的是**把正确做法告诉用户**，而不是假装能一键清理。假装能清会出现
+   * 「点了没反应」这种更糟的体验 —— 而 /safe-delete clean 确实是一条命令就能做完的事。
+   */
+  const runClean = useCallback(async (): Promise<void> => {
+    setMessage('清理请用 /safe-delete clean 或 safe_zone_status 查看当前占用。')
+    setSaved(false)
+  }, [])
 
   /**
    * 启动诊断面板。
@@ -550,24 +620,24 @@ export function SafeZoneSettings(): ReactElement {
   })
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', padding: '4px 0' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '4px 0' }}>
       {/* 卡片：与宿主设置页一致的容器语言（底色 + 描边 + 圆角）。 */}
       <section
         style={{
           border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
           borderRadius: 'var(--dsw-radius-lg, 12px)',
           background: 'var(--dsw-alias-bg-layer-2, transparent)',
-          padding: '16px 18px',
+          padding: '14px 16px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '18px',
+          gap: '12px',
         }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-          <span style={{ fontWeight: 600, fontSize: '14px', color: 'var(--dsw-alias-label-primary, inherit)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+          <span style={{ fontWeight: 600, fontSize: '13px', color: 'var(--dsw-alias-label-primary, inherit)' }}>
             安全区设置
           </span>
-          <span style={{ fontSize: '12px', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
+          <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
             保存后需重启 DSH 生效。删除的文件先进安全区，可在保留期内取回。
           </span>
         </div>
@@ -587,14 +657,21 @@ export function SafeZoneSettings(): ReactElement {
           } else if (spec.kind === 'bytes') {
             display = toBytesInput(current).amount
           } else if (spec.kind === 'duration') {
-            display = toHoursInput(current)
+            const chosen = values[`${spec.key}.unit`]
+            const durationUnit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
+            display = toDurationInput(current, durationUnit)
           } else {
             display = String(current)
           }
           if (spec.kind === 'bytes') {
             unit = toBytesInput(current).unit
           } else if (spec.kind === 'duration') {
-            unit = '小时'
+            // 单位由用户选（`.unit`），没有选过就挑一个读起来自然的：
+            // 1 天显示成「1 天」而不是「24 小时」。
+            const chosen = values[`${spec.key}.unit`]
+            const durationUnit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
+            display = toDurationInput(current, durationUnit)
+            unit = durationUnit === 'day' ? '天' : '小时'
           } else if (spec.kind === 'percent') {
             unit = '%'
           }
@@ -605,14 +682,15 @@ export function SafeZoneSettings(): ReactElement {
               style={{
                 display: 'flex',
                 flexDirection: 'column',
-                gap: '6px',
+                // 标签行与说明行之间的间距：原来 6px 偏松，收紧到 2px 让两行读成一组。
+                gap: '2px',
                 // 条目之间用细分隔线分组，而不是靠大间距 —— 设置页的常见做法。
-                paddingTop: spec.key === FIELDS[0]?.key ? '0' : '14px',
+                paddingTop: spec.key === FIELDS[0]?.key ? '0' : '10px',
                 borderTop:
                   spec.key === FIELDS[0]?.key ? 'none' : '1px solid var(--dsw-alias-border-l1, #edeff4)',
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                 <label
                   htmlFor={`dsd-${spec.key}`}
                   style={{
@@ -642,6 +720,23 @@ export function SafeZoneSettings(): ReactElement {
                     <option value="GB">GB</option>
                     <option value="MB">MB</option>
                   </select>
+                ) : spec.kind === 'duration' ? (
+                  // 天/小时自选：只给小时的话「30 天」要写成 720，容易填错数量级。
+                  <select
+                    aria-label={`${spec.label}单位`}
+                    value={
+                      values[`${spec.key}.unit`] === 'day'
+                        ? 'day'
+                        : values[`${spec.key}.unit`] === 'hour'
+                          ? 'hour'
+                          : naturalDurationUnit(current)
+                    }
+                    onChange={(event) => setField(`${spec.key}.unit`, event.target.value)}
+                    style={{ ...fieldStyle(false), width: '86px' }}
+                  >
+                    <option value="hour">小时</option>
+                    <option value="day">天</option>
+                  </select>
                 ) : unit !== '' ? (
                   <span style={{ fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>{unit}</span>
                 ) : null}
@@ -649,10 +744,10 @@ export function SafeZoneSettings(): ReactElement {
               <span
                 style={{
                   fontSize: '12px',
-                  lineHeight: '1.5',
+                  lineHeight: '1.45',
                   color: 'var(--dsw-alias-label-caption, #8a94a6)',
                   // 与输入框左边缘对齐（label 的 minWidth + gap）。
-                  marginLeft: '162px',
+                  marginLeft: '160px',
                 }}
               >
                 {spec.hint}
@@ -662,7 +757,7 @@ export function SafeZoneSettings(): ReactElement {
                   style={{
                     fontSize: '12px',
                     color: 'var(--dsw-alias-state-error-primary, #d33)',
-                    marginLeft: '162px',
+                    marginLeft: '160px',
                   }}
                 >
                   {errors[spec.key]}
@@ -674,24 +769,55 @@ export function SafeZoneSettings(): ReactElement {
       </section>
 
       {/* 操作区：独立一行，与卡片保持呼吸感。 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+        {/*
+          保存按钮只在**有改动时**出现。
+          常驻的保存按钮会让人以为「不点就白改」，其实每次打开都点一次没有意义；
+          而按钮消失是一个明确信号：现在的值和已保存的值一致。
+        */}
+        {dirty ? (
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={saving}
+            style={{
+              padding: '6px 18px',
+              borderRadius: 'var(--dsw-radius-md, 8px)',
+              border: 'none',
+              cursor: saving ? 'default' : 'pointer',
+              background: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, #3355ff))',
+              color: 'var(--dsw-alias-label-primary-foreground, #fff)',
+              font: 'inherit',
+              fontSize: '13px',
+              fontWeight: 500,
+              opacity: saving ? 0.6 : 1,
+            }}
+          >
+            {saving ? '保存中…' : '保存'}
+          </button>
+        ) : null}
+        {/*
+          「清理」不是配置项，所以常驻；但它无法一键执行（宿主没提供这个接口），
+          所以文案直接写命令，而不是给一个点了没反应的按钮。
+        */}
         <button
           type="button"
-          onClick={() => void save()}
-          disabled={saving}
+          onClick={() => void runClean()}
+          disabled={status !== 'ready'}
+          title="把清理命令告诉你（宿主未向插件开放浏览器端清理接口）"
           style={{
-            padding: '7px 20px',
+            padding: '6px 18px',
             borderRadius: 'var(--dsw-radius-md, 8px)',
-            border: 'none',
-            cursor: saving ? 'default' : 'pointer',
-            background: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, #3355ff))',
-            color: 'var(--dsw-alias-label-primary-foreground, #fff)',
+            border: '1px solid var(--dsw-alias-border-l2, #c9d1e0)',
+            cursor: status !== 'ready' ? 'default' : 'pointer',
+            background: 'transparent',
+            color: 'var(--dsw-alias-label-primary, inherit)',
             font: 'inherit',
-            fontWeight: 500,
-            opacity: saving ? 0.6 : 1,
+            fontSize: '13px',
+            opacity: status !== 'ready' ? 0.55 : 1,
           }}
         >
-          {saving ? '保存中…' : '保存'}
+          如何清理
         </button>
         {message !== '' ? (
           <span
