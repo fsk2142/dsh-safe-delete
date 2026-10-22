@@ -782,7 +782,7 @@ export function apply(ctx: ClientContext): void {
   }
 
   // locale 字典必须先注册。
-  //  // 槽位注册时传的 `locale: NAMESPACE` 指向这个字典；如果字典不存在，
+  // 槽位注册时传的 `locale: NAMESPACE` 指向这个字典；如果字典不存在，
   // 宿主解析标签会拿到空字符串，配置入口就可能整条不渲染（而且不报错）。
   //
   // 写法与官方插件一致：`ctx.effect(() => ctx.locale.register(NS, {zh, en}), label)`
@@ -854,7 +854,14 @@ export function apply(ctx: ClientContext): void {
     //      服务撤销时会自动注销插槽。
     //   3. `plugins.bundle.config` 而非 `plugins.row.config` —— 本插件是一个
     //      bundle，key 是**包名**（不是 `<包名>#<行 id>`，那是单行配置用的）。
-    ctx.inject?.(['configForms'], (scoped) => {
+    //
+    // `ctx.inject` 不可用时不能静默跳过 —— 诊断体系的意义就是不留盲区。
+    const injectFn = (ctx as unknown as { inject?: ClientContext['inject'] }).inject
+    if (typeof injectFn !== 'function') {
+      note('register the config page on the plugin page', false, 'ctx.inject is unavailable')
+      return
+    }
+    injectFn(['configForms'], (scoped) => {
       const service = scoped as {
         // 子 ctx 同时带 slots 与 effect：父 fiber 已声明 slots，子 fiber 沿链能取到。
         slots?: {
@@ -905,7 +912,9 @@ export function apply(ctx: ClientContext): void {
             return <SafeZoneSettings />
           },
         )
-        console.error('[dsh-safe-delete] registered plugins.bundle.config') // 成功日志：定位用
+        // 成功用 info 级别（不是 error）：控制台里红字会被读成失败。
+        // 诊断面板已经记了这一步，这行只是控制台里的方便标记。
+        console.info('[dsh-safe-delete] registered plugins.bundle.config')
         return slot
       }
 

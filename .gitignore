@@ -9,17 +9,20 @@ icon-preview.html
 icon-preview.png
 icon-solo.png
 
-# 提交信息草稿与 release 请求体。
+# 提交信息草稿、tag message 草稿、release 请求体。
 #
-# 为什么要写在这里而不是靠自觉：这些文件曾 4 次被 `git add -A` 混进提交
-# （其中一次进了已打 tag 的发布提交）。只要它们在仓库根，就会被下一次
-# 全量暂存带上。忽略比"每次记得删"可靠。
-.msg-*
-.msg2
+# 为什么用通配而不是逐条列举：这些文件已经**混进过 5 次**提交（其中两次进了
+# 已打 tag 的发布树）。每次都是因为新起了一个名字、而 .gitignore 只列了旧名字
+# （`.commit-msg.txt` → `.msg-*` → `.msg2` → `.tagmsg*` ……）。逐条补是打补丁，
+# 一次通配才是止血。
+#
+# 覆盖范围：仓库根下以点开头的、含 msg/cm/rel 字样的临时文件。
+# 代价：今后不能再往仓库根放这类命名的正经文件 —— 它们本来就该放 docs/ 或 scripts/。
+.*msg*
+.*rel*.json
+.release.json
 .cm
 .cm2
-.rel*.json
-.release.json
 
 # lib/ 是**发布产物，必须进版本库**。
 #
