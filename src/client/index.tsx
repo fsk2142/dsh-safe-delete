@@ -357,8 +357,23 @@ export function SafeZoneSettings(): ReactElement {
         return
       }
       try {
-        const payload = await resolved.describe()
+        const raw = await resolved.describe()
         if (!alive) return
+        // **describe 也返回信封**：`{ ok: true, value: { writable, namespaces } }`。
+        //
+        // 这就是"写入成功、界面永远显示默认值"的根因：mutate 我拆了信封，
+        // describe 没拆，于是 pickNamespace 在 `{ok,value}` 这一层找 `namespaces`
+        // —— 永远找不到，界面只能回落到默认值。
+        // 诊断截图里的 `host namespaces — empty list` 是直接证据。
+        const unwrapped = unwrapRemote(raw)
+        const payload = unwrapped.ok ? unwrapped.value : undefined
+        if (!unwrapped.ok) {
+          setStatus('error')
+          setMessage(`读取配置失败：${unwrapped.error}`)
+          note('describe() envelope', false, unwrapped.error)
+          return
+        }
+        note('describe() envelope', true, 'unwrapped')
         const view = pickNamespace(payload)
         setValues(view.value)
         setRevision(view.revision)
@@ -590,7 +605,9 @@ export function SafeZoneSettings(): ReactElement {
       try {
         const refreshed = activeRemote.describe === undefined ? undefined : await activeRemote.describe()
         if (refreshed !== undefined) {
-          const view = pickNamespace(refreshed)
+          // 同样要拆信封（见上方 describe 的说明）。
+          const refreshedUnwrapped = unwrapRemote(refreshed)
+          const view = pickNamespace(refreshedUnwrapped.ok ? refreshedUnwrapped.value : undefined)
           setRevision(view.revision)
           const wroteSomething = Object.keys(payload).length > 0
           const confirmed =
@@ -670,13 +687,22 @@ export function SafeZoneSettings(): ReactElement {
    */
   const diagPanel = (
     <details
+      // 默认展开：诊断的存在意义就是"用户不需要额外操作就能看到"。
+      // 之前用折叠面板，结果打开页面看起来"什么都没有"——问题在最需要被看见时
+      // 恰好藏起来了。
+      open
       style={{
         marginBottom: '12px',
         fontSize: '12px',
         color: 'var(--dsw-alias-label-caption, #8a94a6)',
+        border: '1px dashed var(--dsw-alias-border-l2, #c9d1e0)',
+        borderRadius: 'var(--dsw-radius-md, 8px)',
+        padding: '8px 10px',
       }}
     >
-      <summary style={{ cursor: 'pointer' }}>启动诊断（{diagnostics.length} 步）</summary>
+      <summary style={{ cursor: 'pointer', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>
+        启动诊断（{diagnostics.length} 步）
+      </summary>
       <ul style={{ margin: '8px 0 0', paddingLeft: '18px', lineHeight: '1.7' }}>
         {diagnostics.map((item, index) => (
           <li
@@ -685,6 +711,8 @@ export function SafeZoneSettings(): ReactElement {
               color: item.ok
                 ? 'var(--dsw-alias-label-secondary, #5c6779)'
                 : 'var(--dsw-alias-state-error-primary, #d33)',
+              // 失败项加粗：一眼能看到哪一步不对。
+              fontWeight: item.ok ? 400 : 600,
             }}
           >
             {item.ok ? '✓' : '✗'} {item.step}
