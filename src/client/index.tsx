@@ -21,6 +21,24 @@ import type { ReactElement } from 'react'
 /** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
 const NAMESPACE = 'dsh-safe-delete'
 
+/**
+ * 启动诊断记录。
+ *
+ * 为什么要这个东西：配置页连续几版都不显示，而控制台里看不到任何线索 ——
+ * 「apply 没执行」「注册被丢弃」「渲染条件不满足」三种情况在界面上长得一模一样。
+ * 把每一步的结果留下来，并渲染到表单顶部，就能一眼区分它们，不必开控制台。
+ *
+ * 同时挂到 `globalThis` 上，方便在控制台里直接看 `__dshSafeDeleteDiag`。
+ */
+const diagnostics: Array<{ at: number; step: string; ok: boolean; detail?: string }> = []
+
+function note(step: string, ok: boolean, detail?: string): void {
+  diagnostics.push({ at: Date.now(), step, ok, ...(detail === undefined ? {} : { detail }) })
+  if (typeof globalThis !== 'undefined') {
+    ;(globalThis as { __dshSafeDeleteDiag?: unknown }).__dshSafeDeleteDiag = diagnostics
+  }
+}
+
 /** 字节单位。 */
 const MB = 1024 * 1024
 const GB = 1024 * MB
@@ -395,9 +413,42 @@ export function SafeZoneSettings(): ReactElement {
     }
   }, [coerce, remote, revision, values])
 
-  if (status === 'loading') return <div style={{ padding: '12px 0' }}>正在读取配置…</div>
+  /**
+   * 启动诊断面板。
+   *
+   * 为什么需要它：配置页连续几版不显示，而三种失败（apply 没跑 / 注册被丢弃 /
+   * 表单没渲染）在界面上完全一样。把启动链路直接画在表单里，用户不必开控制台
+   * 就能告诉我卡在哪一步。
+   */
+  const diagPanel = (
+    <details style={{ marginBottom: 12, fontSize: 12, opacity: 0.85 }}>
+      <summary style={{ cursor: 'pointer' }}>启动诊断（{diagnostics.length} 步）</summary>
+      <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+        {diagnostics.map((item, index) => (
+          <li key={`${item.step}-${index}`} style={{ color: item.ok ? 'inherit' : '#c0392b' }}>
+            {item.ok ? '✓' : '✗'} {item.step}
+            {item.detail === undefined ? '' : ` — ${item.detail}`}
+          </li>
+        ))}
+      </ul>
+    </details>
+  )
+
+  if (status === 'loading') {
+    return (
+      <div style={{ padding: '12px 0' }}>
+        {diagPanel}
+        <div>正在读取配置…</div>
+      </div>
+    )
+  }
   if (status === 'error') {
-    return <div style={{ padding: '12px 0', opacity: 0.8 }}>{message}</div>
+    return (
+      <div style={{ padding: '12px 0', opacity: 0.8 }}>
+        {diagPanel}
+        <div>{message}</div>
+      </div>
+    )
   }
 
   return (
@@ -539,18 +590,21 @@ export const inject = ['slots', 'locale']
  * 失败的那一步会被指名道姓地打出来，其余步骤照常。
  */
 export function apply(ctx: ClientContext): void {
+  note('apply() entered', true, `inject=[${inject.join(',')}]`)
+
   const guarded = (step: string, run: () => void): void => {
     try {
       run()
+      note(step, true)
     } catch (error) {
       // 用 console.error 而不是 warn：激活失败要能在控制台里一眼看到。
       console.error(`[dsh-safe-delete] ${step} failed:`, error)
+      note(step, false, error instanceof Error ? error.message : String(error))
     }
   }
 
   // locale 字典必须先注册。
-  //
-  // 槽位注册时传的 `locale: NAMESPACE` 指向这个字典；如果字典不存在，
+  //  // 槽位注册时传的 `locale: NAMESPACE` 指向这个字典；如果字典不存在，
   // 宿主解析标签会拿到空字符串，配置入口就可能整条不渲染（而且不报错）。
   //
   // 写法与官方插件一致：`ctx.effect(() => ctx.locale.register(NS, {zh, en}), label)`
@@ -559,6 +613,7 @@ export function apply(ctx: ClientContext): void {
     const locale = (ctx as unknown as { locale?: { register?: (ns: string, dict: unknown) => unknown } }).locale
     if (typeof locale?.register !== 'function') {
       console.error('[dsh-safe-delete] locale.register is unavailable; slot labels may not resolve.')
+      note('locale.register', false, `locale=${typeof locale}, register=${typeof locale?.register}`)
       return
     }
     const dictionaries = {
@@ -602,8 +657,10 @@ export function apply(ctx: ClientContext): void {
         console.error(
           '[dsh-safe-delete] configForms service is missing get()/whileServed(); the settings form will not appear.',
         )
+        note('configForms service', false, `get=${typeof forms?.get}, whileServed=${typeof forms?.whileServed}`)
         return
       }
+      note('configForms service', true)
       try {
         forms.get(NAMESPACE)
       } catch (error) {
@@ -638,5 +695,28 @@ export function apply(ctx: ClientContext): void {
         runWhileServed()
       }
     })
+  })
+
+  // 把诊断结果写进页面标题栏。
+  //
+  // 为什么不用表单：槽位没渲染时表单根本不存在，那就没有任何地方能看到这些记录。
+  // 标题栏是宿主自己的，一定能碰 —— 这样即使注册被丢弃，也能确认 apply 跑过了。
+  guarded('publish diagnostics to the document title', () => {
+    const doc = (globalThis as { document?: Document }).document
+    if (doc === undefined) {
+      note('document unavailable', false)
+      return
+    }
+    const okCount = diagnostics.filter((d) => d.ok).length
+    const badCount = diagnostics.length - okCount
+    const suffix = badCount === 0 ? `✓${okCount}` : `✓${okCount} ✗${badCount}`
+    const timer = (globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown }).setTimeout
+    if (typeof timer === 'function') {
+      // 延后一点：让宿主的标题更新先生效，再覆盖，避免被冲掉。
+      timer(() => {
+        doc.title = `${doc.title.replace(/\s*·\s*dsh-safe-delete.*$/, '')} · dsh-safe-delete ${suffix}`
+      }, 1500)
+    }
+    note('publish diagnostics', true, suffix)
   })
 }
