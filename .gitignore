@@ -9,6 +9,18 @@ icon-preview.html
 icon-preview.png
 icon-solo.png
 
+# 提交信息草稿与 release 请求体。
+#
+# 为什么要写在这里而不是靠自觉：这些文件曾 4 次被 `git add -A` 混进提交
+# （其中一次进了已打 tag 的发布提交）。只要它们在仓库根，就会被下一次
+# 全量暂存带上。忽略比"每次记得删"可靠。
+.msg-*
+.msg2
+.cm
+.cm2
+.rel*.json
+.release.json
+
 # lib/ 是**发布产物，必须进版本库**。
 #
 # package.json 的 main / types / exports 与 cordis.patch.yml 里的 name 全部指向

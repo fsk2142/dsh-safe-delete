@@ -102,8 +102,11 @@ function unwrapExecutedCommand(command: string): string | null {
   // `python -c 'import shutil; shutil.rmtree("/tmp/x")'` 的删除动词是**静态可见**的，
   // 只是被引号包住了 —— 与「运行时动态构造的命令」那种真正看不清的情况不同。
   // 脚本体交给嵌套解析处理（分号/换行切分已经就绪）。
+  //
+  // 细节：允许可选路径前缀（`/usr/bin/python`）与标志后无空格（`python -c'...'`）——
+  // 两者都是合法 shell 写法，朴素匹配会漏。
   const interpreter =
-    /^(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)\s+(?:-c|-e|-E|-r)\s+([\s\S]+)$/i.exec(trimmed)
+    /^(?:[^\s]*[\\/])?(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)\s*(?:-c|-e|-E|-r)\s*([\s\S]+)$/i.exec(trimmed)
   if (interpreter !== null) {
     return stripOuterQuotes(interpreter[1]!.trim())
   }
@@ -698,6 +701,50 @@ function targetFromPattern(command: string, label: string): string | null {
 }
 
 /**
+ * 判断一段被包装执行的脚本体是否**明确没有任何删除可能**。
+ *
+ * 用于 `node -e 'console.log(1)'` 这类高频无害写法：让它们直接放行，而不是
+ * 每一条都弹审批卡。审批疲劳会让人无脑点同意，那比少问一次更危险。
+ *
+ * 判据（全部满足才算无害）：
+ *   1. 没有任何删除动词出现在命令位（含「把删除当参数转发」的工具）；
+ *   2. 没有不透明执行（Base64、`-EncodedCommand`）；
+ *   3. 没有删除模式（`find -delete`、`rsync --delete`、`.unlink(` 等）；
+ *   4. 没有任何命令替换（替换里可能有看不见的东西）。
+ *
+ * 任何一条不满足就不算「明确无害」，交给上层按「看不清」处理。
+ *
+ * @param body 脚本体文本。
+ * @returns 明确无害时为 `true`。
+ */
+function isPlainlyHarmless(body: string): boolean {
+  if (body.trim() === '') return true
+  if (OPAQUE_EXECUTION.some((pattern) => pattern.test(body))) return false
+  if (DELETE_PATTERNS.some((pattern) => pattern.pattern.test(body))) return false
+  if (containsDeleteCommand(body)) return false
+
+  // 函数式调用形态：`fs.rmSync(...)`、`shutil.rmtree(...)`、`File.delete(...)`。
+  //
+  // `containsDeleteCommand` 只看"命令位的动词"，摸不到这种写法 —— 而
+  // `node -e 'require("fs").rmSync("/x")'` 正是它。漏了这条就会把真删除
+  // 判成无害（本轮改动一度造成这个回归）。
+  if (CALL_STYLE_DELETE.test(body)) return false
+
+  // 命令替换里可能藏着删除，看不清就不算无害。
+  if (commandSubstitutions(body).length > 0) return false
+
+  return true
+}
+
+/**
+ * 函数式删除调用。
+ *
+ * 覆盖语言标准库里"名字里就写着删除"的方法：`rmSync`、`rmtree`、`unlinkSync`、
+ * `remove`、`File.delete`、`os.remove`…
+ */
+const CALL_STYLE_DELETE = /(?:^|[^\w])(?:rm|rmdir|removedir|unlink)(?:sync|_sync)?\s*\(|(?:rmtree|shutil\s*\.\s*rmtree)\s*\(|\.delete\s*\(|(?:os|fs|shutil)\s*\.\s*(?:remove|unlink|rmdir)\s*\(/i
+
+/**
  * 解析命令文本。
  *
  * @param command 命令原文（可以是 shell 命令，也可以是 `run_code` 的代码体）。
@@ -714,6 +761,16 @@ export function parseCommand(command: string): CommandVerdict {
   // 这条必须排在所有删除判定之前，否则 `echo "rm -rf /tmp"` 会被误拦。
   if (mentionsOnly(raw)) return { destructive: false }
 
+  // 不透明执行（Base64 编码命令等）：静态看不到内容，不能判成安全。
+  //
+  // **必须排在 unwrap 之前**：`powershell -EncodedCommand <base64>` 也会命中
+  // unwrap 的包装器分支，而它的"脚本体"只是一串 base64 —— 若先走 unwrap，
+  // 那串字符不含删除动词，会被判成无害放行。那是真实绕过。
+  if (OPAQUE_EXECUTION.some((pattern) => pattern.test(raw))) {
+    const recursive = RECURSIVE_FLAGS.some((flag) => lower.includes(flag))
+    return { destructive: true, kind: 'delete', recursive, target: null }
+  }
+
   // 包装器命令：`cmd /c "…"`、`sh -c "…"`、`powershell -Command "…"`、
   // `Invoke-Expression "…"` —— 引号里那一段**会被真的执行**。
   //
@@ -724,16 +781,18 @@ export function parseCommand(command: string): CommandVerdict {
   if (wrapped !== null) {
     const inner = parseCommand(wrapped)
     if (inner.destructive) return inner
-    // 内层不是删除，但外层是包装执行：仍然要让人看一眼，因为内层可能有
-    // 静态看不出来的构造。
-    return { destructive: true, kind: 'delete', recursive: false, target: null }
-  }
 
-  // 不透明执行（Base64 编码命令等）：静态看不到内容，不能判成安全。
-  // 交给人类看一眼，而不是放行。
-  if (OPAQUE_EXECUTION.some((pattern) => pattern.test(raw))) {
-    const recursive = RECURSIVE_FLAGS.some((flag) => lower.includes(flag))
-    return { destructive: true, kind: 'delete', recursive, target: null }
+    // 内层明确无害时放行，而不是一律问人。
+    //
+    // 为什么要区分：`node -e 'console.log(1)'`、`python -c 'print("hi")'` 是高频
+    // 开发写法，全部弹卡会造成审批疲劳 —— 而审批疲劳会让人无脑点同意，反而更危险。
+    //
+    // 判据是「这段脚本里根本没有任何删除可能」：既没有删除动词（`mentionsOnly`
+    // 已排除"仅提及"），也没有不透明执行、没有删除模式。两者都满足才放行。
+    if (isPlainlyHarmless(wrapped)) return { destructive: false }
+
+    // 否则仍然要让人看一眼：内层可能有静态看不出来的构造。
+    return { destructive: true, kind: 'delete', recursive: false, target: null }
   }
 
   // 不经过删除动词的构造（find -delete / rsync --delete / .Delete() / unlink …）。
