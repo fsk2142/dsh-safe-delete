@@ -629,13 +629,24 @@ export function SafeZoneSettings(): ReactElement {
  * 官方 `dsh-client-ui-settings-general` 因此**两个都声明**：
  *   ['slots','locale','connection','remote','remote.settings','configForms',…]
  *
- * 本插件按同样规则声明五项：
- *   - `slots`、`locale`：注册 UI 与标签字典；
- *   - `configForms`：宿主渲染配置区时要调 `ctx.configForms.describe()` / `.get(id)`；
- *   - `remote`：访问 `ctx.remote` 这一层；
- *   - `remote.settings`：具体的 settings 命名空间方法。
+ * ## 为什么顶层只留 slots / locale
+ *
+ * 顶层 inject 缺一个服务，整个插件停在 `FIBER_PENDING`，`apply` 永不执行 ——
+ * 代价是整个界面消失。而 `ctx.inject(services, cb)` 内部是
+ * `this.plugin({ inject: services, apply: cb })`，创建的是**子插件**：
+ * 子 fiber 有独立的 inject 列表，缺服务只让那个子插件停住，其余步骤照常。
+ *
+ * 所以能晚取的都晚取：`configForms` 与 `remote.settings` 都走 `ctx.inject`。
+ * 顶层只留宿主一定提供的 `slots`、`locale`。
+ *
+ * ## 一处易错点：`remote` 与 `remote.settings` 是**两个服务**
+ *
+ * 客户端 api-gateway 里 `super(ctx, "remote")` 与
+ * `super(ctx, remoteServiceKey(ns))` 各注册一个。`ctx.remote.settings` 是
+ * 两步属性求值，所以 `ctx.inject` 必须**两个都请求**，只写后者会在第一步
+ * 就抛 `cannot get property "remote" without inject`。
  */
-export const inject = ['slots', 'locale', 'configForms', 'remote', 'remote.settings']
+export const inject = ['slots', 'locale']
 
 /**
  * 注册表单到插件页。
@@ -686,21 +697,39 @@ export function apply(ctx: ClientContext): void {
   })
 
   guarded('capture the settings remote for the form', () => {
-    // `remote.settings` 已经在顶层 inject 里声明，所以这里可以直接读 ——
-    // 声明过的服务不再受 `cannot get property "remote" without inject` 守卫拦。
+    // 用 `ctx.inject` 而不是直接读 `ctx.remote`。
     //
-    // 仍然包一层 try：宿主版本差异下 guard 的实现可能不同，宁可降级成
-    // 「没有设置接口」也不要让整个子树被错误边界丢掉。
-    try {
-      settingsRemote = (ctx as { remote?: { settings?: SettingsRemote } }).remote?.settings
-      note(
-        'capture settings remote',
-        settingsRemote !== undefined,
-        settingsRemote === undefined ? 'remote.settings is empty' : 'ok',
-      )
-    } catch (error) {
-      note('capture settings remote', false, error instanceof Error ? error.message : String(error))
+    // 关键机制（读 cordis 源码确认）：`ctx.inject(services, cb)` 内部是
+    // `this.plugin({ inject: services, apply: cb })` —— **创建一个子插件**，
+    // 子 fiber 有自己独立的 inject 列表。所以回调参数里的 ctx 能合法访问
+    // 这些服务，绕过了父 fiber 的守卫。
+    //
+    // 为什么这比写进顶层 inject 更安全：
+    //   - 顶层 inject 缺服务 → 整个插件停在 pending，`apply` 永不执行；
+    //   - 这里缺服务 → 只有这个子插件停住，其余步骤（含配置页注册）照常。
+    //
+    // 必须同时请求 `remote` 与 `remote.settings`：`ctx.remote.settings` 是
+    // 两步属性求值，只声明后者会在取 `remote` 时就抛 without inject。
+    const maybeInject = (ctx as unknown as {
+      inject?: (services: string[], cb: (scoped: Record<string, unknown>) => void) => unknown
+    }).inject
+    if (typeof maybeInject !== 'function') {
+      note('capture settings remote', false, 'ctx.inject is unavailable')
+      return
     }
+    maybeInject(['remote', 'remote.settings'], (scoped) => {
+      try {
+        const remote = (scoped as { remote?: { settings?: SettingsRemote } }).remote
+        settingsRemote = remote?.settings
+        note(
+          'capture settings remote',
+          settingsRemote !== undefined,
+          settingsRemote === undefined ? 'remote.settings is empty' : 'ok',
+        )
+      } catch (error) {
+        note('capture settings remote', false, error instanceof Error ? error.message : String(error))
+      }
+    })
   })
 
   guarded('register the config page on the plugin page', () => {

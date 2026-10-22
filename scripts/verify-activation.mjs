@@ -8,9 +8,21 @@ import { readFileSync } from 'node:fs'
 
 const source = readFileSync('lib/client.js', 'utf8')
 
-// 宿主实际会提供的客户端服务（slots / locale 来自宿主核心）。
-const AVAILABLE_SERVICES = new Set(['slots', 'locale', 'commands', 'systemPrompt'])
-// remote.* 不在这里 —— 它们是 ctx.remote 的命名空间，不是 inject 服务名。
+// 宿主实际会提供的客户端服务。
+//
+// 这份清单要跟着宿主的真实能力走：`remote` 与 `remote.settings` 都由客户端
+// api-gateway 注册（`super(ctx,"remote")` 与 `super(ctx, remoteServiceKey(ns))`），
+// `configForms` 由 ui-settings 提供。把它们当作「宿主不提供」会得到一个假警报，
+// 反而掩盖真实问题。
+const AVAILABLE_SERVICES = new Set([
+  'slots',
+  'locale',
+  'commands',
+  'systemPrompt',
+  'configForms',
+  'remote',
+  'remote.settings',
+])
 
 let exportBag = {}
 const localeRegistry = {}
