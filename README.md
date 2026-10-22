@@ -75,11 +75,29 @@ dsh-safe-delete check
 
 ## 配置
 
+### 在界面里改（推荐）
+
+装好插件后，打开侧边栏的 **插件** → `dsh-safe-delete` → **配置**，就能看到这五项：
+
+- 最大安全区容量（GB / MB 可切换）
+- 提前清理阈值（百分比）
+- 定时清理间隔（小时）
+- 单次删除条目数确认
+- 单次删除大小确认
+
+保存后**需要重启 DSH 生效**：配置值本身立即更新，但插件的拦截逻辑在启动时装配，
+界面会明确提示这一点，不假装即时。
+
+> 界面能改的只有上面五项。换安全区目录、关掉拦截这类改动风险高，仍然走配置文件。
+
+### 配置文件
+
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `stateDir` | `<DSH_HOME>/.dsh-safe-delete` | 安全区目录 |
+| `stateDir` | `<DSH_HOME>/.dsh-safe-delete` | 安全区目录。改了等于「现有安全区不再可见」 |
 | `retentionDays` | `7` | 保留天数 |
 | `maxBytes` | `21474836480`（20 GB） | 容量上限，超出最旧先清 |
+| `pruneAtPercent` | `90` | **提前清理阈值**。用到上限的 90%（18 GB）就开始清最旧条目，为下一次删除腾空间。`0` 或 `≥100` 表示只在超过 `maxBytes` 时才清 |
 | `autoPrune` | `true` | 关掉后只剩手动清理 |
 | `autoPruneIntervalMs` | `3600000`（1 小时） | 清理的检查间隔：工具调用时顺路看一眼，超过才真跑 |
 | `confirmFileCount` | `5000` | 单次删除超过这么多条目就额外确认一次；`0` 关闭 |
@@ -87,6 +105,9 @@ dsh-safe-delete check
 | `blockShellDeletes` | `true` | 拦车闸开关 |
 | `blockProtectedWrites` | `true` | 拦截对启动关键路径的写入 |
 | `crossVolumeCopy` | `false` | 安全区与目标不同卷时是否允许复制式移入 |
+
+标了界面可编辑的那几项在 `src/config.ts` 里声明为 `.volatile()` —— 宿主只认这样的字段。
+`schemastery` 因此是 peer 依赖（由宿主提供，构建时保持 external）。
 
 ### 什么时候会弹二次确认
 

@@ -30,6 +30,14 @@ import { createTools, type ApprovalOutcome, type ToolDefinition } from './tools'
 
 export const name = 'dsh-safe-delete'
 
+/**
+ * 插件配置 schema（供宿主设置表单使用）。
+ *
+ * 导出它是为了让 DSH 的设置表单能发现本插件的配置字段 —— 表单只认 schema 里
+ * 声明过 `.volatile()` 的项。没有它，插件页上的「配置」是空的。
+ */
+export { Config } from './config'
+
 /** 需要的服务：工具注册表与系统提示。 */
 export const inject = ['tools', 'systemPrompt']
 
@@ -58,6 +66,14 @@ export interface SafeDeleteConfig {
   autoPruneIntervalMs?: number
   /** 是否自动清理；默认 true。关掉后只剩手动清理。 */
   autoPrune?: boolean
+  /**
+   * 提前清理阈值（0-100）；默认 90。
+   *
+   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
+   * 例如上限 20 GB、阈值 90 → 用到 18 GB 就动手，而不是等撑满。
+   * 设为 `0` 或 `>= 100` 表示只在超过 `maxBytes` 本身时才清。
+   */
+  pruneAtPercent?: number
   /**
    * 单次删除的条目数阈值；超过就额外要一次人工确认。默认 `5000`。
    *
@@ -142,16 +158,35 @@ function writeTargetOf(toolName: string, args: Record<string, unknown> | undefin
 }
 
 function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
-  // `homeDir` 一旦显式给出，`dshHome` 也从它推导 —— 否则两者会指向不同的树，
-  // 分类器判定的"DSH 目录"就不是配置所指向的那个（测试里尤其明显）。
-  const homeDir = config.homeDir ?? os.homedir()
-  const dshHome = config.homeDir !== undefined ? path.join(config.homeDir, '.dsh') : resolveDshHome()
-  const stateDir = path.resolve(config.stateDir ?? path.join(dshHome, '.dsh-safe-delete'))
+  // 配置可能来自 schema 解析结果，其中的 `.volatile()` 字段是**引用**（`.get()`），
+  // 不是普通值。直接拿引用做 `> 0`、`!== undefined` 这类比较会恒为假 ——
+  // 那是静默失效：配置看着生效，实际全是默认值。所以统一解包一次。
+  const raw = config as unknown as Record<string, unknown>
+  const unwrap = (value: unknown): unknown =>
+    value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function'
+      ? (value as { get: () => unknown }).get()
+      : value
+
+  const numeric = (key: string, fallback: number): number => {
+    const value = unwrap(raw[key])
+    return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+  }
+  const booleanOf = (key: string, fallback: boolean): boolean => {
+    const value = unwrap(raw[key])
+    return typeof value === 'boolean' ? value : fallback
+  }
+  const textOf = (key: string, fallback: string): string => {
+    const value = unwrap(raw[key])
+    return typeof value === 'string' && value !== '' ? value : fallback
+  }
+
+  const homeDir = textOf('homeDir', os.homedir())
+  const dshHome = raw['homeDir'] !== undefined ? path.join(homeDir, '.dsh') : resolveDshHome()
+  const stateDir = path.resolve(textOf('stateDir', path.join(dshHome, '.dsh-safe-delete')))
   const env: ClassifyEnv = { home: homeDir, workdir: process.cwd(), dshHome, safeZoneDir: stateDir }
 
-  const retentionDays = typeof config.retentionDays === 'number' && config.retentionDays > 0 ? config.retentionDays : 7
-  const maxBytes =
-    typeof config.maxBytes === 'number' && config.maxBytes > 0 ? config.maxBytes : 20 * 1024 * 1024 * 1024
+  const retentionDays = Math.max(1, numeric('retentionDays', 7))
+  const maxBytes = Math.max(1024, numeric('maxBytes', 20 * 1024 * 1024 * 1024))
 
   // 关于审批：本插件**不自己调用** `ctx.approval`。
   //
@@ -201,10 +236,11 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     requestApproval,
     retentionDays,
     maxBytes,
-    autoPrune: config.autoPrune !== false,
-    autoPruneIntervalMs: config.autoPruneIntervalMs,
-    confirmFileCount: config.confirmFileCount !== undefined ? config.confirmFileCount : 5000,
-    confirmBytes: config.confirmBytes !== undefined ? config.confirmBytes : 2 * 1024 * 1024 * 1024,
+    autoPrune: booleanOf('autoPrune', true),
+    autoPruneIntervalMs: numeric('autoPruneIntervalMs', 60 * 60 * 1000),
+    confirmFileCount: numeric('confirmFileCount', 5000),
+    confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
+    pruneAtPercent: numeric('pruneAtPercent', 90),
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined
@@ -236,7 +272,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     //
     // 只拦 `protected`，不拦 `confirm`：家目录里的普通文档可以照常编辑，
     // 那里只对**删除**要求授权。
-    if (config.blockProtectedWrites !== false) {
+    if (booleanOf('blockProtectedWrites', true)) {
       const writeTarget = writeTargetOf(toolName, exec.arguments)
       if (writeTarget !== null) {
         let classification
@@ -321,7 +357,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
 
     const field = SHELL_TOOLS[toolName]
     if (field === undefined) return next()
-    if (config.blockShellDeletes === false) return next()
+    if (!booleanOf('blockShellDeletes', true)) return next()
 
     const text = exec.arguments?.[field]
     if (typeof text !== 'string' || text === '') return next()

@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs'
 
 const readme = readFileSync('README.md', 'utf8')
 const indexSrc = readFileSync('src/index.ts', 'utf8')
+const configSrc = readFileSync('src/config.ts', 'utf8')
 const toolsSrc = readFileSync('src/tools.ts', 'utf8')
 const cliSrc = readFileSync('bin/dsh-safe-delete.mjs', 'utf8')
 
@@ -24,20 +25,30 @@ function docDefault(key) {
 /** 从实现里取默认值。 */
 function codeDefault(key) {
   const patterns = [
+    // schema 里的默认值：`key: z.number().default(N)`
+    new RegExp('^\\s*' + key + ':\\s*z\\.[^\\n]*\\.default\\(([0-9*\\s.]+)\\)', 'm'),
+    // 解包读取：`numeric('key', N)` / `booleanOf('key', N)`
+    new RegExp("(?:numeric|booleanOf)\\('" + key + "',\\s*([0-9*\\strafle]+)\\)"),
+    // 裸读（旧写法）
     new RegExp('config\\.' + key + '\\s*\\?\\?\\s*([0-9*\\s.]+)', 'm'),
-    new RegExp(
-      'config\\.' + key + '\\s*!==\\s*undefined\\s*\\?\\s*config\\.' + key + '\\s*:\\s*([0-9*\\s.]+)',
-      'm',
-    ),
   ]
-  for (const pattern of patterns) {
-    const m = pattern.exec(indexSrc)
-    if (m !== null) return m[1].trim()
+  for (const source of [configSrc, indexSrc]) {
+    for (const pattern of patterns) {
+      const m = pattern.exec(source)
+      if (m !== null) return m[1].trim()
+    }
   }
   return null
 }
 
-const documentedKeys = ['retentionDays', 'maxBytes', 'autoPruneIntervalMs', 'confirmFileCount', 'confirmBytes']
+const documentedKeys = [
+  'retentionDays',
+  'maxBytes',
+  'pruneAtPercent',
+  'autoPruneIntervalMs',
+  'confirmFileCount',
+  'confirmBytes',
+]
 
 console.log('=== README 配置表 vs 实现默认值 ===')
 for (const key of documentedKeys) {
@@ -45,6 +56,17 @@ for (const key of documentedKeys) {
   const code = codeDefault(key)
   console.log(`${doc !== null ? 'ok  ' : 'CHECK'}  ${key.padEnd(20)} 文档=${doc ?? '(未列出)'}  代码=${code ?? '(未找到)'}`)
   if (doc === null) mismatches.push(`${key}: 文档未列出`)
+  if (code === null) mismatches.push(`${key}: 实现里找不到默认值`)
+}
+
+// schema 里声明了 volatile 的字段，必须都能在 README 表里找到 ——
+// 否则用户在界面上看到一个参数，却不知道它是什么。
+console.log('\n=== schema 的 volatile 字段是否都在 README 里 ===')
+const volatileKeys = [...configSrc.matchAll(/^\s+(\w+):\s*z\.[^\n]*\.volatile\(\)/gm)].map((m) => m[1])
+for (const key of volatileKeys) {
+  const documented = docDefault(key) !== null
+  console.log(`${documented ? 'ok  ' : 'MISSING'}  ${key}`)
+  if (!documented) mismatches.push(`volatile 字段 ${key}: README 未列出`)
 }
 
 console.log('\n=== README 提到的工具是否都存在 ===')

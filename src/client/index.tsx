@@ -1,0 +1,425 @@
+/**
+ * 插件页里的「安全区设置」表单。
+ *
+ * ## 为什么放在插件页而不是设置页
+ *
+ * DSH 的插件页声明了 `plugins.row.config` 槽位，插件可以把自己的配置渲染在
+ * 自己的详情页里。设置页需要额外处理 tab 挂载与切换，反而更绕。
+ *
+ * ## 为什么保存后提示「重启 DSH 生效」
+ *
+ * 配置本身是 `.volatile()` 的，值会立即对读者可见；但本插件的**拦截线是否挂上**
+ * 是在 `apply()` 时决定的，而 `apply` 不会因配置变更重跑。所以诚实的说法是
+ * 「重启生效」—— 不假装即时。
+ *
+ * @module dsh-safe-delete/client
+ */
+
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { ReactElement } from 'react'
+
+/** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
+const NAMESPACE = 'dsh-safe-delete'
+
+/** 字节单位。 */
+const MB = 1024 * 1024
+const GB = 1024 * MB
+
+/** 一个可编辑字段的描述。 */
+interface FieldSpec {
+  key: string
+  label: string
+  hint: string
+  /** 控件类型。 */
+  kind: 'bytes' | 'number' | 'percent' | 'boolean' | 'duration'
+  /** 最小值（含）。 */
+  min?: number
+  max?: number
+  /** 配置里读不到该字段时显示的兜底值（与宿主侧默认值保持一致）。 */
+  fallback: number
+}
+
+/** 1 GB 的字节数。 */
+const GIGABYTE = 1024 * 1024 * 1024
+
+/**
+ * 表单字段。
+ *
+ * 刻意只放**用户真正会调**的项：`stateDir`、`blockShellDeletes` 这类要么改动风险高
+ * （换目录会让现有安全区「消失」）、要么属于核心安全语义（关掉拦截），不放进表单。
+ */
+const FIELDS: FieldSpec[] = [
+  {
+    key: 'maxBytes',
+    label: '最大安全区容量',
+    hint: '超过这个大小就开始清理最旧的条目。',
+    kind: 'bytes',
+    min: 1,
+    fallback: 20 * GIGABYTE,
+  },
+  {
+    key: 'pruneAtPercent',
+    label: '提前清理阈值',
+    hint: '占用达到该百分比就开始清理，为新删除腾出空间。0 表示只在超过容量上限时才清。',
+    kind: 'percent',
+    min: 0,
+    max: 100,
+    fallback: 90,
+  },
+  {
+    key: 'autoPruneIntervalMs',
+    label: '定时清理间隔',
+    hint: '每次工具调用时顺路检查，超过这个间隔才真正清理一次。',
+    kind: 'duration',
+    min: 60 * 1000,
+    fallback: 60 * 60 * 1000,
+  },
+  {
+    key: 'confirmFileCount',
+    label: '单次删除条目数确认',
+    hint: '一次删除超过这么多条就额外问一次。0 表示关闭。',
+    kind: 'number',
+    min: 0,
+    fallback: 5000,
+  },
+  {
+    key: 'confirmBytes',
+    label: '单次删除大小确认',
+    hint: '一次删除超过这么大就额外问一次。0 表示关闭。',
+    kind: 'bytes',
+    min: 0,
+    fallback: 2 * GIGABYTE,
+  },
+]
+
+/** 宿主 settings 远程面的最小形状。 */
+interface SettingsRemote {
+  describe?: () => Promise<unknown>
+  mutate?: (request: unknown) => Promise<unknown>
+}
+
+/** 客户端上下文的最小形状。 */
+interface ClientContext {
+  get?: (id: string) => unknown
+  remote?: { settings?: SettingsRemote }
+  slots?: {
+    inject?: (name: string, factory: () => unknown) => void
+    register?: (spec: Record<string, unknown>, component: unknown) => unknown
+  }
+  effect?: (fn: () => unknown, label?: string) => unknown
+}
+
+/** 把值格式化成字节单位（GB/MB 取整，避免 20.000000001 GB 这种）。 */
+function toBytesInput(value: number): { amount: string; unit: 'MB' | 'GB' } {
+  if (value >= GB) {
+    const amount = value / GB
+    return { amount: Number(amount.toFixed(2)).toString(), unit: 'GB' }
+  }
+  const amount = Math.max(0, value / MB)
+  return { amount: Number(amount.toFixed(2)).toString(), unit: 'MB' }
+}
+
+/** 把毫秒格式化成小时（最小 1 分钟）。 */
+function toHoursInput(ms: number): string {
+  return Number((ms / (60 * 60 * 1000)).toFixed(2)).toString()
+}
+
+/** 读取一个数字字段的当前值（兼容 volatile 引用与普通值）。 */
+function numericOf(source: Record<string, unknown>, key: string, fallback: number): number {
+  const raw = source[key]
+  const value = raw !== null && typeof raw === 'object' && 'get' in (raw as object)
+    ? (raw as { get: () => unknown }).get()
+    : raw
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+/**
+ * 从 `describe()` 的返回里找出本命名空间的配置值。
+ *
+ * 形状随宿主版本可能不同（顶层数组 / `{namespaces}` / 直接对象），
+ * 所以三种都认 —— 认不出就当成空对象，让界面显示默认值而不是崩掉。
+ */
+function pickNamespace(payload: unknown): Record<string, unknown> {
+  const dig = (node: unknown, depth: number): Record<string, unknown> | undefined => {
+    if (depth > 4 || node === null || typeof node !== 'object') return undefined
+    const record = node as Record<string, unknown>
+    if (Array.isArray(record.namespaces)) {
+      const found = record.namespaces.find(
+        (item) => item !== null && typeof item === 'object' && (item as Record<string, unknown>).name === NAMESPACE,
+      )
+      if (found !== undefined) {
+        const value = (found as Record<string, unknown>).value
+        return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+      }
+    }
+    if (record.name === NAMESPACE && record.value !== null && typeof record.value === 'object') {
+      return record.value as Record<string, unknown>
+    }
+    for (const value of Object.values(record)) {
+      const deeper = dig(value, depth + 1)
+      if (deeper !== undefined) return deeper
+    }
+    return undefined
+  }
+  return dig(payload, 0) ?? {}
+}
+
+/** 表单组件。 */
+export function SafeZoneSettings(): ReactElement {
+  const [values, setValues] = useState<Record<string, unknown>>({})
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [message, setMessage] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [errors, setErrors] = useState<Record<string, string>>({})
+
+  const remote = useMemo<SettingsRemote | undefined>(() => {
+    const ctx = (globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx
+    return ctx?.remote?.settings
+  }, [])
+
+  useEffect(() => {
+    let alive = true
+    const load = async (): Promise<void> => {
+      if (remote?.describe === undefined) {
+        if (alive) {
+          setStatus('error')
+          setMessage('这个宿主没有暴露设置接口，配置请改用 cordis.patch.yml。')
+        }
+        return
+      }
+      try {
+        const payload = await remote.describe()
+        if (!alive) return
+        setValues(pickNamespace(payload))
+        setStatus('ready')
+      } catch (error) {
+        if (!alive) return
+        setStatus('error')
+        setMessage(error instanceof Error ? error.message : String(error))
+      }
+    }
+    void load()
+    return () => {
+      alive = false
+    }
+  }, [remote])
+
+  const setField = useCallback((key: string, raw: string): void => {
+    // 用 `<key>.draft` 保存用户的原始输入：不要覆盖从配置读到的真实值，
+    // 否则下一次渲染就没法再换算回显示单位了。
+    setValues((prev) => ({ ...prev, [`${key}.draft`]: raw }))
+    setSaved(false)
+    setErrors((prev) => {
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+  }, [])
+
+  /** 校验并转成实际值；返回 undefined 表示不合法。 */
+  const coerce = useCallback((spec: FieldSpec, raw: unknown): number | undefined => {
+    const text = typeof raw === 'string' ? raw.trim() : String(raw ?? '')
+    if (text === '') return spec.min === 0 ? 0 : undefined
+    const amount = Number(text)
+    if (!Number.isFinite(amount) || amount < 0) return undefined
+    if (spec.min !== undefined && amount < spec.min) return undefined
+    if (spec.max !== undefined && amount > spec.max) return undefined
+    if (spec.kind === 'bytes') {
+      // 单位跟着输入框一起存在 values 里（`<key>.unit`），由用户切换。
+      const unit = values[`${spec.key}.unit`] === 'MB' ? MB : GB
+      return Math.round(amount * unit)
+    }
+    if (spec.kind === 'duration') return Math.round(amount * 60 * 60 * 1000)
+    return amount
+  }, [values])
+
+  const save = useCallback(async (): Promise<void> => {
+    if (remote?.mutate === undefined) return
+    const nextErrors: Record<string, string> = {}
+    const payload: Record<string, unknown> = {}
+    for (const spec of FIELDS) {
+      const draft = values[`${spec.key}.draft`]
+      if (typeof draft === 'string') {
+        // 用户改过：草稿是**显示单位**下的数字，需要换算成字节/毫秒。
+        const value = coerce(spec, draft)
+        if (value === undefined) {
+          nextErrors[spec.key] = '填一个不小于下限的数字'
+          continue
+        }
+        payload[spec.key] = value
+        continue
+      }
+      // 没改过：`values[key]` 已经是配置里的真实值（字节/毫秒），原样写回。
+      // 若也走 coerce，会被当成 GB 再乘一次 —— 直接放大 1073741824 倍。
+      const current = numericOf(values, spec.key, spec.fallback)
+      payload[spec.key] = current
+    }
+    setErrors(nextErrors)
+    if (Object.keys(nextErrors).length > 0) {
+      setMessage('有字段不合法，没有保存。')
+      return
+    }
+
+    setSaving(true)
+    setMessage('')
+    try {
+      await remote.mutate({ name: NAMESPACE, value: payload })
+      setSaved(true)
+      setMessage('已保存。重启 DSH 生效。')
+    } catch (error) {
+      setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setSaving(false)
+    }
+  }, [coerce, remote, values])
+
+  if (status === 'loading') return <div style={{ padding: '12px 0' }}>正在读取配置…</div>
+  if (status === 'error') {
+    return <div style={{ padding: '12px 0', opacity: 0.8 }}>{message}</div>
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', padding: '4px 0' }}>
+      {FIELDS.map((spec) => {
+        // 显示值有两个来源，必须分清：
+        //   - 用户正在输入的原始文本（`<key>.draft`）—— 原样显示，否则每敲一个
+        //     字符就被换算一次，输入框会跳；
+        //   - 从配置读到的**字节/毫秒**值 —— 必须先换算成 GB/小时再显示，
+        //     否则用户会看到 `21474836480 GB` 这种东西。
+        const draft = values[`${spec.key}.draft`]
+        const current = numericOf(values, spec.key, spec.fallback)
+        let display: string
+        let unit = ''
+        if (typeof draft === 'string') {
+          display = draft
+        } else if (spec.kind === 'bytes') {
+          display = toBytesInput(current).amount
+        } else if (spec.kind === 'duration') {
+          display = toHoursInput(current)
+        } else {
+          display = String(current)
+        }
+        if (spec.kind === 'bytes') {
+          unit = toBytesInput(current).unit
+        } else if (spec.kind === 'duration') {
+          unit = '小时'
+        } else if (spec.kind === 'percent') {
+          unit = '%'
+        }
+
+        return (
+          <label key={spec.key} style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <span style={{ display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 500 }}>{spec.label}</span>
+              <input
+                aria-label={spec.label}
+                value={display}
+                onChange={(event) => setField(spec.key, event.target.value)}
+                inputMode="decimal"
+                style={{
+                  width: '96px',
+                  padding: '4px 8px',
+                  borderRadius: '6px',
+                  border: `1px solid ${errors[spec.key] === undefined ? 'var(--dsw-alias-border-secondary, #c9d1e0)' : 'var(--dsw-alias-state-error-primary, #d33)'}`,
+                  background: 'transparent',
+                  color: 'inherit',
+                  font: 'inherit',
+                }}
+              />
+              {spec.kind === 'bytes' ? (
+                <select
+                  aria-label={`${spec.label}单位`}
+                  value={values[`${spec.key}.unit`] === 'MB' ? 'MB' : 'GB'}
+                  onChange={(event) => setField(`${spec.key}.unit`, event.target.value)}
+                  style={{
+                    padding: '4px 6px',
+                    borderRadius: '6px',
+                    border: '1px solid var(--dsw-alias-border-secondary, #c9d1e0)',
+                    background: 'transparent',
+                    color: 'inherit',
+                    font: 'inherit',
+                  }}
+                >
+                  <option value="GB">GB</option>
+                  <option value="MB">MB</option>
+                </select>
+              ) : unit !== '' ? (
+                <span style={{ opacity: 0.7 }}>{unit}</span>
+              ) : null}
+            </span>
+            <span style={{ fontSize: '12px', opacity: 0.65 }}>{spec.hint}</span>
+            {errors[spec.key] !== undefined ? (
+              <span style={{ fontSize: '12px', color: 'var(--dsw-alias-state-error-primary, #d33)' }}>
+                {errors[spec.key]}
+              </span>
+            ) : null}
+          </label>
+        )
+      })}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '4px' }}>
+        <button
+          type="button"
+          onClick={() => void save()}
+          disabled={saving}
+          style={{
+            padding: '6px 16px',
+            borderRadius: '8px',
+            border: 'none',
+            cursor: saving ? 'default' : 'pointer',
+            background: 'var(--dsw-alias-interactive-bg-primary, #3355ff)',
+            color: '#fff',
+            font: 'inherit',
+            opacity: saving ? 0.6 : 1,
+          }}
+        >
+          {saving ? '保存中…' : '保存'}
+        </button>
+        {message !== '' ? (
+          <span style={{ fontSize: '12px', opacity: 0.8 }} aria-live="polite">
+            {saved ? '✓ ' : ''}
+            {message}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+/** 客户端插件入口。 */
+export const inject = ['slots', 'locale', 'remote.settings']
+
+/**
+ * 注册表单到插件页。
+ *
+ * 每一步单独兜住：`apply` 里任何一处抛错都会让宿主把整个客户端包判为「激活失败」，
+ * 表现是插件页里什么都没有、控制台只有一行。分开捕获后，失败的那一步会被指出来，
+ * 其余照常。
+ */
+export function apply(ctx: ClientContext): void {
+  try {
+    // 表单组件要从模块作用域拿到 remote.settings，这里把它挂上去。
+    ;(globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx = ctx
+  } catch {
+    /* 不重要 */
+  }
+
+  try {
+    ctx.slots?.inject?.('plugins.row.config', () => {
+      ctx.slots?.register?.(
+        {
+          name: 'plugins.row.config',
+          key: `${NAMESPACE}#safe-zone`,
+          locale: NAMESPACE,
+        },
+        // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
+        // 传一个 `{ view, panel }` 的对象是错的 —— 宿主会把它当成组件去调用，
+        // 结果是一个不可渲染的对象，表单根本不出现（而且不报错）。
+        ({ view }: { view?: string }) => (view === 'summary' ? '安全区设置' : <SafeZoneSettings />),
+      )
+    })
+  } catch (error) {
+    console.warn('[dsh-safe-delete] 注册设置表单失败', error)
+  }
+}
