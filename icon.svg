@@ -1,0 +1,66 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>dsh-safe-delete</title>
+  <desc>车站式垃圾桶 + 回旋箭头：删除先进安全区，随时可以捡回来。</desc>
+  <defs>
+    <linearGradient id="binBody" x1="286" y1="392" x2="738" y2="872" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A9BFD8"/>
+      <stop offset="0.42" stop-color="#6A83A2"/>
+      <stop offset="1" stop-color="#33465C"/>
+    </linearGradient>
+    <linearGradient id="binLid" x1="256" y1="300" x2="768" y2="386" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAF2FD"/>
+      <stop offset="0.55" stop-color="#B4C8E0"/>
+      <stop offset="1" stop-color="#8FA6C2"/>
+    </linearGradient>
+    <linearGradient id="binSlot" x1="380" y1="392" x2="644" y2="392" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#1D2A3C"/>
+    </linearGradient>
+    <linearGradient id="restore" x1="672" y1="620" x2="880" y2="836" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7CF3D4"/>
+      <stop offset="1" stop-color="#2FB8E8"/>
+    </linearGradient>
+    <linearGradient id="label" x1="318" y1="556" x2="706" y2="556" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5DE3C5" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#2FB8E8" stop-opacity="0.85"/>
+    </linearGradient>
+    <filter id="soft" x="96" y="120" width="832" height="848" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="28" flood-color="#020617" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#soft)">
+    <!-- 地面投影 -->
+    <ellipse cx="512" cy="894" rx="300" ry="30" fill="#040B16" opacity="0.4"/>
+
+    <!-- 桶体（上宽下窄的车站垃圾桶轮廓） -->
+    <path d="M300 396h424a34 34 0 0 1 34 36l-22 392a56 56 0 0 1-56 52H344a56 56 0 0 1-56-52L266 432a34 34 0 0 1 34-36Z" fill="url(#binBody)"/>
+    <path d="M300 396h424a34 34 0 0 1 34 36l-22 392a56 56 0 0 1-56 52H344a56 56 0 0 1-56-52L266 432a34 34 0 0 1 34-36Z" stroke="#1E2B3B" stroke-opacity="0.45" stroke-width="9"/>
+
+    <!-- 左侧竖向高光，让桶身有金属感 -->
+    <path d="M330 420 316 838" stroke="#DCE9F8" stroke-opacity="0.35" stroke-width="16" stroke-linecap="round"/>
+
+    <!-- 投口 -->
+    <rect x="382" y="378" width="264" height="40" rx="20" fill="url(#binSlot)"/>
+
+    <!-- 盖沿 -->
+    <path d="M256 326h512a24 24 0 0 1 24 24v18a24 24 0 0 1-24 24H256a24 24 0 0 1-24-24v-18a24 24 0 0 1 24-24Z" fill="url(#binLid)"/>
+
+    <!-- 桶身中部标条：车站分类桶的横向色带 -->
+    <rect x="318" y="540" width="388" height="26" rx="13" fill="url(#label)" opacity="0.55"/>
+
+    <!-- 回收标识（可恢复的暗示，弱化处理，不抢主视觉） -->
+    <g opacity="0.5">
+      <rect x="352" y="604" width="150" height="150" rx="26" fill="#0E1726" opacity="0.4"/>
+      <path d="M427 640 469 712h-84L427 640Z" fill="none" stroke="#BFE9FF" stroke-width="13" stroke-linejoin="round"/>
+    </g>
+  </g>
+
+  <!-- 回旋箭头徽标：这是整个图标的主张 —— 还能捡回来 -->
+  <g filter="url(#soft)">
+    <circle cx="772" cy="742" r="126" fill="#0B1420" opacity="0.55"/>
+    <circle cx="772" cy="742" r="126" fill="none" stroke="url(#restore)" stroke-width="10" opacity="0.85"/>
+    <path d="M772 664a78 78 0 1 1-74 102" fill="none" stroke="url(#restore)" stroke-width="26" stroke-linecap="round"/>
+    <path d="M700 762l-4-46 46 14" fill="none" stroke="url(#restore)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

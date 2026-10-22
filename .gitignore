@@ -1,0 +1,19 @@
+node_modules/
+*.tsbuildinfo
+
+# 开发过程中的工作笔记：含本机调试细节，不属于产品的一部分。
+.superpowers/
+
+# 图标渲染用的临时预览产物（icon.svg 才是源文件）。
+icon-preview.html
+icon-preview.png
+icon-solo.png
+
+# lib/ 是**发布产物，必须进版本库**。
+#
+# package.json 的 main / types / exports 与 cordis.patch.yml 里的 name 全部指向
+# lib/*.js —— 与 dsh-llm-account 踩过的坑相同：忽略 lib/ 会让「克隆下来直接安装」
+# 得到一个只有源码的仓库，宿主加载时文件不存在。
+#
+# 代价：每次改 src/ 都要 `pnpm build` 并把 lib/ 一起提交。验证方式：`pnpm build`
+# 后 `git status` 里 lib/ 应当是唯一的变化来源。
