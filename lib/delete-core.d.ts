@@ -19,6 +19,13 @@ export interface DeleteContext {
   confirmFileCount: number;
   /** 单次删除的字节数阈值；`0` 表示关闭。 */
   confirmBytes: number;
+  /**
+   * 跨卷时是否允许「复制 + 删源」。
+   *
+   * 必须从配置透传到 `moveToSafeZone`：不透传的话，用户在配置里打开这个开关
+   * 毫无效果，跨卷删除永远以 different volumes 拒绝 —— 一个只在文档里存在的开关。
+   */
+  crossVolumeCopy?: boolean;
   /** 需要人工确认时调用；返回是否放行。 */
   requestApproval: (reason: string) => Promise<ApprovalOutcome>;
   /** 当前时间（测试可注入）。 */

@@ -94,7 +94,9 @@ for (const { name, file } of exports) {
 // —— 2. 无人导入的文件 ——
 const importedFiles = new Set();
 for (const [file, text] of sources) {
-  for (const match of text.matchAll(/from\s+"([^"]+)"/g)) {
+  // 引号三选一都要认：本仓库源码统一用单引号，只认双引号会让每个文件都被报成
+  // 「无人导入」—— 那种误报会训练人直接忽略整份报告，比漏报更糟。
+  for (const match of text.matchAll(/from\s+['"]([^'"]+)['"]/g)) {
     const spec = match[1];
     if (!spec.startsWith(".")) continue;
     const base = join(file.slice(0, file.lastIndexOf(sep)), spec);

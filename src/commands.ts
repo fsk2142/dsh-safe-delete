@@ -101,7 +101,6 @@ export function renderConfigDetail(guide: SettingGuide, values: Record<string, u
   ].join('\n')
 }
 
-/** 把命令输入切成第一段与其余部分。 */
 /** 已知的子命令。 */
 const SUBCOMMANDS = new Set(['list', 'restore', 'clean', 'config', 'status', 'help', '--help', '-h'])
 

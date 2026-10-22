@@ -14,6 +14,7 @@
  *   journal [n]         审计流水（拦截 / 删除 / 取回 / 清理），最新在前
  */
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -46,6 +47,77 @@ function dshHome() {
 /** 状态目录。 */
 function stateDir() {
   return path.join(dshHome(), '.dsh-safe-delete')
+}
+
+/**
+ * 读本插件的配置；读不到就退回内置默认值，并**明确标注**。
+ *
+ * 为什么必须标注：终端里没有 settings 服务。如果 `status` 直接打印
+ * `retention: 7 days`，用户会理所当然地以为那是当前配置 —— 而它可能早被改成 30 天。
+ * 宁可说明「这是默认值」，也不要给一个看起来确定的错数。
+ *
+ * 配置真实存放位置：`<DSH_HOME>/profiles/<profile>/cordis.patch.yml` 里
+ * 本插件那一行的 `config:`。
+ *
+ * @returns `{ maxBytes, retentionDays, pruneAtPercent, source, note }`
+ */
+function readConfigDefaults() {
+  const fallback = {
+    maxBytes: 20 * 1024 ** 3,
+    retentionDays: 7,
+    pruneAtPercent: 90,
+    source: 'default',
+    note: 'built-in defaults — DSH settings not read (run /safe-delete config inside DSH for live values)',
+  }
+  try {
+    const profile = process.env.DSH_PROFILE
+    if (profile === undefined || profile === '') return fallback
+    const patchFile = path.join(dshHome(), 'profiles', profile, 'cordis.patch.yml')
+    if (!fs.existsSync(patchFile)) return fallback
+
+    // 只做一次轻量文本扫描：不引入 YAML 依赖，配置行是扁平的 `key: value`。
+    const text = fs.readFileSync(patchFile, 'utf8')
+    const block = extractPluginBlock(text, 'dsh-safe-delete')
+    if (block === null) return fallback
+
+    const pick = (key, fallbackValue) => {
+      const m = new RegExp(`^\\s+${key}:\\s*(.+?)\\s*$`, 'm').exec(block)
+      if (m === null) return fallbackValue
+      const raw = m[1].replace(/#.*$/, '').trim()
+      const n = Number(raw)
+      return Number.isFinite(n) ? n : fallbackValue
+    }
+
+    return {
+      maxBytes: pick('maxBytes', fallback.maxBytes),
+      retentionDays: pick('retentionDays', fallback.retentionDays),
+      pruneAtPercent: pick('pruneAtPercent', fallback.pruneAtPercent),
+      source: 'file',
+      note: `read from ${patchFile}`,
+    }
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * 从 patch 文本里切出某个插件的行（含它的 config 缩进块）。
+ *
+ * @param text patch 文件全文。
+ * @param name 插件包名。
+ * @returns 该行的文本片段；找不到时 `null`。
+ */
+function extractPluginBlock(text, name) {
+  const lines = text.split(/\r?\n/)
+  const start = lines.findIndex((line) => new RegExp(`^\\s*-\\s*id:\\s*${name}\\s*$`).test(line))
+  if (start === -1) return null
+  const out = [lines[start]]
+  for (let i = start + 1; i < lines.length; i += 1) {
+    // 下一行的 `- id:` 表示换了一个插件。
+    if (/^\s*-\s*id:/.test(lines[i])) break
+    out.push(lines[i])
+  }
+  return out.join('\n')
 }
 
 function humanBytes(bytes) {
@@ -114,7 +186,13 @@ async function main(argv) {
       const dryRun = rest.includes('--dry-run')
       const entries = await store.listSafeZone(stateDir())
       const { selectForPrune, safeZoneBytes } = await import('../lib/prune.js')
-      const selected = selectForPrune(entries, { now: Date.now(), maxBytes: 20 * 1024 ** 3 })
+      const cfg = readConfigDefaults()
+      if (cfg.source !== 'file') process.stdout.write(`(${cfg.note})\n`)
+      const selected = selectForPrune(entries, {
+        now: Date.now(),
+        maxBytes: cfg.maxBytes,
+        ...(cfg.pruneAtPercent > 0 ? { pruneAtPercent: cfg.pruneAtPercent } : {}),
+      })
       if (selected.length === 0) {
         process.stdout.write('nothing to prune\n')
         return 0
@@ -139,13 +217,15 @@ async function main(argv) {
       if (store === undefined) return missingBuild()
       const entries = await store.listSafeZone(stateDir())
       const total = entries.reduce((sum, e) => sum + e.bytes, 0)
+      const cfg = readConfigDefaults()
+      const suffix = cfg.source === 'file' ? '' : `  (${cfg.note})`
       process.stdout.write(
         [
           `state dir: ${stateDir()}`,
           `entries: ${entries.length}`,
           `total size: ${humanBytes(total)}`,
-          `capacity cap: ${humanBytes(20 * 1024 ** 3)}`,
-          `retention: 7 days`,
+          `capacity cap: ${humanBytes(cfg.maxBytes)}${suffix}`,
+          `retention: ${cfg.retentionDays} days${suffix}`,
           entries.length > 0 ? `oldest expires: ${new Date(entries[0].expiresAt).toISOString()}` : 'safe zone is empty',
         ].join('\n') + '\n',
       )

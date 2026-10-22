@@ -17,6 +17,7 @@
  *      这正是 dsh-safety 需要另开终端敲 `allow` 的根因。
  */
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -121,6 +122,44 @@ export interface PluginContext {
 }
 
 /**
+ * 推断 DSH 的安装目录，供分类器把「改动宿主自身文件」判为 protected。
+ *
+ * ## 为什么需要推断而不是配置
+ *
+ * 这个路径随用户的安装方式而变（桌面版在 `%LOCALAPPDATA%\Programs\...`，
+ * 也可能有别的部署），写死或要求用户手填都不合适。宿主加载插件时，
+ * `process.execPath` 指向的就是那一份运行时，从它往上找 `resources` 即可。
+ *
+ * ## 找不到时的行为
+ *
+ * 返回空对象 —— 即不给 `env.installDir`。分类器因此不会把任何路径判为
+ * 「安装目录」。这比猜一个错误路径更好：错猜会把正常文件误判成 protected。
+ *
+ * @returns `{ installDir }` 或空对象。
+ */
+function resolveInstallDir(): { installDir?: string } {
+  try {
+    // 桌面版布局：<install>/resources/app.asar/... —— 取 resources 的父目录。
+    const exec = process.execPath
+    if (typeof exec !== 'string' || exec === '') return {}
+    const resources = path.join(path.dirname(exec), 'resources')
+    if (fs.existsSync(resources)) return { installDir: path.dirname(exec) }
+
+    // 其它布局：从可执行文件所在目录往上找一层含有 resources 的。
+    let dir = path.dirname(exec)
+    for (let i = 0; i < 4; i += 1) {
+      if (fs.existsSync(path.join(dir, 'resources'))) return { installDir: dir }
+      const parent = path.dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
+
+/**
  * 插件入口。任何注册异常都在这里被吞掉并记日志 —— 见文件头「fail-soft」。
  */
 export function apply(ctx: PluginContext, config: SafeDeleteConfig = {}): void {
@@ -197,7 +236,15 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   const homeDir = textOf('homeDir', os.homedir())
   const dshHome = raw['homeDir'] !== undefined ? path.join(homeDir, '.dsh') : resolveDshHome()
   const stateDir = path.resolve(textOf('stateDir', path.join(dshHome, '.dsh-safe-delete')))
-  const env: ClassifyEnv = { home: homeDir, workdir: process.cwd(), dshHome, safeZoneDir: stateDir }
+  const env: ClassifyEnv = {
+    home: homeDir,
+    workdir: process.cwd(),
+    dshHome,
+    safeZoneDir: stateDir,
+    // 安装目录必须接线，否则 README 分级表里「安装目录 = protected」这条
+    // 只在单元测试里生效，生产里永远 undefined —— 一层不存在的保护。
+    ...resolveInstallDir(),
+  }
 
   const retentionDays = Math.max(1, numeric('retentionDays', 7))
   const maxBytes = Math.max(1024, numeric('maxBytes', 20 * 1024 * 1024 * 1024))
@@ -255,6 +302,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     confirmFileCount: numeric('confirmFileCount', 5000),
     confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
     pruneAtPercent: numeric('pruneAtPercent', 90),
+    crossVolumeCopy: booleanOf('crossVolumeCopy', false),
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined

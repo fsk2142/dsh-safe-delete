@@ -44,6 +44,40 @@ function entryDir(stateDir: string, id: string): string {
   return path.join(stateDir, ITEMS_DIR, id)
 }
 
+/**
+ * 索引写操作的串行队列。
+ *
+ * ## 为什么需要
+ *
+ * `moveToSafeZone` / `destroyEntry` / `restoreFromSafeZone` 都是
+ * 「读索引 → 改 → 写回」。DSH 的并发工具调用可达 50，两个并发的删除会读到同一份
+ * 旧数组，后写者把它整个覆盖回去 —— 前一条从索引里消失，但内容还留在
+ * `items/<id>/` 盘上。后果是**列表看不见、清理永远轮不到**（prune 只扫索引），
+ * 属于静默的磁盘泄漏。
+ *
+ * ## 为什么用 Promise 链而不是文件锁
+ *
+ * 插件跑在单个宿主进程里，跨进程并发不存在。一条 Promise 链就够，而且
+ * 没有锁文件残留、崩溃自动释放的问题。
+ */
+let indexQueue: Promise<unknown> = Promise.resolve()
+
+/**
+ * 把一次索引操作排进队列，保证读-改-写不交错。
+ *
+ * @param job 要串行执行的操作。
+ * @returns 该操作的结果。
+ */
+function serialized<T>(job: () => Promise<T>): Promise<T> {
+  // 无论前一个成功还是失败都继续排队（用 catch 抹掉拒绝，避免链条断掉）。
+  const run = indexQueue.then(job, job)
+  indexQueue = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
 /** 读索引；不存在或损坏时返回空数组（安全区宁可"看起来空"也不能让删除流程崩掉）。 */
 async function readIndex(stateDir: string): Promise<TrashEntry[]> {
   const file = indexPath(stateDir)
@@ -96,6 +130,7 @@ function isUnder(child: string, parent: string): boolean {
  * @returns 新条目。
  */
 export async function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry> {
+  return serialized(async () => {
   const target = path.resolve(absPath)
 
   // 安全区自保护：不能把自己移进自己。
@@ -170,6 +205,7 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
   }
 
   return entry
+  })
 }
 
 /** 列出安全区条目（按移入时间升序）。 */
@@ -184,36 +220,54 @@ export async function listSafeZone(stateDir: string): Promise<TrashEntry[]> {
  * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— 绝不覆盖现在的文件。
  */
 export async function restoreFromSafeZone(stateDir: string, id: string): Promise<{ restoredTo: string }> {
-  const entries = await readIndex(stateDir)
-  const entry = entries.find((e) => e.id === id)
-  if (entry === undefined) {
-    throw new Error(`unknown safe-zone id: ${id}`)
-  }
+  return serialized(async () => {
+    const entries = await readIndex(stateDir)
+    const entry = entries.find((e) => e.id === id)
+    if (entry === undefined) {
+      throw new Error(`unknown safe-zone id: ${id}`)
+    }
 
-  // 内容在 `items/<id>/<basename>`；取该目录下唯一的那个条目。
-  const source = resolveStoredContent(stateDir, id)
-  if (source === null) {
-    throw new Error(`safe-zone entry ${id} has no content on disk`)
-  }
+    // 内容在 `items/<id>/<basename>`；取该目录下唯一的那个条目。
+    const source = resolveStoredContent(stateDir, id)
+    if (source === null) {
+      throw new Error(`safe-zone entry ${id} has no content on disk`)
+    }
 
-  let destination = entry.originalPath
-  if (existsSync(destination)) {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    destination = `${entry.originalPath}.restored-${stamp}`
-  }
+    let destination = entry.originalPath
+    if (existsSync(destination)) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      destination = `${entry.originalPath}.restored-${stamp}`
+    }
 
-  mkdirSync(path.dirname(destination), { recursive: true })
-  renameSync(source, destination)
+    mkdirSync(path.dirname(destination), { recursive: true })
 
-  // 取回后清掉空的条目目录，避免在安全区里留下空壳。
-  try {
-    rmSync(entryDir(stateDir, id), { recursive: true, force: true })
-  } catch {
-    /* 空壳残留不影响取回结果 */
-  }
+    // 跨卷还原：`rename` 会抛 EXDEV。
+    //
+    // 移入方向早就有「复制 + 删源」的回退，还原方向也必须对称 —— 否则
+    // `crossVolumeCopy` 造出来的条目**恰好全都取不回来**，与「可逆删除」的核心
+    // 承诺直接矛盾。
+    //
+    // 顺序：先复制到目标，成功后删源，最后写索引。任一步失败都留下源，
+    // 不会出现"安全区没了、原位置也没有"的孤儿状态。
+    try {
+      renameSync(source, destination)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EXDEV') throw error
+      cpSync(source, destination, { recursive: true, preserveTimestamps: true })
+      rmSync(source, { recursive: true, force: true })
+    }
 
-  await writeIndex(stateDir, entries.filter((e) => e.id !== id))
-  return { restoredTo: destination }
+    // 取回后清掉空的条目目录，避免在安全区里留下空壳。
+    try {
+      rmSync(entryDir(stateDir, id), { recursive: true, force: true })
+    } catch {
+      /* 空壳残留不影响取回结果 */
+    }
+
+    await writeIndex(stateDir, entries.filter((e) => e.id !== id))
+    return { restoredTo: destination }
+  })
 }
 
 /**
@@ -244,22 +298,24 @@ function resolveStoredContent(stateDir: string, id: string): string | null {
  * **这是本文件唯一允许递归删除的地方**，且 `entryDir` 保证路径落在安全区内部。
  */
 export async function destroyEntry(stateDir: string, id: string): Promise<void> {
-  const entries = await readIndex(stateDir)
-  const entry = entries.find((e) => e.id === id)
-  if (entry === undefined) {
-    throw new Error(`unknown safe-zone id: ${id}`)
-  }
+  return serialized(async () => {
+    const entries = await readIndex(stateDir)
+    const entry = entries.find((e) => e.id === id)
+    if (entry === undefined) {
+      throw new Error(`unknown safe-zone id: ${id}`)
+    }
 
-  const dir = entryDir(stateDir, id)
-  // 双保险：即使索引被篡改，也绝不删到安全区之外的路径。
-  if (!isUnder(dir, path.join(stateDir, ITEMS_DIR))) {
-    throw new Error(`refusing to destroy a path outside the safe zone: ${dir}`)
-  }
-  if (existsSync(dir)) {
-    rmSync(dir, { recursive: true, force: true })
-  }
+    const dir = entryDir(stateDir, id)
+    // 双保险：即使索引被篡改，也绝不删到安全区之外的路径。
+    if (!isUnder(dir, path.join(stateDir, ITEMS_DIR))) {
+      throw new Error(`refusing to destroy a path outside the safe zone: ${dir}`)
+    }
+    if (existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true })
+    }
 
-  await writeIndex(stateDir, entries.filter((e) => e.id !== id))
+    await writeIndex(stateDir, entries.filter((e) => e.id !== id))
+  })
 }
 
 /** 安全区是否为空（含磁盘上无残留条目）。 */
