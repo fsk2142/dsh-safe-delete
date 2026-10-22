@@ -51,7 +51,10 @@ interface MutateCall {
 }
 
 /**
- * 一个假的 settings remote：记录 mutate 收到了什么。
+ * 一个假的 settings remote：记录 mutate 收到了什么，并在 mutate 后更新自身状态。
+ *
+ * **必须真的更新状态**：否则 describe() 会一直返回旧值，被测的「保存后回读确认」
+ * 逻辑永远走不到成功分支——那种替身会把真 bug 掩盖成假失败。
  *
  * @param initial 初始配置值。
  * @returns 假 remote 与调用记录。
@@ -62,16 +65,21 @@ function fakeRemote(initial: Record<string, unknown>): {
 } {
   const calls: MutateCall[] = []
   let revision = 1
+  const state: Record<string, unknown> = { ...initial }
   return {
     calls,
     remote: {
       describe: async () => ({
         writable: true,
         hasDocument: false,
-        namespaces: [{ ns: 'dsh-safe-delete', value: { ...initial }, revision }],
+        namespaces: [{ ns: 'dsh-safe-delete', value: { ...state }, revision }],
       }),
       mutate: async (ns: string, ops: MutateCall['ops'], rev?: number) => {
         calls.push({ ns, ops })
+        // 模拟真实持久化：把写入应用到 state，否则回读还是旧值。
+        for (const op of ops) {
+          if (op.op === 'set' && op.path.length > 0) state[op.path[0] as string] = op.value
+        }
         revision = (rev ?? revision) + 1
         return { ok: true, value: { revision } }
       },
@@ -204,6 +212,82 @@ describe('SafeZoneSettings interaction', () => {
 
     // 保存成功后应给出重启提示，而不是静默成功。
     expect(document.body.textContent).toContain('已保存')
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('writes the interval when the unit is changed FIRST', async () => {
+    // 顺序敏感性：先选单位再填数字，与先填数字再选单位，是不同的中间状态。
+    // 上一版只测了后者，而你在界面上的操作很可能就是前者。
+    const React = await import('react')
+    const { createRoot } = await import('react-dom/client')
+    const { act } = await import('react')
+    const mod = (await import('../src/client/index')) as unknown as {
+      __setRemoteForTest: (r: unknown) => void
+      SafeZoneSettings: unknown
+    }
+
+    const { remote, calls } = fakeRemote({
+      maxBytes: 20 * GB,
+      pruneAtPercent: 90,
+      autoPruneIntervalMs: HOUR,
+      confirmFileCount: 5000,
+      confirmBytes: 2 * GB,
+    })
+    mod.__setRemoteForTest(remote)
+
+    const container = document.getElementById('root')
+    if (container === null) throw new Error('no root')
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(React.createElement(mod.SafeZoneSettings as never))
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    })
+
+    /** 模拟用户操作一个受控控件。 */
+    const changeValue = async (el: HTMLInputElement | HTMLSelectElement, value: string): Promise<void> => {
+      await act(async () => {
+        const proto = Object.getPrototypeOf(el) as object
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+        setter?.call(el, value)
+        el.dispatchEvent(new Event('change', { bubbles: true }))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+    }
+
+    const unitSelect = document.querySelector<HTMLSelectElement>('select[aria-label="定时清理间隔单位"]')
+    expect(unitSelect).not.toBeNull()
+    // 先改单位。
+    if (unitSelect !== null) await changeValue(unitSelect, 'day')
+
+    const intervalInput = document.querySelector<HTMLInputElement>('#dsd-autoPruneIntervalMs')
+    expect(intervalInput).not.toBeNull()
+    console.log('先改单位后，输入框显示值:', intervalInput?.value)
+    // 再改数字。
+    if (intervalInput !== null) await changeValue(intervalInput, '2')
+
+    const saveButton = [...document.querySelectorAll('button')].find((b) => b.textContent === '保存')
+    console.log('保存按钮存在:', saveButton !== undefined)
+    if (saveButton !== undefined) {
+      await act(async () => {
+        saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300))
+      })
+    }
+
+    console.log('先单位后数字 - mutate 收到:', JSON.stringify(calls))
+    console.log('先单位后数字 - 页面尾部:', document.body.textContent?.slice(-120))
+
+    expect(calls.length, '保存应当调用 mutate').toBe(1)
+    const ops = calls[0]?.ops ?? []
+    const intervalOp = ops.find((op) => op.path[0] === 'autoPruneIntervalMs')
+    expect(intervalOp?.value, '先选天后填 2，也应是 2 天').toBe(2 * 24 * 60 * 60 * 1000)
 
     await act(async () => {
       root.unmount()
