@@ -1,9 +1,0 @@
-v0.2.14 - fetch remote via ctx.inject, top inject stays minimal
-
-ctx.inject creates a sub-plugin with its own inject list, so a missing service
-stalls only that child instead of the whole package. remote.settings and
-remote are now requested together there (two-step property evaluation needs
-both names); top-level inject is back to ['slots','locale'].
-
-Also fixed verify-activation.mjs, which wrongly treated those services as
-unavailable and produced a false alarm. 311 tests.

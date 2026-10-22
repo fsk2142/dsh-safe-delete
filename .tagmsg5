@@ -1,0 +1,22 @@
+v0.2.15 - child ctx inside inject, startup-timing fix, silent-failure audit
+
+Two further issues found by auditing every silent-failure mode rather than
+just the last one:
+
+1. Config-page registration used the parent ctx's slots/effect while running
+   inside a ctx.inject child plugin. Official dsh-context uses the child ctx;
+   ctx.effect asserts the fiber is active, and the whileServed callback can
+   fire after apply returns. Now uses scoped.slots / scoped.effect.
+
+2. The settings service was captured once at startup. ctx.get() is strict and
+   returns undefined when the service fiber is not yet ready, without
+   throwing - so a later-arriving service was dropped permanently and slash
+   command config writes would fail forever. Now looked up per call.
+
+Adds scripts/verify-client-contract.mjs, which asserts every silent failure
+mode hit in recent rounds: exports["./client"], minimal top-level inject,
+remote + remote.settings requested together, slot name and key, locale
+dictionary, no ctx access in the render path, and the built bundle containing
+the registration.
+
+311 tests.
