@@ -19,8 +19,20 @@ import { makeFakeCtx } from './support/fake-ctx'
  * 之前失效的真正原因。
  */
 describe('client apply', () => {
-  it('declares every service it accesses, and only real ones', () => {
-    // 这条规则被误解过两次：
+  it('declares both remote and remote.settings', () => {
+    // cordis 的守卫对 `ctx.remote.settings` 会**先**检查 `remote`、**再**取 `settings`。
+    // 只声明 `remote.settings` 时，第一步就抛 `cannot get property "remote"
+    // without inject`（`?.` 拦不住，因为错误发生在属性求值处，整棵子树被丢掉）。
+    //
+    // api-gateway 里 `super(ctx, "remote")` 与
+    // `super(ctx, remoteServiceKey(ns))` 是**两个独立服务**，
+    // 官方 dsh-client-ui-settings-general 因此两个都声明。
+    expect(inject).toContain('remote')
+    expect(inject).toContain('remote.settings')
+  })
+
+  it('declares every other service it accesses, and only real ones', () => {
+    // 这条规则被误解过三次：
     //
     //   声明了宿主不提供的服务 → fiber 停在 pending，apply 永不执行；
     //   访问了未声明的服务     → guard 在属性**求值**处抛错（`?.` 拦不住），
@@ -28,10 +40,8 @@ describe('client apply', () => {
     //
     // 官方 dsh-client-ui-settings-general 声明了
     // ['slots','locale','connection','remote','remote.settings','configForms',…]
-    // —— 说明 remote.settings 与 configForms 本来就是可声明的真实服务。
     expect(inject).toContain('slots')
     expect(inject).toContain('locale')
-    expect(inject).toContain('remote.settings')
     expect(inject).toContain('configForms')
   })
 

@@ -604,27 +604,38 @@ export function SafeZoneSettings(): ReactElement {
 /**
  * 客户端插件入口。
  *
- * ## inject 该写什么（这一条被误解过两次，代价很大）
+ * ## inject 该写什么（这一条被误解过三次，代价很大）
  *
- * 宿主用 `Object.keys(fiber.inject).filter((s) => ctx.get(s) === undefined)` 检查
- * 依赖，缺一个就把 fiber 停在 `FIBER_PENDING` —— `apply` 永远不执行。所以
- * **只能声明宿主确实会提供的服务**。
+ * cordis 的服务访问有守卫（`ReflectService.handler.get`），规则是：
  *
- * 反过来说，凡是宿主**确实提供**的服务，都必须声明 —— 否则访问它时 cordis 的
- * 存取守卫会抛 `cannot get property "x" without inject`，而这个错误发生在
- * 属性求值处，`?.` 拦不住，整个组件子树会被错误边界丢掉（界面一片空白）。
+ *   1. 属性在 ctx 代理目标上存在            → 直接返回；
+ *   2. 否则沿 fiber 链找 `fiber.store[prop]`  → 找到则返回；
+ *   3. `prop in fiber.inject` 且服务未就绪  → `cannot get required service "x" in inactive context`；
+ *   4. 其余                                 → `cannot get property "x" without inject`。
  *
- * 官方 `dsh-client-ui-settings-general` 的声明是：
+ * 第 3、4 条是两种不同的病：3 说明**声明了但服务没到**，4 说明**根本没声明**。
+ * 而声明了宿主不提供的服务，会让 fiber 停在 `FIBER_PENDING`，`apply` 永不执行。
  *
- *   ['slots','locale','connection','remote','remote.settings','configForms','shortcuts','modules']
+ * ## remote 与 remote.settings 是两个独立服务
  *
- * 也就是说 `remote` 与 `remote.settings` **本来就是可声明的服务**，我之前把它们
- * 判为「宿主不提供」是错的。这里按同样思路声明本插件真正需要的四项：
+ * 客户端 api-gateway 里：
+ *   - `super(ctx, "remote")`                      —— 顶层 Remote 服务；
+ *   - `super(ctx, remoteServiceKey(name))`        —— 每个命名空间一个，`remote.<ns>`。
+ *
+ * 所以 `ctx.remote.settings` 的求值要**先**通过 `remote` 的守卫，**再**取 `settings`。
+ * 只声明 `remote.settings` 时，`ctx.remote` 这一步就抛 `without inject` —— 这正是
+ * 0.2.12 的诊断里看到的那条。
+ *
+ * 官方 `dsh-client-ui-settings-general` 因此**两个都声明**：
+ *   ['slots','locale','connection','remote','remote.settings','configForms',…]
+ *
+ * 本插件按同样规则声明五项：
  *   - `slots`、`locale`：注册 UI 与标签字典；
- *   - `configForms`：宿主渲染配置页时要读的表单契约；
- *   - `remote.settings`：读写插件配置的接口。
+ *   - `configForms`：宿主渲染配置区时要调 `ctx.configForms.describe()` / `.get(id)`；
+ *   - `remote`：访问 `ctx.remote` 这一层；
+ *   - `remote.settings`：具体的 settings 命名空间方法。
  */
-export const inject = ['slots', 'locale', 'configForms', 'remote.settings']
+export const inject = ['slots', 'locale', 'configForms', 'remote', 'remote.settings']
 
 /**
  * 注册表单到插件页。
