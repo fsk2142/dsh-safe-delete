@@ -19,11 +19,20 @@ import { makeFakeCtx } from './support/fake-ctx'
  * 之前失效的真正原因。
  */
 describe('client apply', () => {
-  it('declares only the services the host always provides', () => {
-    // 宿主会检查顶层 inject 里的每个服务，缺一个就把 fiber 停在 pending，
-    // **apply 永远不执行**。所以这个数组必须只含启动必备的服务。
-    // 对照 dsh-context（真实可用的带配置页插件）就是 ['slots','locale']。
-    expect(inject).toEqual(['slots', 'locale'])
+  it('declares every service it accesses, and only real ones', () => {
+    // 这条规则被误解过两次：
+    //
+    //   声明了宿主不提供的服务 → fiber 停在 pending，apply 永不执行；
+    //   访问了未声明的服务     → guard 在属性**求值**处抛错（`?.` 拦不住），
+    //                            组件子树被错误边界丢掉，界面一片空白。
+    //
+    // 官方 dsh-client-ui-settings-general 声明了
+    // ['slots','locale','connection','remote','remote.settings','configForms',…]
+    // —— 说明 remote.settings 与 configForms 本来就是可声明的真实服务。
+    expect(inject).toContain('slots')
+    expect(inject).toContain('locale')
+    expect(inject).toContain('remote.settings')
+    expect(inject).toContain('configForms')
   })
 
   it('registers on plugins.bundle.config, keyed by the package name', () => {

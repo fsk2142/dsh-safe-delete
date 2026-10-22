@@ -604,24 +604,27 @@ export function SafeZoneSettings(): ReactElement {
 /**
  * 客户端插件入口。
  *
- * **只声明宿主一定会提供的服务**：`slots` 与 `locale`。
- *
- * ## 为什么这里不能多写
+ * ## inject 该写什么（这一条被误解过两次，代价很大）
  *
  * 宿主用 `Object.keys(fiber.inject).filter((s) => ctx.get(s) === undefined)` 检查
- * 依赖，缺一个就把 fiber 停在 `FIBER_PENDING` —— **`apply` 永远不执行**。
- * 表现是：插件在宿主侧正常运行、界面元素一个都不出现、控制台没有明显错误。
+ * 依赖，缺一个就把 fiber 停在 `FIBER_PENDING` —— `apply` 永远不执行。所以
+ * **只能声明宿主确实会提供的服务**。
  *
- * 之前这里写着 `remote.settings`（自 v0.2.0 起）和 `configForms`，两者都不是
- * 客户端启动必备：
- *   - `configForms` 是渲染配置页时才要的服务，应当用 `ctx.inject()` 现取；
- *   - `remote.settings` 在宿主里并未注册（宿主用的是 `remote.pluginManager`
- *     这类名字），声明它等于让整个客户端包一直等一个不会到来的服务。
+ * 反过来说，凡是宿主**确实提供**的服务，都必须声明 —— 否则访问它时 cordis 的
+ * 存取守卫会抛 `cannot get property "x" without inject`，而这个错误发生在
+ * 属性求值处，`?.` 拦不住，整个组件子树会被错误边界丢掉（界面一片空白）。
  *
- * 对照 `dsh-context`（真实可用的带配置页插件）：它的顶层 inject 就是
- * `['slots', 'locale']`，其余服务一律 `ctx.inject()` 现取。
+ * 官方 `dsh-client-ui-settings-general` 的声明是：
+ *
+ *   ['slots','locale','connection','remote','remote.settings','configForms','shortcuts','modules']
+ *
+ * 也就是说 `remote` 与 `remote.settings` **本来就是可声明的服务**，我之前把它们
+ * 判为「宿主不提供」是错的。这里按同样思路声明本插件真正需要的四项：
+ *   - `slots`、`locale`：注册 UI 与标签字典；
+ *   - `configForms`：宿主渲染配置页时要读的表单契约；
+ *   - `remote.settings`：读写插件配置的接口。
  */
-export const inject = ['slots', 'locale']
+export const inject = ['slots', 'locale', 'configForms', 'remote.settings']
 
 /**
  * 注册表单到插件页。
@@ -672,31 +675,18 @@ export function apply(ctx: ClientContext): void {
   })
 
   guarded('capture the settings remote for the form', () => {
-    // `ctx.remote` 有存取守卫：不声明 inject 就访问会抛
-    // `cannot get property "remote" without inject`。而 `remote.*` 又不能写进
-    // 顶层 inject（会让整个客户端包停在 pending）。
+    // `remote.settings` 已经在顶层 inject 里声明，所以这里可以直接读 ——
+    // 声明过的服务不再受 `cannot get property "remote" without inject` 守卫拦。
     //
-    // 解法与取 `configForms` 相同：用 `ctx.inject([...], cb)` 动态注入一次。
-    // 回调拿到的是**作用域内的 ctx**，那上面访问 remote 是合法的。
-    const maybeInject = (ctx as unknown as {
-      inject?: (services: string[], cb: (scoped: Record<string, unknown>) => void) => unknown
-    }).inject
-    if (typeof maybeInject === 'function') {
-      maybeInject(['remote.settings'], (scoped) => {
-        // 作用域 ctx 上访问 remote 是合法的（这就是 inject 的意义）。
-        const remote = (scoped as { remote?: { settings?: SettingsRemote } }).remote
-        settingsRemote = remote?.settings
-        note('capture settings remote', settingsRemote !== undefined, settingsRemote === undefined ? 'not exposed' : 'ok')
-      })
-      return
-    }
-    // 没有 `ctx.inject` 的宿主：直接读会抛守卫错误，所以走 try 并降级。
-    //
-    // 这里**不能**写 `ctx.remote?.settings` —— 守卫在属性**求值**时抛，
-    // 可选链拦不住。包一层 try 才能安全降级成「没有设置接口」。
+    // 仍然包一层 try：宿主版本差异下 guard 的实现可能不同，宁可降级成
+    // 「没有设置接口」也不要让整个子树被错误边界丢掉。
     try {
       settingsRemote = (ctx as { remote?: { settings?: SettingsRemote } }).remote?.settings
-      note('capture settings remote', settingsRemote !== undefined, 'direct read (no ctx.inject)')
+      note(
+        'capture settings remote',
+        settingsRemote !== undefined,
+        settingsRemote === undefined ? 'remote.settings is empty' : 'ok',
+      )
     } catch (error) {
       note('capture settings remote', false, error instanceof Error ? error.message : String(error))
     }
