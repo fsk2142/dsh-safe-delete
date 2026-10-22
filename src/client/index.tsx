@@ -113,6 +113,13 @@ interface ClientContext {
     register?: (spec: Record<string, unknown>, component: unknown) => unknown
   }
   effect?: (fn: () => unknown, label?: string) => unknown
+  /**
+   * cordis 的服务注入：等服务就绪后再执行回调。
+   *
+   * 配置页必须走它 —— `configForms` 服务晚于 `apply` 就绪，直接在 `apply` 里
+   * 注册槽位的话，宿主渲染时拿不到对应表单，「配置」入口不出现且不报错。
+   */
+  inject?: (services: string[], callback: (scoped: Record<string, unknown>) => void) => unknown
 }
 
 /** 把值格式化成字节单位（GB/MB 取整，避免 20.000000001 GB 这种）。 */
@@ -502,7 +509,7 @@ export function SafeZoneSettings(): ReactElement {
 }
 
 /** 客户端插件入口。 */
-export const inject = ['slots', 'locale', 'remote.settings']
+export const inject = ['slots', 'locale', 'remote.settings', 'configForms']
 
 /**
  * 注册表单到插件页。
@@ -526,30 +533,51 @@ export function apply(ctx: ClientContext): void {
     ;(globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx = ctx
   })
 
-  guarded('register the settings form on the plugin page', () => {
-    ctx.slots?.inject?.('plugins.row.config', () => {
-      ctx.slots?.register?.(
-        {
-          name: 'plugins.row.config',
-          // 契约：key 是 `<包名>#<行 id>`。
-          //
-          // 本插件的行 id 在 cordis.patch.yml 里声明为 `dsh-safe-delete`，
-          // 与包名相同 —— 所以两段一样。**不能用别的字符串**：宿主按 key 找
-          // 对应的行，对不上就静默不显示「配置」入口（也不报错）。
-          key: `${NAMESPACE}#${NAMESPACE}`,
-          locale: NAMESPACE,
-        },
-        // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
-        //
-        // 三种视图：
-        //   - `summary`：折叠摘要（放在标题下）
-        //   - `page`：宿主给表单的整页视图 —— 表单自带保存按钮时用它
-        //   - 其余：沿用表单本体
-        ({ view }: { view?: string }) => {
-          if (view === 'summary') return '安全区设置'
-          return <SafeZoneSettings />
-        },
-      )
+  guarded('register the config page on the plugin page', () => {
+    // 与 dsh-context（一个真实可用的带配置页插件）同一套写法，三点缺一不可：
+    //
+    //   1. `ctx.inject(['configForms'], …)` —— 等配置表单服务挂上再继续。
+    //      宿主渲染配置页时要用这个服务；早于它就绪注册，槽位记录虽然存在，
+    //      页面拿不到对应表单，「配置」入口就不出现（而且**不报错**）。
+    //   2. `whileServed([ns], …)` —— 保证这个 namespace 的配置确实被服务，
+    //      服务撤销时会自动注销插槽。
+    //   3. `plugins.bundle.config` 而非 `plugins.row.config` —— 本插件是一个
+    //      bundle，key 是**包名**（不是 `<包名>#<行 id>`，那是单行配置用的）。
+    ctx.inject?.(['configForms'], (scoped) => {
+      const service = scoped as {
+        configForms?: {
+          get?: (ns: string) => unknown
+          whileServed?: (namespaces: string[], register: () => void) => unknown
+        }
+      }
+      const forms = service.configForms
+      if (forms?.get === undefined || forms.whileServed === undefined) {
+        console.error(
+          '[dsh-safe-delete] configForms service is missing get()/whileServed(); the settings form will not appear.',
+        )
+        return
+      }
+      try {
+        forms.get(NAMESPACE)
+      } catch (error) {
+        console.error(`[dsh-safe-delete] configForms.get("${NAMESPACE}") threw:`, error)
+      }
+      forms.whileServed([NAMESPACE], () => {
+        ctx.slots?.inject?.('plugins.bundle.config', () => {
+          ctx.slots?.register?.(
+            {
+              name: 'plugins.bundle.config',
+              key: NAMESPACE,
+              locale: NAMESPACE,
+            },
+            // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
+            ({ view }: { view?: string }) => {
+              if (view === 'summary') return '安全区设置'
+              return <SafeZoneSettings />
+            },
+          )
+        })
+      })
     })
   })
 }

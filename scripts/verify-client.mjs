@@ -11,6 +11,7 @@ const code = readFileSync('lib/client.js', 'utf8')
 
 const registered = []
 let injectedSlot = ''
+const servedNamespaces = []
 let loadCallCount = 0
 let moduleId = ''
 
@@ -59,6 +60,24 @@ const ctx = {
       return () => {}
     },
   },
+  // 配置页必须等 `configForms` 服务就绪才注册（与 dsh-context 同一套写法）。
+  // 这里模拟宿主：服务已就绪，`whileServed` 立刻执行回调。
+  configForms: {
+    get: () => ({}),
+    whileServed: (namespaces, register) => {
+      servedNamespaces.push(...namespaces)
+      register()
+      return () => {}
+    },
+  },
+  inject: (services, callback) => {
+    const scoped = {}
+    for (const service of services) {
+      if (service === 'configForms') scoped.configForms = ctx.configForms
+    }
+    callback(scoped)
+    return () => {}
+  },
   locale: {},
   remote: { settings: {} },
   get: () => undefined,
@@ -89,6 +108,7 @@ console.log('\n=== 结果 ===')
 console.log(`loader.load 调用次数: ${loadCallCount}`)
 console.log(`模块 id: ${moduleId}`)
 console.log(`inject 的槽位: ${injectedSlot || '(无)'}`)
+console.log(`whileServed 的 namespace: ${servedNamespaces.join(', ') || '(无)'}`)
 console.log(`注册的表单条数: ${registered.length}`)
 for (const item of registered) {
   console.log(`  spec: ${JSON.stringify(item.spec)}`)
@@ -98,8 +118,11 @@ for (const item of registered) {
 const problems = []
 if (loadCallCount !== 1) problems.push('loader.load 应该恰好被调用一次')
 if (moduleId !== 'dsh-safe-delete') problems.push('模块 id 不匹配')
-if (injectedSlot !== 'plugins.row.config') problems.push('没有注册到 plugins.row.config')
+// 真实可用插件（dsh-context）用的是 plugins.bundle.config + 包名作 key。
+if (injectedSlot !== 'plugins.bundle.config') problems.push('没有注册到 plugins.bundle.config')
 if (registered.length !== 1) problems.push('应该恰好注册一个表单')
+if (registered[0]?.spec?.key !== 'dsh-safe-delete') problems.push('槽位 key 应当是包名')
+if (!servedNamespaces.includes('dsh-safe-delete')) problems.push('没有通过 whileServed 绑定 namespace')
 
 console.log('')
 if (problems.length === 0) {

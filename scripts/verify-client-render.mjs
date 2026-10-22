@@ -52,6 +52,22 @@ const fakeWindow = {
             return () => {}
           },
         },
+        // 配置页必须等 `configForms` 就绪才注册（与 dsh-context 同一套写法）。
+        configForms: {
+          get: () => ({}),
+          whileServed: (namespaces, register) => {
+            register()
+            return () => {}
+          },
+        },
+        inject: (services, callback) => {
+          const scoped = {}
+          for (const service of services) {
+            if (service === 'configForms') scoped.configForms = ctx.configForms
+          }
+          callback(scoped)
+          return () => {}
+        },
         locale: {},
         remote: { settings: {} },
         get: () => undefined,
