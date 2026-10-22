@@ -36,8 +36,6 @@ export declare function restoreFromSafeZone(stateDir: string, id: string): Promi
  * **这是本文件唯一允许递归删除的地方**，且 `entryDir` 保证路径落在安全区内部。
  */
 export declare function destroyEntry(stateDir: string, id: string): Promise<void>;
-/** 安全区当前总占用字节数。 */
-export declare function safeZoneBytesOnDisk(stateDir: string): Promise<number>;
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 export declare function isEmptySafeZone(stateDir: string): Promise<boolean>;
 //#endregion
