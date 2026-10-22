@@ -1,0 +1,26 @@
+fix: see deletes inside interpreter one-liners
+
+Round 4 found no regression, one pre-existing gap, and one detail of the
+same family that the report flagged in passing.
+
+Interpreter wrappers were not unwrapped. `python -c 'import shutil;
+shutil.rmtree("/tmp/x")'`, `node -e 'require("fs").rmSync(...)'` and
+`perl -e 'unlink ...'` all passed, because the script body is glued into a
+single token by tokenize. The delete verbs here are statically visible -
+this is not the documented "dynamically constructed command" limitation -
+so they belong in the unwrap table alongside cmd /c and sh -c. python,
+python3, node, perl, ruby, php and lua with -c/-e/-E/-r now unwrap into the
+normal nested parse. Running a script file is still allowed: its contents
+are not statically known.
+
+The single-quote mask treated every quote as a string delimiter, so
+`echo "'$(rm -rf x)'"` was read as a single-quoted range and the
+substitution was missed. That inner quote sits inside double quotes, where
+POSIX treats it as an ordinary character and still expands `$()`. The mask
+now tracks both quote states and only opens a single-quoted range outside
+double quotes.
+
+Mutation checks confirm both tests bite: disabling the interpreter unwrap,
+or reverting the mask to a naive toggle, turns the suite red.
+
+267 tests, 28 files.
