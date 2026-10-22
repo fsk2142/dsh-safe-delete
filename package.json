@@ -44,11 +44,12 @@
     "bin/",
     "cordis.patch.yml",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=22.19.0",
-    "dsh": ">=0.2.0-rc.2 <0.3.0"
+    "dsh": ">=0.2.0-rc.2"
   },
   "dsh": {
     "bundle": {
@@ -67,6 +68,7 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:watch": "vitest",
     "version:next": "node scripts/next-version.mjs",
     "release": "node scripts/release.mjs",
     "dead-code": "node scripts/find-dead-code.mjs ."
