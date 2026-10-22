@@ -5,10 +5,12 @@
  */
 import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
-const root = '<repo>'
+// 以脚本自身位置定位仓库根，这样在任何人机器上都能跑（不写死绝对路径）。
+const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const svg = readFileSync(join(root, 'icon.svg'), 'utf8')
 
 const html = `<!doctype html><meta charset="utf-8">

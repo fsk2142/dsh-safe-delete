@@ -1,0 +1,23 @@
+chore: drop development-only scripts and fix leftover placeholders
+
+Removes scripts that existed only for this one development cycle, whose
+value is now fully carried by the test suite:
+
+- probe-classification.ts / audit-coverage.ts / probe-form-units.ts
+  (their subject matter is covered by interception-safety.test.ts and
+  commands.test.ts)
+- probe-e2e.ts, check-icon.mjs (one-off checks)
+- verify-remote.mjs (my remote audit; hardcoded this repo's name)
+- check-anchors.mjs (written for a rules file that lives in another repo)
+
+Also repairs two things the earlier anonymisation pass broke:
+
+- render-icon.mjs resolved its paths from a literal `<repo>` placeholder,
+  so it could not run at all. It now locates the repo from its own file
+  location, which works on any machine.
+- tests/classify.test.ts and the plan document carried `<workspace>` in
+  path literals where a normal directory name belongs.
+
+README gains the development section, the verification-script table and an
+explicit "known limitations" list, and drops the stale claim that the
+plugin ships no browser-side UI.

@@ -13,9 +13,10 @@ import { readFileSync } from 'node:fs'
 const checks = [
   {
     label: '本机用户名 / 绝对路径',
-    // 只匹配"看起来是真的用户名"的写法：`C:\Users\<某个词>` 后面紧跟路径分隔。
-    // 占位符（`alice`、`<user>`、`%USERNAME%`）不算 —— 但也排除掉本机真实用户名，
-    // 所以这条规则在别的机器上跑时需要改 ACTUAL_USER。
+    // 匹配 `C:\Users\<某个词>\` 这种"看起来是真的用户名"的写法。
+    // 占位符（`alice`、`<user>`、`%USERNAME%`、`$…`）不算 —— 源码注释里用它们
+    // 举例是正常的。要在自己机器上跑得更严，可以把你的用户名加进下面的排除表，
+    // 那样连"占位符恰好和你同名"的情况也不会漏。
     pattern: new RegExp(`C:\\\\+Users\\\\+(?!alice|<user>|%USERNAME%|\\$)[A-Za-z0-9._-]+\\\\`, 'i'),
     ignoreFiles: ['pnpm-lock.yaml'], // 该文件的 base64 完整性哈希可能偶然含子串
     severity: 'high',

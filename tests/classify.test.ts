@@ -2,11 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import { classifyPath, requiresApproval } from '../src/classify'
 
-const env = { home: 'C:\\Users\\alice', workdir: 'C:\\Work\\<workspace>' }
+const env = { home: 'C:\\Users\\alice', workdir: 'C:\\Work\\project' }
 
 describe('classifyPath', () => {
   it('treats ordinary workspace files as free', () => {
-    expect(classifyPath('C:\\Work\\<workspace>\\build', env)).toBe('free')
+    expect(classifyPath('C:\\Work\\project\\build', env)).toBe('free')
     expect(classifyPath('C:\\Work\\other\\dist', env)).toBe('free')
   })
 
