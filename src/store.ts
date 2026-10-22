@@ -262,12 +262,6 @@ export async function destroyEntry(stateDir: string, id: string): Promise<void> 
   await writeIndex(stateDir, entries.filter((e) => e.id !== id))
 }
 
-/** 安全区当前总占用字节数。 */
-export async function safeZoneBytesOnDisk(stateDir: string): Promise<number> {
-  const entries = await readIndex(stateDir)
-  return entries.reduce((sum, e) => sum + e.bytes, 0)
-}
-
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 export async function isEmptySafeZone(stateDir: string): Promise<boolean> {
   const entries = await readIndex(stateDir)
