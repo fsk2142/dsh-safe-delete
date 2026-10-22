@@ -57,8 +57,10 @@ const files = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
 
 console.log(`审计范围：${files.length} 个被跟踪文件\n`)
 
-/** 本脚本自身的路径：它天然包含所有检测模式，跳过以免误报。 */
-const SELF = 'scripts/privacy-audit.mjs'
+/**
+ * 本身内嵌检测模式的脚本：它们的"命中"是规则，不是泄露，必须跳过。
+ */
+const SCANNERS = new Set(['scripts/privacy-audit.mjs', 'scripts/verify-remote.mjs'])
 
 let findings = 0
 
@@ -75,8 +77,7 @@ for (const check of checks) {
   // 内容层面的检查
   for (const file of files) {
     if (binary.test(file)) continue
-    // 审计脚本自己包含了这些模式串（它们是规则，不是泄露），跳过自身。
-    if (SELF === file) continue
+    if (SCANNERS.has(file)) continue
     if (check.ignoreFiles?.includes(file) === true) continue
     let text
     try {
