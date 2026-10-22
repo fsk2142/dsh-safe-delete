@@ -33,7 +33,8 @@
       "types": "./lib/tools.d.ts",
       "default": "./lib/tools.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "bin": {
     "dsh-safe-delete": "bin/dsh-safe-delete.mjs"
@@ -46,7 +47,8 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0-rc.2 <0.3.0"
   },
   "dsh": {
     "bundle": {
