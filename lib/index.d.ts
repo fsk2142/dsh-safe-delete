@@ -34,6 +34,14 @@ export interface SafeDeleteConfig {
   crossVolumeCopy?: boolean;
   /** 拦截开关；默认 true。 */
   blockShellDeletes?: boolean;
+  /** 是否拦截对启动关键路径的写入；默认 true。 */
+  blockProtectedWrites?: boolean;
+  /**
+   * 覆盖用户主目录（测试用）。
+   *
+   * 生产环境不该设置它 —— 分类器默认取 `os.homedir()`。
+   */
+  homeDir?: string;
 }
 /** 插件上下文的最小结构；真实 cordis Context 是它的超集。 */
 export interface PluginContext {

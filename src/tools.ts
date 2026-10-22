@@ -1,5 +1,5 @@
 /**
- * 五个工具的定义：`safe_delete` 与四个安全区管理工具。
+ * 工具定义：`safe_delete`、四个安全区管理工具，以及审计流水。
  *
  * 这里刻意**手写 JSON Schema 子集**而不 import `defineTool` —— 以 `link:` 裸装的
  * bundle 没有自带 node_modules，import `@deepseek-ai/*` 会在 DSH 启动时解析失败。
@@ -10,6 +10,8 @@
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
+
+import { appendAudit, readAudit } from './audit'
 
 import { classifyPath, requiresApproval, type ClassifyEnv } from './classify'
 import { describeTarget } from './describe'
@@ -162,6 +164,11 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     const selected = selectForPrune(entries, { now: now(), maxBytes: deps.maxBytes })
     for (const entry of selected) {
       await destroyEntry(deps.stateDir, entry.id)
+      appendAudit(deps.stateDir, {
+        event: 'prune',
+        target: entry.originalPath,
+        detail: `id=${entry.id} bytes=${entry.bytes}`,
+      })
     }
     return selected
   }
@@ -247,6 +254,13 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         ...(reason !== undefined && reason !== '' ? { reason } : {}),
       })
 
+      appendAudit(deps.stateDir, {
+        event: 'delete',
+        target,
+        tool: 'safe_delete',
+        detail: `id=${entry.id} cls=${classification}${reason === undefined || reason === '' ? '' : ` reason=${reason}`}`,
+      })
+
       // 7. 顺带清理（时间 + 容量）。
       const pruned = await pruneNow()
 
@@ -299,6 +313,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       const id = String(args.id ?? '')
       if (id === '') return { ok: false, text: '', error: 'id is required' }
       const { restoredTo } = await restoreFromSafeZone(deps.stateDir, id)
+      appendAudit(deps.stateDir, { event: 'restore', target: restoredTo, tool: 'safe_zone_restore', detail: `id=${id}` })
       return { ok: true, text: `restored to: ${restoredTo}` }
     },
   })
@@ -336,7 +351,35 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     },
   })
 
-  return [safeDelete, safeZoneList, safeZoneRestore, safeZoneStatus, safeZoneCheck]
+  const safeZoneJournal = makeTool({
+    name: 'safe_zone_journal',
+    description:
+      'Tail the audit trail: every blocked shell delete, blocked write to a boot-critical file, approval ask, deletion, restore and prune, newest first. ' +
+      'Use it to answer "what happened" rather than "what is in the safe zone now".',
+    parameters: {
+      n: { type: 'integer', description: 'Number of records to show (default 20, max 200).' },
+    },
+    async execute(args) {
+      const limit = Math.min(200, Math.max(1, Number(args.n) || 20))
+      const records = readAudit(deps.stateDir, limit)
+      if (records.length === 0) return { ok: true, text: 'journal is empty' }
+      return {
+        ok: true,
+        text: records
+          .map((r) => {
+            const when = r.at.slice(0, 19).replace('T', ' ')
+            const parts = [when, r.event]
+            if (r.tool !== undefined) parts.push(`tool=${r.tool}`)
+            if (r.target !== undefined) parts.push(r.target)
+            if (r.detail !== undefined) parts.push(`(${r.detail})`)
+            return parts.join('  ')
+          })
+          .join('\n'),
+      }
+    },
+  })
+
+  return [safeDelete, safeZoneList, safeZoneRestore, safeZoneStatus, safeZoneCheck, safeZoneJournal]
 }
 
 /**

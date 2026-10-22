@@ -18,6 +18,13 @@ interface ClassifyEnv {
    * 真实使用中这正是被抱怨的那类打扰。
    */
   tmpdir?: string;
+  /**
+   * 安全区状态目录的实际位置。
+   *
+   * 默认按 `<dshHome>/.dsh-safe-delete` 推导，但 `stateDir` 是可配置的 ——
+   * 配到别处时若不显式告知，安全区自身就会失去保护。
+   */
+  safeZoneDir?: string;
 }
 //#endregion
 //#region src/tools.d.ts

@@ -32,6 +32,13 @@ export interface ClassifyEnv {
    * 真实使用中这正是被抱怨的那类打扰。
    */
   tmpdir?: string
+  /**
+   * 安全区状态目录的实际位置。
+   *
+   * 默认按 `<dshHome>/.dsh-safe-delete` 推导，但 `stateDir` 是可配置的 ——
+   * 配到别处时若不显式告知，安全区自身就会失去保护。
+   */
+  safeZoneDir?: string
 }
 
 /** profile 目录下受保护的清单文件名。 */
@@ -88,7 +95,10 @@ export function classifyPath(absPath: string, env: ClassifyEnv): Classification 
   const target = normalize(absPath)
   const home = normalize(env.home)
   const dshHome = normalize(env.dshHome ?? path.join(env.home, '.dsh'))
-  const safeZone = normalize(path.join(env.dshHome ?? path.join(env.home, '.dsh'), '.dsh-safe-delete'))
+  // 安全区可能被配置到任意位置（`stateDir`），所以由调用方显式告知，
+  // 不能只按 `<dshHome>/.dsh-safe-delete` 猜 —— 猜错就等于让插件自己的状态目录
+  // 暴露在写入/删除通道下。
+  const safeZone = normalize(env.safeZoneDir ?? path.join(env.dshHome ?? path.join(env.home, '.dsh'), '.dsh-safe-delete'))
 
   // 1. 安全区自身：永不允许被删除。
   if (isUnder(target, safeZone)) return 'protected'

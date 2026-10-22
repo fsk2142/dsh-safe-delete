@@ -11,6 +11,7 @@
  *   prune [--dry-run]   按策略清理（时间 + 容量），--dry-run 只报告不动手
  *   check               只读体检（不写任何文件）
  *   status              安全区概况
+ *   journal [n]         审计流水（拦截 / 删除 / 取回 / 清理），最新在前
  */
 
 import os from 'node:os'
@@ -150,6 +151,25 @@ async function main(argv) {
       process.stdout.write(
         `${checkComposition({ home: os.homedir(), workdir: process.cwd(), dshHome: dshHome() })}\n`,
       )
+      return 0
+    }
+
+    case 'journal': {
+      const { readAudit } = await import('../lib/audit.js')
+      const limit = Math.min(200, Math.max(1, Number(rest[0]) || 20))
+      const records = readAudit(stateDir(), limit)
+      if (records.length === 0) {
+        process.stdout.write('journal is empty\n')
+        return 0
+      }
+      for (const r of records) {
+        const when = r.at.slice(0, 19).replace('T', ' ')
+        const parts = [when, r.event]
+        if (r.tool !== undefined) parts.push(`tool=${r.tool}`)
+        if (r.target !== undefined) parts.push(r.target)
+        if (r.detail !== undefined) parts.push(`(${r.detail})`)
+        process.stdout.write(`${parts.join('  ')}\n`)
+      }
       return 0
     }
 

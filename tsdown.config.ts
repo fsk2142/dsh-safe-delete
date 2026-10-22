@@ -18,6 +18,7 @@ const hostConfig: UserConfig = {
     store: 'src/store.ts',
     prune: 'src/prune.ts',
     tools: 'src/tools.ts',
+    audit: 'src/audit.ts',
   },
   outDir: 'lib',
   format: 'esm',
