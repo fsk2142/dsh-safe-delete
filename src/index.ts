@@ -531,7 +531,18 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   // 为什么两条路都要：命令适合「知道参数名、要快」；设置页适合「想看清有哪些
   // 参数、范围和影响」。两者最终都走宿主的 settings 服务，所以一处改动在另一处
   // 重启后自然可见 —— 不存在两份配置需要同步的问题。
-  const settingsService = ctx.get('settings') as
+  /**
+   * 取宿主 settings 服务。
+   *
+   * ## 为什么不在启动时捕获一次
+   *
+   * `ctx.get(name)` 是 strict 的：服务的 fiber 尚未就绪（`state !== 2`）时返回
+   * `undefined`，而且**不报错**。启动时捕获会永久丢掉「稍后才就绪」的服务 ——
+   * 表现为斜杠命令改配置永远失败，却说不出原因。
+   *
+   * 每次调用时现取，服务就绪后自然可用。
+   */
+  const settingsServiceOf = ():
     | {
         describe?: () => unknown
         mutate?: (
@@ -540,12 +551,22 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           revision?: number,
         ) => Promise<unknown>
       }
-    | undefined
+    | undefined =>
+    ctx.get('settings') as
+      | {
+          describe?: () => unknown
+          mutate?: (
+            ns: string,
+            ops: readonly { op: 'set'; path: readonly string[]; value: unknown }[],
+            revision?: number,
+          ) => Promise<unknown>
+        }
+      | undefined
 
   /** 从宿主 settings 快照里取本插件的当前值。 */
   const readSettings = (): Record<string, unknown> => {
     try {
-      const described = settingsService?.describe?.()
+      const described = settingsServiceOf()?.describe?.()
       const rows = Array.isArray(described)
         ? described
         : (described as { namespaces?: unknown } | undefined)?.namespaces
@@ -567,7 +588,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   /** 当前快照的修订号（并发围栏）。 */
   const readRevision = (): number | undefined => {
     try {
-      const described = settingsService?.describe?.()
+      const described = settingsServiceOf()?.describe?.()
       const rows = Array.isArray(described)
         ? described
         : (described as { namespaces?: unknown } | undefined)?.namespaces
@@ -638,6 +659,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       return { ...defaults, ...stored }
     },
     writeConfig: async (key, value) => {
+      const settingsService = settingsServiceOf()
       if (settingsService?.mutate === undefined) {
         return { ok: false, error: '这个宿主没有暴露设置服务，请改用 cordis.patch.yml' }
       }
