@@ -41,8 +41,8 @@ let checked = 0
 
 for (const node of blobs) {
   if (/\.(png|jpg|jpeg|svg|woff2?)$/i.test(node.path)) continue
-  // privacy-audit.mjs 自身包含这些模式（它们是规则），跳过
-  if (node.path === 'scripts/privacy-audit.mjs') continue
+  // 本文件与隐私审计脚本都内嵌了检测规则（规则不是泄露），跳过它们。
+  if (node.path === 'scripts/privacy-audit.mjs' || node.path === 'scripts/verify-remote.mjs') continue
 
   const data = await api(`/repos/${repo}/git/blobs/${node.sha}`)
   const text = Buffer.from(data.content, 'base64').toString('utf8')
