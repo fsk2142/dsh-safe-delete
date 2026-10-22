@@ -15,7 +15,7 @@
  * @module dsh-safe-delete/client
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 
 /** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
@@ -250,6 +250,31 @@ function unwrapRemote(result: unknown): { ok: true; value: unknown } | { ok: fal
   return { ok: true, value: result }
 }
 
+/**
+ * 宿主 settings remote 的持有者。
+ *
+ * ## 为什么不能直接读 `ctx.remote`
+ *
+ * cordis 对服务访问有守卫：`ctx.remote` 属于「需要 inject 声明才能访问」的路径，
+ * 没有声明就抛 `cannot get property "remote" without inject`。而 `remote.*` 又
+ * **不能**写进顶层 `inject`（那样会让整个客户端包停在 pending，apply 永不执行）——
+ * 两头都是死路。
+ *
+ * 绕开守卫的正确做法：在 `apply` 阶段把 remote 取出来存进模块变量，
+ * 组件从这里读。`apply` 里访问是安全的（那是插件的激活上下文），
+ * 组件渲染时只是读一个普通变量。
+ */
+let settingsRemote: SettingsRemote | undefined
+
+/**
+ * 表单组件里取 remote。
+ *
+ * @returns 宿主提供的 settings remote；不可用时 `undefined`。
+ */
+function currentRemote(): SettingsRemote | undefined {
+  return settingsRemote
+}
+
 /** 表单组件。 */
 export function SafeZoneSettings(): ReactElement {
   const [values, setValues] = useState<Record<string, unknown>>({})
@@ -269,23 +294,34 @@ export function SafeZoneSettings(): ReactElement {
    */
   const savingRef = useRef(false)
 
-  const remote = useMemo<SettingsRemote | undefined>(() => {
-    const ctx = (globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx
-    return ctx?.remote?.settings
-  }, [])
+  // remote 由 `apply` 里的 `ctx.inject(['remote.settings'], …)` 异步填入，
+  // 可能在首次渲染之后才就绪。所以这里不用 `useMemo`（它只算一次），
+  // 而是在 effect 里读，必要时短暂重试。
+  const remote = currentRemote()
 
   useEffect(() => {
     let alive = true
     const load = async (): Promise<void> => {
-      if (remote?.describe === undefined) {
-        if (alive) {
-          setStatus('error')
-          setMessage('这个宿主没有暴露设置接口，配置请改用 cordis.patch.yml。')
-        }
+      // 等 remote 就绪（最多约 2 秒）。用轮询而不是订阅：宿主没有暴露
+      // 「remote 可用」的通知，而这个等待只发生在打开配置页的那一次。
+      let resolved = currentRemote()
+      for (let i = 0; i < 20 && resolved === undefined && alive; i += 1) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100)
+        })
+        resolved = currentRemote()
+      }
+      if (!alive) return
+
+      if (resolved?.describe === undefined) {
+        setStatus('error')
+        setMessage(
+          '这个宿主没有暴露设置接口（remote.settings 不可用），配置请改用 cordis.patch.yml。',
+        )
         return
       }
       try {
-        const payload = await remote.describe()
+        const payload = await resolved.describe()
         if (!alive) return
         const view = pickNamespace(payload)
         setValues(view.value)
@@ -372,6 +408,11 @@ export function SafeZoneSettings(): ReactElement {
     setSaving(true)
     setMessage('')
     try {
+      const activeRemote = currentRemote()
+      if (activeRemote?.mutate === undefined) {
+        setMessage('这个宿主没有暴露设置接口，无法保存。配置请改用 cordis.patch.yml。')
+        return
+      }
       // 真实契约：`mutate(ns, ops, revision)`，ops 是 `{ op:'set', path:[key], value }`
       // 的数组，不是 `{ name, value }` 这种扁平形状。
       const ops = Object.entries(payload).map(([key, value]) => ({
@@ -379,7 +420,7 @@ export function SafeZoneSettings(): ReactElement {
         path: [key],
         value,
       }))
-      const result = await remote.mutate(NAMESPACE, ops, revision)
+      const result = await activeRemote.mutate(NAMESPACE, ops, revision)
       // 宿主契约：失败**不 reject**，而是 resolve 成 `{ ok:false, error }`。
       // 不拆信封就会把被拒绝的保存当成成功。
       const unwrapped = unwrapRemote(result)
@@ -390,7 +431,7 @@ export function SafeZoneSettings(): ReactElement {
       // 成功后重新读一次，拿到新的修订号；否则连续两次保存会撞上自己上一次
       // 产生的修订号，第二次被当作冲突拒绝。
       try {
-        const refreshed = remote.describe === undefined ? undefined : await remote.describe()
+        const refreshed = activeRemote.describe === undefined ? undefined : await activeRemote.describe()
         if (refreshed !== undefined) {
           const view = pickNamespace(refreshed)
           setRevision(view.revision)
@@ -630,9 +671,35 @@ export function apply(ctx: ClientContext): void {
     }
   })
 
-  guarded('expose settings remote to the form', () => {
-    // 表单组件要从模块作用域拿到 remote.settings，这里把它挂上去。
-    ;(globalThis as { __dshSafeDeleteCtx?: ClientContext }).__dshSafeDeleteCtx = ctx
+  guarded('capture the settings remote for the form', () => {
+    // `ctx.remote` 有存取守卫：不声明 inject 就访问会抛
+    // `cannot get property "remote" without inject`。而 `remote.*` 又不能写进
+    // 顶层 inject（会让整个客户端包停在 pending）。
+    //
+    // 解法与取 `configForms` 相同：用 `ctx.inject([...], cb)` 动态注入一次。
+    // 回调拿到的是**作用域内的 ctx**，那上面访问 remote 是合法的。
+    const maybeInject = (ctx as unknown as {
+      inject?: (services: string[], cb: (scoped: Record<string, unknown>) => void) => unknown
+    }).inject
+    if (typeof maybeInject === 'function') {
+      maybeInject(['remote.settings'], (scoped) => {
+        // 作用域 ctx 上访问 remote 是合法的（这就是 inject 的意义）。
+        const remote = (scoped as { remote?: { settings?: SettingsRemote } }).remote
+        settingsRemote = remote?.settings
+        note('capture settings remote', settingsRemote !== undefined, settingsRemote === undefined ? 'not exposed' : 'ok')
+      })
+      return
+    }
+    // 没有 `ctx.inject` 的宿主：直接读会抛守卫错误，所以走 try 并降级。
+    //
+    // 这里**不能**写 `ctx.remote?.settings` —— 守卫在属性**求值**时抛，
+    // 可选链拦不住。包一层 try 才能安全降级成「没有设置接口」。
+    try {
+      settingsRemote = (ctx as { remote?: { settings?: SettingsRemote } }).remote?.settings
+      note('capture settings remote', settingsRemote !== undefined, 'direct read (no ctx.inject)')
+    } catch (error) {
+      note('capture settings remote', false, error instanceof Error ? error.message : String(error))
+    }
   })
 
   guarded('register the config page on the plugin page', () => {
