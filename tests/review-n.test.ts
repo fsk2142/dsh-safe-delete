@@ -68,3 +68,73 @@ describe('N2: a delete verb behind a path or .exe is still a delete verb', () =>
     expect(parseCommand('cat C:\\Work\\rm-notes.txt').destructive).toBe(false)
   })
 })
+
+/**
+ * 复审第三轮 M1：动词的 basename 出现在**参数位**时不是删除命令。
+ *
+ * N2 的修复把 basename 匹配用在了全部 token 上，于是「复制一个恰好叫 rm 的
+ * 文件」被判成删除 —— 而且拒绝理由会把目标说成 `/backup/`，给模型一条
+ * **错误信息**，比普通拒绝更糟。
+ */
+describe('M1: a verb-looking argument is not a delete command', () => {
+  const notDeletes = [
+    'cp /tmp/rm /backup/',
+    'cp del.exe bin/',
+    'mv ri ri.bak',
+    'cp rd /backup/',
+    'ls rm',
+    'git add rm',
+    'cat /tmp/del',
+  ]
+
+  for (const command of notDeletes) {
+    it(`allows ${JSON.stringify(command)}`, () => {
+      expect(parseCommand(command).destructive).toBe(false)
+    })
+  }
+
+  // 命令位上的仍然必须拦 —— 否则这次修复就修过头了。
+  const stillDeletes = [
+    'rm -rf /tmp/x',
+    '/bin/rm -rf /tmp/x',
+    'C:\\Windows\\System32\\rd.exe /s /q C:\\x',
+    'cmd /c "rd /s /q C:\\x"',
+    'find . -name x -exec rm {} \\;',
+    'cat list | xargs rm',
+  ]
+
+  for (const command of stillDeletes) {
+    it(`still treats ${JSON.stringify(command)} as destructive`, () => {
+      expect(parseCommand(command).destructive).toBe(true)
+    })
+  }
+})
+
+/**
+ * 复审第三轮 M2：单引号在 POSIX shell 里抑制命令替换。
+ *
+ * `echo '$(rm -rf x)'` 打印字面量，不执行；双引号内的 `$()` 则会执行。
+ * 不区分引号语境就会把字符串当命令 —— 那是误伤。
+ */
+describe('M2: single quotes suppress substitution, double quotes do not', () => {
+  const literal = ["echo '$(rm -rf x)'", "echo 'use `rm` carefully'", "cat 'x; rm -rf y'"]
+
+  for (const command of literal) {
+    it(`allows ${JSON.stringify(command)}`, () => {
+      expect(parseCommand(command).destructive).toBe(false)
+    })
+  }
+
+  const executed = ['echo "$(rm -rf x)"', 'echo "`rm -rf x`"', 'echo $(rm -rf x)', 'echo `rm -rf x`']
+
+  for (const command of executed) {
+    it(`still treats ${JSON.stringify(command)} as destructive`, () => {
+      expect(parseCommand(command).destructive).toBe(true)
+    })
+  }
+
+  it('allows harmless double-quoted substitutions', () => {
+    expect(parseCommand('echo "$(cat f)"').destructive).toBe(false)
+    expect(parseCommand('echo "$(date)"').destructive).toBe(false)
+  })
+})

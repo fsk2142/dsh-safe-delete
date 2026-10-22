@@ -157,12 +157,7 @@ function mentionsOnly(command: string): boolean {
    * 只看整条的第一个词，就会把这类命令整体豁免 —— 而 `;`、`&&`、换行、管道
    * 都是最常见的串联方式，等于给了一条不需要任何技巧的绕过通道。
    */
-  const segments = stripped
-    // `;` `&&` `||` `|` 换行，以及 Windows 单 `&`（同样能串联命令）。
-    // 注意 `&&` 要排在 `&` 前面，否则会被切成两段空的。
-    .split(/;|&&|\|\||\||\n|\r|&/)
-    .map((s) => s.trim())
-    .filter((s) => s !== '')
+  const segments = splitOutsideQuotes(stripped)
 
   if (segments.length === 0) return false
 
@@ -256,8 +251,16 @@ const DELETES_VIA_ARGUMENT = new Set(['xargs', 'find', 'foreach-object', 'foreac
 function commandSubstitutions(text: string): string[] {
   const found: string[] = []
 
+  // 先算出每个位置是否处在**单引号区间内**。
+  //
+  // 为什么：POSIX shell 里单引号抑制一切展开，`echo '$(rm -rf x)'` 打印的是
+  // 字面量，不会执行；而双引号内 `"$(rm -rf x)"` **会**执行。
+  // 不区分引号语境就会把字符串当命令 —— 那是误伤。
+  const inSingleQuote = singleQuoteMask(text)
+
   // `$( ... )`：按括号配对，支持嵌套。
   for (let i = 0; i < text.length - 1; i += 1) {
+    if (inSingleQuote[i] === true) continue
     if (text[i] !== '$' || text[i + 1] !== '(') continue
     let depth = 1
     let j = i + 2
@@ -268,12 +271,80 @@ function commandSubstitutions(text: string): string[] {
     if (depth === 0) found.push(text.slice(i + 2, j - 1))
   }
 
-  // 反引号：成对出现，非贪婪。
-  for (const match of text.matchAll(/`([^`]*)`/g)) {
-    found.push(match[1] ?? '')
+  // 反引号：成对出现，非贪婪；同样跳过单引号内的。
+  let cursor = 0
+  while (cursor < text.length) {
+    const open = text.indexOf('`', cursor)
+    if (open === -1) break
+    const close = text.indexOf('`', open + 1)
+    if (close === -1) break
+    if (inSingleQuote[open] !== true) found.push(text.slice(open + 1, close))
+    cursor = close + 1
   }
 
   return found
+}
+
+/**
+ * 标记每个字符是否处在单引号区间内。
+ *
+ * @param text 命令文本。
+ * @returns 与 text 等长的布尔数组。
+ */
+function singleQuoteMask(text: string): boolean[] {
+  const mask = new Array<boolean>(text.length).fill(false)
+  let inside = false
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "'") {
+      inside = !inside
+      mask[i] = inside
+      continue
+    }
+    mask[i] = inside
+  }
+  return mask
+}
+
+/**
+ * 按 shell 的命令分隔符切段，但**跳过引号内部**。
+ *
+ * 为什么不能直接 `split(/;/)`：`cat 'x; rm -rf y'` 里那个分号是字符串内容，
+ * 不是命令分隔。朴素切分会把它当成两条命令，于是第二段「以删除动词开头」，
+ * 整条被判成删除 —— 误伤。
+ *
+ * @param text 命令文本。
+ * @returns 各段（已 trim，空段被丢弃）。
+ */
+function splitOutsideQuotes(text: string): string[] {
+  const segments: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i] ?? ''
+
+    if (quote !== null) {
+      current += ch
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+      continue
+    }
+
+    // 分隔符：`;`、`&`、`|`、换行。`&&`/`||` 会在逐字符处理时自然产生空段。
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '\n' || ch === '\r') {
+      segments.push(current)
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  segments.push(current)
+
+  return segments.map((s) => s.trim()).filter((s) => s !== '')
 }
 
 /**
@@ -286,43 +357,47 @@ function commandSubstitutions(text: string): string[] {
  * @returns 含有删除命令时为 `true`。
  */
 function containsDeleteCommand(text: string): boolean {
-  const segments = text
-    .split(/;|&&|\|\||\||\n|\r|&/)
-    .map((s) => s.trim())
-    .filter((s) => s !== '')
+  // 引号内的分隔符不是命令分隔（`cat 'x; rm -rf y'` 是一个命令）。
+  const segments = splitOutsideQuotes(text)
 
   for (const segment of segments) {
     const tokens = tokenize(segment).map((t) => t.toLowerCase().replace(/^['"]|['"]$/g, ''))
 
-    // 1) 任一词是删除动词（含完整路径与 .exe 形式）。
-    if (tokens.some((t) => isDeleteVerb(t))) return true
+    // 只看命令位：路径参数里恰好叫 `rm` 的文件不是删除命令。
+    for (let i = 0; i < tokens.length; i += 1) {
+      const token = tokens[i] ?? ''
+      if (!isCommandPosition(tokens, i)) continue
+      if (isDeleteVerb(token)) return true
+      if (DELETES_VIA_ARGUMENT.has(token) && tokens.some((t) => isDeleteVerb(t))) return true
+    }
   }
 
-  // 2) 原始子串兜底：按空白切成裸词再看一次。
-  //
-  // 这一步是必要的：`$(rm -rf x)` 内部再切分时，括号与引号会把 token 粘在一起，
-  // 上面的 token 判断可能摸不到。裸词扫描对 `rm`、`rd`、`del` 这类短动词很可靠。
-  //
-  // **但必须先挖出命令替换、再剥普通引号**：
-  //   - `"unlink"`、`'rm -rf'` 是数据，剥掉免得误伤；
-  //   - `"$(rm -rf x)"` 里虽然有引号，`$()` 仍会被执行 —— 所以替换内容先单独留下。
-  const commandLike = commandSubstitutions(text).join(' ')
-  const withoutQuotes = stripQuotedStrings(text)
-  for (const word of `${withoutQuotes} ${commandLike}`.split(/[\s(){}[\]`$;|&]+/)) {
-    if (word !== '' && isDeleteVerb(word)) return true
+  // 2) 命令替换里的是命令，逐段按命令位判。
+  for (const inner of commandSubstitutions(text)) {
+    if (containsDeleteCommand(inner) && innerHasCommandVerb(inner)) return true
   }
 
   return false
 }
 
 /**
- * 去掉被引号包裹的内容（单引号与双引号）。
+ * 命令替换内容里是否真的在**执行**删除。
  *
- * @param text 命令文本。
- * @returns 引号内内容被替换成空格的文本。
+ * 只看该段自身的命令位：`$(cat rm.txt)` 里的 `rm.txt` 不是命令。
+ *
+ * @param text 命令替换内部文本。
+ * @returns 在执行删除时为 `true`。
  */
-function stripQuotedStrings(text: string): string {
-  return text.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ')
+function innerHasCommandVerb(text: string): boolean {
+  const segments = splitOutsideQuotes(text)
+  for (const segment of segments) {
+    const tokens = tokenize(segment).map((t) => t.toLowerCase().replace(/^['"]|['"]$/g, ''))
+    for (let i = 0; i < tokens.length; i += 1) {
+      if (!isCommandPosition(tokens, i)) continue
+      if (isDeleteVerb(tokens[i] ?? '')) return true
+    }
+  }
+  return false
 }
 
 /** 判断一个 token 是否就是删除动词（去引号、按 basename 比、忽略 .exe/.com）。 */
@@ -332,6 +407,65 @@ function isDeleteVerb(token: string): boolean {
   // Windows 上 `rd.exe` / `del.exe` 与 `rd` / `del` 等同。
   const withoutExe = base.replace(/\.(exe|com|cmd|bat)$/, '')
   return (DELETE_VERBS as readonly string[]).includes(base) || (DELETE_VERBS as readonly string[]).includes(withoutExe)
+}
+
+/** 取出 token 的动词基本形式（`C:\…\rd.exe` → `rd`）。 */
+function baseVerbOf(token: string): string {
+  const cleaned = token.toLowerCase().replace(/^['"]|['"]$/g, '')
+  const base = (cleaned.split(/[\\/]/).pop() ?? cleaned).replace(/\.(exe|com|cmd|bat)$/, '')
+  return base
+}
+
+/**
+ * 判断第 `index` 个 token 是否处在「命令位」（会被 shell 当命令执行）。
+ *
+ * 命令位 = 段首，或紧跟在分隔符、包装器之后：
+ *   - 索引 0；
+ *   - 前一个 token 以 `|`、`;`、`&` 结尾（分隔符被并进上一个 token 时）；
+ *   - 前一个 token 是 `cmd /c`、`powershell -Command`、`Invoke-Expression` 之类。
+ *
+ * 为什么要区分：`C:\Windows\System32\rd.exe /s /q X` 是调用删除，而
+ * `cp /tmp/rm /backup/` 只是复制一个恰好叫 rm 的文件。只看 basename
+ * 会把后者判成「删除 /backup/」，给模型一条错误信息。
+ *
+ * @param tokens 整条命令的 token 列表。
+ * @param index 待判断的下标。
+ * @returns 处在命令位时为 `true`。
+ */
+function isCommandPosition(tokens: readonly string[], index: number): boolean {
+  if (index === 0) return true
+
+  const previous = (tokens[index - 1] ?? '').toLowerCase()
+  const previousStripped = previous.replace(/^['"]|['"]$/g, '')
+  if (/[|;&]$/.test(previousStripped)) return true
+
+  // 包装器之后的那一段也是命令位。
+  const WRAPPERS = new Set([
+    'cmd',
+    'sh',
+    'bash',
+    'zsh',
+    'pwsh',
+    'powershell',
+    'eval',
+    'exec',
+    'invoke-expression',
+    'iex',
+    'call',
+    'xargs',
+    'sudo',
+    'doas',
+    'env',
+    'time',
+    'nohup',
+  ])
+  if (WRAPPERS.has(previousStripped)) return true
+
+  // `cmd /c X`、`powershell -Command X`、`bash -c X`：开关之后的第一项。
+  const WRAPPER_FLAGS = new Set(['/c', '-c', '-command', '/command', '-encodedcommand'])
+  if (WRAPPER_FLAGS.has(previousStripped)) return true
+
+  return false
 }
 
 /**
@@ -580,41 +714,64 @@ export function parseCommand(command: string): CommandVerdict {
     }
   }
 
-  // 找出第一个命中的删除动词，并要求其位于词边界上：
-  // `form.txt` 里的 `rm`、`removable` 里的 `rm` 都不算。
   let verbIndex = -1
   let matchedVerb = ''
-  for (const verb of DELETE_VERBS) {
-    for (let i = 0; i < tokens.length; i += 1) {
-      const token = tokens[i]!.toLowerCase().replace(/^['"]|['"]$/g, '')
-      // 允许动词带路径前缀或可执行后缀：`C:\Windows\System32\rd.exe`、
-      // `/bin/rm`、`rd.exe` 在 shell 里与裸 `rd` / `rm` 等价。
-      // 只做 `token === verb` 精确匹配会漏掉这一整类 —— 而完整路径调用
-      // 比字符串拼接常见得多。
-      if (isDeleteVerb(token)) {
-        if (verbIndex === -1 || i < verbIndex) {
-          verbIndex = i
-          matchedVerb = verb
-        }
-        break
-      }
-      // 函数式调用：`fs.rmSync(` / `shutil.rmtree(` / `os.remove(`
-      const callMatch = /^(?:[a-z_.]*\.)?([a-z]+)\s*\(/i.exec(token)
-      if (callMatch !== null) {
-        const callee = callMatch[1]!.toLowerCase()
-        const isDeleteCall =
-          callee === 'rm' ||
-          callee === 'rmsync' ||
-          callee === 'rmtree' ||
-          callee === 'unlink' ||
-          callee === 'unlinksync' ||
-          callee === 'remove' ||
-          callee === 'removesync' ||
-          callee === 'removedir'
-        if (isDeleteCall && (verbIndex === -1 || i < verbIndex)) {
-          verbIndex = i
-          matchedVerb = callee
-        }
+
+  // `-exec rm {} \;`、`| xargs rm`、`{ rm ... }`：删除语出现在**非命令位**，
+  // 但确实会被执行。这些前缀是明确的"下一项会被执行"信号。
+  const EXEC_SIGNALS = new Set(['-exec', '-execdir', '-ok', '-okdir', 'xargs', 'parallel', 'eval', 'exec'])
+  for (let i = 1; i < tokens.length; i += 1) {
+    const previous = (tokens[i - 1] ?? '').toLowerCase().replace(/^['"]|['"]$/g, '')
+    if (!EXEC_SIGNALS.has(previous)) continue
+    const token = (tokens[i] ?? '').toLowerCase().replace(/^['"]|['"]$/g, '')
+    if (isDeleteVerb(token) && (verbIndex === -1 || i < verbIndex)) {
+      verbIndex = i
+      matchedVerb = baseVerbOf(token)
+    }
+  }
+
+  // 花括号块：`{ Remove-Item ... }` 里的是命令。
+  for (let i = 0; i < tokens.length; i += 1) {
+    if ((tokens[i] ?? '') !== '{') continue
+    const token = (tokens[i + 1] ?? '').toLowerCase().replace(/^['"]|['"]$/g, '')
+    if (isDeleteVerb(token) && (verbIndex === -1 || i + 1 < verbIndex)) {
+      verbIndex = i + 1
+      matchedVerb = baseVerbOf(token)
+    }
+  }
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]!.toLowerCase().replace(/^['"]|['"]$/g, '')
+
+    // 任何形式（裸动词、带路径、带 .exe）都**只在命令位**才算删除。
+    //
+    // 为什么不再"精确匹配全位置都算"：`cp /tmp/rm /backup/`、`mv ri ri.bak`、
+    // `git add rm` 里那个词只是参数，不是命令。旧行为会把它判成删除，而且
+    // 拒绝理由会把目标说成别的路径 —— 给模型一条错误信息，比普通拒绝更坏。
+    // 真实会被执行的删除都在命令位上（段首 / 分隔符后 / 包装器后），
+    // `isCommandPosition` 已把这些位置列全。
+    if (isCommandPosition(tokens, i) && isDeleteVerb(token)) {
+      verbIndex = i
+      matchedVerb = baseVerbOf(token)
+      break
+    }
+
+    // 函数式调用：`fs.rmSync(` / `shutil.rmtree(` / `os.remove(`
+    const callMatch = /^(?:[a-z_.]*\.)?([a-z]+)\s*\(/i.exec(token)
+    if (callMatch !== null) {
+      const callee = callMatch[1]!.toLowerCase()
+      const isDeleteCall =
+        callee === 'rm' ||
+        callee === 'rmsync' ||
+        callee === 'rmtree' ||
+        callee === 'unlink' ||
+        callee === 'unlinksync' ||
+        callee === 'remove' ||
+        callee === 'removesync' ||
+        callee === 'removedir'
+      if (isDeleteCall && (verbIndex === -1 || i < verbIndex)) {
+        verbIndex = i
+        matchedVerb = callee
       }
     }
   }
