@@ -17,14 +17,20 @@
 import os from 'node:os'
 import path from 'node:path'
 
-const USAGE = `dsh-safe-delete — inspect and undo deletions made through the safe zone
+const USAGE = `dsh-safe-delete — move deletions into a recoverable safe zone
 
 Usage:
+  dsh-safe-delete delete <path> [--preview]   Move a file or directory into the safe zone
   dsh-safe-delete list                 List what is in the safe zone
   dsh-safe-delete undo <id>            Restore one entry to where it came from
   dsh-safe-delete prune [--dry-run]    Destroy expired / over-capacity entries
   dsh-safe-delete status               Show safe-zone size, retention and capacity
   dsh-safe-delete check                Read-only composition health check
+  dsh-safe-delete journal [n]          Audit trail, newest first
+
+Notes:
+  delete refuses anything that needs interactive approval: a terminal has no
+  approval channel. Use /safe-delete inside DSH for those paths.
 
 Environment:
   DSH_HOME   DSH home directory (default: ~/.dsh)
@@ -150,6 +156,50 @@ async function main(argv) {
       const { checkComposition } = await import('../lib/tools.js')
       process.stdout.write(
         `${checkComposition({ home: os.homedir(), workdir: process.cwd(), dshHome: dshHome() })}\n`,
+      )
+      return 0
+    }
+
+    case 'delete': {
+      // 与插件里的斜杠命令走**同一个核心**（lib/delete-core.js），
+      // 所以禁区判定、阈值确认、移入安全区的行为完全一致。
+      const target = rest.find((arg) => !arg.startsWith('--'))
+      const preview = rest.includes('--preview')
+      if (target === undefined) {
+        process.stderr.write('usage: dsh-safe-delete delete <path> [--preview]\n')
+        return 2
+      }
+      const { deletePath, describeMoved, describePreview } = await import('../lib/delete-core.js')
+      const result = await deletePath(
+        { path: target, preview },
+        {
+          stateDir: stateDir(),
+          env: {
+            home: os.homedir(),
+            workdir: process.cwd(),
+            dshHome: dshHome(),
+            safeZoneDir: stateDir(),
+          },
+          retentionDays: 7,
+          confirmFileCount: 5000,
+          confirmBytes: 2 * 1024 ** 3,
+          // 终端里没有 DSH 的审批卡片：需要确认时一律拒绝，并提示改用插件内的命令。
+          requestApproval: async () => 'rejected',
+          now: () => Date.now(),
+        },
+      )
+      if (!result.ok) {
+        process.stderr.write(`${result.error}\n`)
+        // 需要审批时给出可行的下一步，而不是只说「不行」。
+        if (result.error.includes('needs approval') || result.error.includes('rejected')) {
+          process.stderr.write(
+            '提示：这条路径需要人工确认，终端里没有审批通道。请在 DSH 里用 /safe-delete 完成。\n',
+          )
+        }
+        return 1
+      }
+      process.stdout.write(
+        `${result.kind === 'preview' ? describePreview(result, 7) : describeMoved(result, 7)}\n`,
       )
       return 0
     }

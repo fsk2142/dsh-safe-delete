@@ -6,7 +6,7 @@ const PACKAGE_NAME = 'dsh-safe-delete'
  * 宿主运行时提供的包：必须保持 external。
  *
  * 为什么：这些包的实例身份由宿主决定。inline 一份进去会得到**不同的类身份**，
- * 宿主那边的 `instanceof` / 服务注册就会认不出来 —— 表现是「插件加载了但什么都不生效」。
+ * 宿主那边的 `instanceof` / 服务注册就会认不出来。
  *
  * `schemastery` 尤其关键：`.volatile()` 的引用语义依赖同一个实现。
  */
@@ -36,6 +36,9 @@ const hostConfig: UserConfig = {
     tools: 'src/tools.ts',
     audit: 'src/audit.ts',
     config: 'src/config.ts',
+    'delete-core': 'src/delete-core.ts',
+    commands: 'src/commands.ts',
+    'settings-guide': 'src/settings-guide.ts',
   },
   outDir: 'lib',
   format: 'esm',
@@ -51,6 +54,9 @@ const hostConfig: UserConfig = {
 
 /**
  * 浏览器入口：插件页里的设置表单。
+ *
+ * 与斜杠命令并存：命令负责「改得快」，界面负责「看得清」。
+ * 两条路径写的是同一份配置（都走宿主的 settings 服务），不会分叉。
  *
  * 为什么是 CJS 而不是 ESM：宿主 loader 用 `window.__ModuleLoader__.load({id, factory})`
  * 包装这个产物，`require` 由 loader 注入，最后读 `module.exports` 上的 `{ apply, inject }`。

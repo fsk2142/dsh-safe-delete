@@ -24,11 +24,25 @@ import { appendAudit } from './audit'
 import type { ClassifyEnv } from './classify'
 import { classifyPath, requiresApproval } from './classify'
 import { isUnresolvableTarget, parseCommand } from './command'
+import { runCommand } from './commands'
+import { Config, unwrapConfig } from './config'
+import { deletePath, describeMoved, describePreview, humanBytes } from './delete-core'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
+import { selectForPrune } from './prune'
+import { destroyEntry, listSafeZone, restoreFromSafeZone } from './store'
 import { createTools, type ApprovalOutcome, type ToolDefinition } from './tools'
 
 export const name = 'dsh-safe-delete'
+
+/**
+ * 设置命名空间 = 本插件在 profile 里的**条目 id**。
+ *
+ * 宿主的 settings 服务按条目 id 寻址，不是包名。本插件两者恰好相同
+ * （`cordis.patch.yml` 里 `id: dsh-safe-delete`），但如果将来改了行 id，
+ * 这里必须跟着改 —— 否则命令写入会落在不存在的条目上。
+ */
+const PLUGIN_NAMESPACE = 'dsh-safe-delete'
 
 /**
  * 插件配置 schema（供宿主设置表单使用）。
@@ -419,6 +433,152 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     on.call(ctx, 'tools/pre-execute', onPreExecute)
   }
 
+  // ── 斜杠命令：与设置页并存，两边写同一份配置 ──────────────────────────
+  //
+  // 为什么两条路都要：命令适合「知道参数名、要快」；设置页适合「想看清有哪些
+  // 参数、范围和影响」。两者最终都走宿主的 settings 服务，所以一处改动在另一处
+  // 重启后自然可见 —— 不存在两份配置需要同步的问题。
+  const settingsService = ctx.get('settings') as
+    | {
+        describe?: () => unknown
+        mutate?: (
+          ns: string,
+          ops: readonly { op: 'set'; path: readonly string[]; value: unknown }[],
+          revision?: number,
+        ) => Promise<unknown>
+      }
+    | undefined
+
+  /** 从宿主 settings 快照里取本插件的当前值。 */
+  const readSettings = (): Record<string, unknown> => {
+    try {
+      const described = settingsService?.describe?.()
+      const rows = Array.isArray(described)
+        ? described
+        : (described as { namespaces?: unknown } | undefined)?.namespaces
+      if (!Array.isArray(rows)) return {}
+      for (const row of rows) {
+        if (row === null || typeof row !== 'object') continue
+        const record = row as Record<string, unknown>
+        const name = typeof record['ns'] === 'string' ? record['ns'] : record['id']
+        if (name !== PLUGIN_NAMESPACE) continue
+        const value = record['value']
+        return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+      }
+      return {}
+    } catch {
+      return {}
+    }
+  }
+
+  /** 当前快照的修订号（并发围栏）。 */
+  const readRevision = (): number | undefined => {
+    try {
+      const described = settingsService?.describe?.()
+      const rows = Array.isArray(described)
+        ? described
+        : (described as { namespaces?: unknown } | undefined)?.namespaces
+      if (!Array.isArray(rows)) return undefined
+      for (const row of rows) {
+        if (row === null || typeof row !== 'object') continue
+        const record = row as Record<string, unknown>
+        const name = typeof record['ns'] === 'string' ? record['ns'] : record['id']
+        if (name !== PLUGIN_NAMESPACE) continue
+        return typeof record['revision'] === 'number' ? record['revision'] : undefined
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const commandAdapter: import('./commands').CommandDeps = {
+    delete: async (pathText, options) => {
+      const result = await deletePath({ path: pathText, preview: options.preview }, {
+        stateDir,
+        env,
+        retentionDays,
+        confirmFileCount: numeric('confirmFileCount', 5000),
+        confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
+        requestApproval,
+        now: () => Date.now(),
+      })
+      if (!result.ok) return { ok: false, text: result.error }
+      return {
+        ok: true,
+        text: result.kind === 'preview' ? describePreview(result, retentionDays) : describeMoved(result, retentionDays),
+      }
+    },
+    listSafeZone: async () => listSafeZone(stateDir),
+    restore: async (id) => {
+      try {
+        const { restoredTo } = await restoreFromSafeZone(stateDir, id)
+        appendAudit(stateDir, { event: 'restore', target: restoredTo, tool: 'slash-command', detail: `id=${id}` })
+        return { ok: true, restoredTo }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+    clean: async (dryRun) => {
+      const entries = await listSafeZone(stateDir)
+      const selected = selectForPrune(entries, {
+        now: Date.now(),
+        maxBytes,
+        pruneAtPercent: numeric('pruneAtPercent', 90),
+      })
+      if (dryRun) {
+        return {
+          removed: selected.map((entry) => `${entry.originalPath} (${entry.id})`),
+          freedBytes: selected.reduce((sum, entry) => sum + entry.bytes, 0),
+        }
+      }
+      for (const entry of selected) await destroyEntry(stateDir, entry.id)
+      return {
+        removed: selected.map((entry) => `${entry.originalPath} (${entry.id})`),
+        freedBytes: selected.reduce((sum, entry) => sum + entry.bytes, 0),
+      }
+    },
+    readConfig: async () => {
+      // 合并：schema 默认值 + 宿主里已存的值。
+      const stored = readSettings()
+      const defaults = unwrapConfig(Config({})) as Record<string, unknown>
+      return { ...defaults, ...stored }
+    },
+    writeConfig: async (key, value) => {
+      if (settingsService?.mutate === undefined) {
+        return { ok: false, error: '这个宿主没有暴露设置服务，请改用 cordis.patch.yml' }
+      }
+      try {
+        const result = await settingsService.mutate(
+          PLUGIN_NAMESPACE,
+          [{ op: 'set', path: [key], value }],
+          readRevision(),
+        )
+        // 宿主失败不 reject，而是 resolve 成 { ok:false, error }。
+        if (result !== null && typeof result === 'object' && (result as { ok?: unknown }).ok === false) {
+          const error = (result as { error?: unknown }).error
+          return { ok: false, error: typeof error === 'string' ? error : '宿主拒绝了这次保存' }
+        }
+        return { ok: true }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+    status: async () => {
+      const entries = await listSafeZone(stateDir)
+      const total = entries.reduce((sum, entry) => sum + entry.bytes, 0)
+      return [
+        `安全区目录：${stateDir}`,
+        `条目数：${entries.length}`,
+        `占用：${humanBytes(total)} / 上限 ${humanBytes(maxBytes)}`,
+        `保留期：${retentionDays} 天`,
+        `自动清理：${booleanOf('autoPrune', true) ? '开' : '关'}`,
+      ].join('\n')
+    },
+  }
+
+  registerCommands(ctx as never, commandAdapter)
+
   // 行为约定：把「怎么删」讲清楚，而不只是拒绝。
   // 只拒绝不解释，模型只会换个姿势继续试。
   const systemPrompt = ctx.get('systemPrompt') as
@@ -437,4 +597,27 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         '- Deleted items stay in the safe zone for a while and can be brought back with `safe_zone_restore id=<id>`; `safe_zone_list` shows what is there.',
     })
   }
+}
+
+/**
+ * 注册 `/safe-delete` 斜杠命令。
+ *
+ * 与设置页的**配置是同一份**：两者都通过宿主的 settings 服务读写，所以命令行改完、
+ * 重启后设置页会显示新值，反之亦然。不存在「两处配置需要对账」。
+ *
+ * 命令不同于工具：它不经过模型，不消耗 token，用户直接触发。
+ */
+function registerCommands(
+  ctx: PluginContext & { commands?: { register?: (spec: unknown) => unknown } },
+  adapter: import('./commands').CommandDeps,
+): void {
+  const register = ctx.commands?.register
+  if (typeof register !== 'function') return
+
+  register.call(ctx.commands, {
+    name: 'safe-delete',
+    description: '安全删除：把文件移入安全区（可恢复），或管理安全区与配置（无参数看用法）',
+    input: { hint: '<路径> | clean | config | list | restore <id> | status' },
+    handler: async ({ rawInput }: { rawInput: string }) => runCommand(rawInput, adapter),
+  })
 }
