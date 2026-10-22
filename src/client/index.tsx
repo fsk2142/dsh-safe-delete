@@ -381,6 +381,22 @@ export function SafeZoneSettings(): ReactElement {
     })
   }, [])
 
+  /**
+   * 设置某个字段的单位（`MB`/`GB` 或 `hour`/`day`）。
+   *
+   * **不能复用 `setField`**：它会把 key 拼成 `<key>.draft`，于是写进去的是
+   * `key.unit.draft`，而读取时查的是 `values[key.unit]` —— 单位选择永远读不到
+   * 刚选的值，表现为「选了天、保存后还是小时」。
+   *
+   * @param key 字段名（不含单位后缀）。
+   * @param unit 单位字面量。
+   */
+  const setFieldUnit = useCallback((key: string, unit: string): void => {
+    setValues((prev) => ({ ...prev, [`${key}.unit`]: unit }))
+    // 单位变了意味着「有未保存的改动」，与改数值同等对待。
+    setSaved(false)
+  }, [])
+
   /** 校验并转成实际值；返回 undefined 表示不合法。 */
   const coerce = useCallback((spec: FieldSpec, raw: unknown): number | undefined => {
     const text = typeof raw === 'string' ? raw.trim() : String(raw ?? '')
@@ -415,15 +431,42 @@ export function SafeZoneSettings(): ReactElement {
     return amount
   }, [values])
 
+  /**
+   * 取某个字段**当前显示在输入框里的数值**（不含单位）。
+   *
+   * 用途：用户只切换了单位、没改数字时，保存要用「显示单位的数字」重新换算。
+   * 直接拿 `values[key]`（字节/毫秒）会绕错方向。
+   *
+   * @param spec 字段。
+   * @param source 当前 values。
+   * @returns 输入框里应显示的数字字符串。
+   */
+  function displayValueOf(spec: FieldSpec, source: Record<string, unknown>): string {
+    const current = numericOf(source, spec.key, spec.fallback)
+    if (spec.kind === 'bytes') return toBytesInput(current).amount
+    if (spec.kind === 'duration') {
+      const chosen = source[`${spec.key}.unit`]
+      const unit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
+      return toDurationInput(current, unit)
+    }
+    return String(current)
+  }
+
   const save = useCallback(async (): Promise<void> => {
     if (remote?.mutate === undefined) return
     const nextErrors: Record<string, string> = {}
     const payload: Record<string, unknown> = {}
     for (const spec of FIELDS) {
       const draft = values[`${spec.key}.draft`]
-      if (typeof draft === 'string') {
-        // 用户改过：草稿是**显示单位**下的数字，需要换算成字节/毫秒。
-        const value = coerce(spec, draft)
+      const unitChanged = typeof values[`${spec.key}.unit`] === 'string'
+      if (typeof draft === 'string' || (unitChanged && (spec.kind === 'bytes' || spec.kind === 'duration'))) {
+        // 用户改过**数值或单位**：把当前显示值（单位下的数字）换算成字节/毫秒。
+        //
+        // 为什么单位变了也要走这条路：只切单位不改数值时，最终要保存的数**变了**
+        // （1 小时 → 1 天）。走下面的"没改过"分支会把旧值原样写回，用户的单位
+        // 选择被静默丢弃。
+        const displayValue = typeof draft === 'string' ? draft : displayValueOf(spec, values)
+        const value = coerce(spec, displayValue)
         if (value === undefined) {
           nextErrors[spec.key] = '填一个不小于下限的数字'
           continue
@@ -500,9 +543,17 @@ export function SafeZoneSettings(): ReactElement {
    * 判据是「有没有草稿」而不是「草稿和已存值是否相等」：草稿只在用户真的动过
    * 某个输入框时才存在（`setField` 才写它），敲进去又改回原值仍是"动过"——
    * 这时显示保存按钮无害，而漏显示会导致用户的修改没有入口提交。
+   *
+   * **也要看单位**：只把「小时」切成「天」、数值没动，同样是一次真实修改
+   * （它改变了最终要保存的毫秒数）。只看数值草稿会漏掉这一类，表现是
+   * 「改了单位但保存按钮不出现」。
    */
   const dirty = useMemo(
-    () => FIELDS.some((spec) => typeof values[`${spec.key}.draft`] === 'string'),
+    () =>
+      FIELDS.some(
+        (spec) =>
+          typeof values[`${spec.key}.draft`] === 'string' || typeof values[`${spec.key}.unit`] === 'string',
+      ),
     [values],
   )
 
@@ -714,7 +765,7 @@ export function SafeZoneSettings(): ReactElement {
                   <select
                     aria-label={`${spec.label}单位`}
                     value={values[`${spec.key}.unit`] === 'MB' ? 'MB' : 'GB'}
-                    onChange={(event) => setField(`${spec.key}.unit`, event.target.value)}
+                    onChange={(event) => setFieldUnit(spec.key, event.target.value)}
                     style={{ ...fieldStyle(false), width: '76px' }}
                   >
                     <option value="GB">GB</option>
@@ -731,7 +782,7 @@ export function SafeZoneSettings(): ReactElement {
                           ? 'hour'
                           : naturalDurationUnit(current)
                     }
-                    onChange={(event) => setField(`${spec.key}.unit`, event.target.value)}
+                    onChange={(event) => setFieldUnit(spec.key, event.target.value)}
                     style={{ ...fieldStyle(false), width: '86px' }}
                   >
                     <option value="hour">小时</option>
