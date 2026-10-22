@@ -1,0 +1,12 @@
+v0.2.12 - declare remote.settings so the form can read configuration
+
+The diagnostics panel rendered and reported "remote.settings unavailable".
+The service was never declared in inject; cordis guards service access and
+throws at property-evaluation time, so the component could not read it.
+
+The official settings plugin declares remote.settings and configForms
+among its inject list, which proves both are real declarable services.
+Removing remote.settings in 0.2.7 was wrong.
+
+inject is now ['slots','locale','configForms','remote.settings'].
+310 tests.
