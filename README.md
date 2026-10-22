@@ -80,16 +80,29 @@ dsh-safe-delete check
 | `retentionDays` | `7` | 保留天数 |
 | `maxBytes` | `21474836480`（20 GB） | 容量上限，超出最旧先清 |
 | `autoPrune` | `true` | 关掉后只剩手动清理 |
+| `autoPruneIntervalMs` | `3600000`（1 小时） | 清理的检查间隔：工具调用时顺路看一眼，超过才真跑 |
+| `confirmFileCount` | `5000` | 单次删除超过这么多条目就额外确认一次；`0` 关闭 |
+| `confirmBytes` | `2147483648`（2 GB） | 单次删除超过这么大就额外确认一次；`0` 关闭 |
 | `blockShellDeletes` | `true` | 拦车闸开关 |
+| `blockProtectedWrites` | `true` | 拦截对启动关键路径的写入 |
 | `crossVolumeCopy` | `false` | 安全区与目标不同卷时是否允许复制式移入 |
+
+### 什么时候会弹二次确认
+
+两个**相互独立**的理由，任一命中就问一次（不会叠加问两次）：
+
+1. **路径危险**：家目录、`$DSH_HOME` 下的非清单内容、profile 清单/补丁/lockfile、`node_modules`、安装目录、安全区自身。
+2. **这一单太大量**：条目数超过 `confirmFileCount`，或总字节超过 `confirmBytes`。普通工作区文件也会因此确认一次。
+
+卡片上会写明是哪一条触发的，例如「5 entries exceeds the limit of 2」。`force: true` 永远不是授权。
 
 ## 不做
 
 - **不存快照、不做回滚**：桌面版自带 `sanitizeProfile`（配置坏到起不来时的原生
   恢复），插件安装器也会自己回滚 `package.json` 与 lockfile。重复实现只会多一份
   要维护的代码。
-- **不拦非删除操作**：写文件、读文件、跑构建都不管。
-- **不写浏览器端 UI**：审批卡片由 DSH 自带。
+- **不拦读操作**：`str_replace_editor view` 照常放行。
+- **不写浏览器端 UI**：审批卡片由 DSH 自带，配置走 Cordis 配置文件。
 
 ## 开发
 

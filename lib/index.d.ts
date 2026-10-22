@@ -26,10 +26,30 @@ export interface SafeDeleteConfig {
   stateDir?: string;
   /** 保留天数；默认 7。 */
   retentionDays?: number;
-  /** 容量上限（字节）；默认 20 GB。 */
+  /** 容量上限（字节）；默认 20 GB（`21474836480`）。 */
   maxBytes?: number;
-  /** 是否自动清理；默认 true。 */
+  /**
+   * 自动清理的检查间隔（毫秒）；默认 1 小时（`3600000`）。
+   *
+   * 每次工具调用都会看一眼距上次清理多久，超过这个间隔才真正跑一次。
+   * 设为 `0` 表示沿用默认值。
+   */
+  autoPruneIntervalMs?: number;
+  /** 是否自动清理；默认 true。关掉后只剩手动清理。 */
   autoPrune?: boolean;
+  /**
+   * 单次删除的条目数阈值；超过就额外要一次人工确认。默认 `5000`。
+   *
+   * 与路径分级相互独立：普通工作区路径也会因为"这一单太大"而确认一次。
+   * 设为 `0` 关闭该阈值。
+   */
+  confirmFileCount?: number;
+  /**
+   * 单次删除的字节数阈值；超过就额外要一次人工确认。默认 2 GB（`2147483648`）。
+   *
+   * 设为 `0` 关闭该阈值。
+   */
+  confirmBytes?: number;
   /** 跨卷时是否允许复制式移入；默认 false。 */
   crossVolumeCopy?: boolean;
   /** 拦截开关；默认 true。 */

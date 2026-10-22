@@ -59,6 +59,22 @@ export interface ToolDeps {
   maxBytes: number
   /** 是否自动按时间/容量清理。 */
   autoPrune?: boolean
+  /**
+   * 单次删除的条目数阈值：超过就额外要一次人工确认。
+   *
+   * `0` 表示不启用。与路径分级相互独立 —— 两者任一命中都要确认。
+   */
+  confirmFileCount?: number
+  /** 单次删除的字节数阈值：超过就额外要一次人工确认。`0` 表示不启用。 */
+  confirmBytes?: number
+  /**
+   * 自动清理的检查间隔（毫秒）。默认 1 小时。
+   *
+   * 为什么需要它：原先清理只在"执行一次安全删除"时顺带发生 —— 长期不删东西，
+   * 安全区就永远不会被清理，过期条目会一直占着盘。现在每次工具调用都会看一眼
+   * 距上次清理有多久，超过间隔才真正跑一次。
+   */
+  autoPruneIntervalMs?: number
   /** 当前时间（测试可注入）。 */
   now?: () => number
 }
@@ -95,6 +111,8 @@ function makeTool(spec: {
   description: string
   parameters: Record<string, { type: string; description?: string; enum?: string[]; required?: boolean }>
   execute: (args: Record<string, unknown>) => Promise<ToolResult>
+  /** 每次执行前的钩子（用于按间隔触发清理）。钩子失败不影响工具本身。 */
+  beforeExecute?: () => Promise<void>
 }): ToolDefinition {
   return {
     name: spec.name,
@@ -105,6 +123,13 @@ function makeTool(spec: {
       render: (_args, value) => [{ type: 'text', text: value.text !== '' ? value.text : (value.error ?? '(empty)') }],
     },
     async execute(args: Record<string, unknown>): Promise<ToolResult> {
+      if (spec.beforeExecute !== undefined) {
+        try {
+          await spec.beforeExecute()
+        } catch {
+          /* 钩子失败不阻断工具调用 */
+        }
+      }
       try {
         return await spec.execute(args)
       } catch (error) {
@@ -116,8 +141,7 @@ function makeTool(spec: {
 }
 
 /** 人类可读的体积。 */
-function humanBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
+function humanBytes(bytes: number): string {  if (bytes < 1024) return `${bytes} B`
   const units = ['KB', 'MB', 'GB', 'TB']
   let value = bytes / 1024
   let unitIndex = 0
@@ -126,6 +150,27 @@ function humanBytes(bytes: number): string {
     unitIndex += 1
   }
   return `${value.toFixed(1)} ${units[unitIndex]}`
+}
+
+/** 人类可读的时长。 */
+function describeInterval(ms: number): string {
+  if (ms <= 0) return 'every call'
+  const minutes = ms / 60000
+  if (minutes < 60) return `${Math.round(minutes)} min`
+  const hours = minutes / 60
+  if (hours < 24) return `${hours % 1 === 0 ? hours : hours.toFixed(1)} h`
+  return `${(hours / 24).toFixed(1)} days`
+}
+
+/** 描述单次删除的确认阈值。 */
+function describeThresholds(deps: ToolDeps): string {
+  const count = deps.confirmFileCount ?? 0
+  const bytes = deps.confirmBytes ?? 0
+  if (count <= 0 && bytes <= 0) return 'disabled'
+  const parts: string[] = []
+  if (count > 0) parts.push(`${count} entries`)
+  if (bytes > 0) parts.push(humanBytes(bytes))
+  return parts.join(' or ')
 }
 
 /** 驱动盘根判定（`C:\`、`C:/`、`/`）。 */
@@ -156,6 +201,10 @@ function approvalFailureText(outcome: ApprovalOutcome, target: string): string {
 /** 创建全部工具。 */
 export function createTools(deps: ToolDeps): ToolDefinition[] {
   const now = deps.now ?? (() => Date.now())
+  const pruneIntervalMs = deps.autoPruneIntervalMs !== undefined && deps.autoPruneIntervalMs > 0 ? deps.autoPruneIntervalMs : 60 * 60 * 1000
+
+  /** 上次真正跑清理的时间；`null` 表示本进程还没跑过。 */
+  let lastPruneAt: number | null = null
 
   /** 按策略清理安全区；返回被销毁的条目。 */
   const pruneNow = async (): Promise<TrashEntry[]> => {
@@ -173,6 +222,25 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     return selected
   }
 
+  /**
+   * 按间隔调用 `pruneNow`。
+   *
+   * 为什么不是定时器：一个挂在事件循环上的 `setInterval` 会让插件在 DSH 空闲时
+   * 也保有生命周期，而清理并不需要那种准时性。改为"每次工具调用顺路看一眼"，
+   * 代价是插件彻底不用管定时器的清理与异常。
+   */
+  const pruneIfDue = async (): Promise<void> => {
+    if (deps.autoPrune === false) return
+    const at = now()
+    if (lastPruneAt !== null && at - lastPruneAt < pruneIntervalMs) return
+    lastPruneAt = at
+    try {
+      await pruneNow()
+    } catch {
+      /* 清理失败不该让工具调用失败 */
+    }
+  }
+
   const safeDelete = makeTool({
     name: 'safe_delete',
     description:
@@ -188,6 +256,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         description: 'Ignored. Kept for compatibility: a model-set flag is never a user approval.',
       },
     },
+    beforeExecute: pruneIfDue,
     async execute(args) {
       const raw = String(args.path ?? '')
       if (raw === '') return { ok: false, text: '', error: 'path is required' }
@@ -234,11 +303,28 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       }
 
       // 5. 分类与授权。
+      //
+      // 两个**相互独立**的理由都可能导致要人确认：
+      //   a) 路径是危险路径（家目录、profile 清单、node_modules…）；
+      //   b) 这一单"太大量"：条目数或字节数超过阈值。
+      // 两者任一命中就问一次 —— 不叠加问两次，那只是骚扰。
       const classification = classifyPath(target, deps.env)
-      if (requiresApproval(classification)) {
+      const countLimit = deps.confirmFileCount ?? 0
+      const bytesLimit = deps.confirmBytes ?? 0
+      const exceedsCount = countLimit > 0 && description.fileCount > countLimit
+      const exceedsBytes = bytesLimit > 0 && description.bytes > bytesLimit
+
+      if (requiresApproval(classification) || exceedsCount || exceedsBytes) {
+        // 说清是哪一条触发的 —— 用户需要知道自己在为什么签字。
+        const reasons: string[] = []
+        if (requiresApproval(classification)) reasons.push(`it is a ${classification} path`)
+        if (exceedsCount) reasons.push(`${description.fileCount} entries exceeds the limit of ${countLimit}`)
+        if (exceedsBytes) reasons.push(`${humanBytes(description.bytes)} exceeds the limit of ${humanBytes(bytesLimit)}`)
+
         // `force` 在这里被刻意无视：它只作为兼容参数存在，不参与任何判定。
         const outcome = await deps.requestApproval(
           `Delete "${target}"? ${description.isDirectory ? `Directory, ${description.fileCount} entries, ` : 'File, '}${humanBytes(description.bytes)}. ` +
+            `Why this needs your OK: ${reasons.join('; ')}. ` +
             `It will be moved into the safe zone and can be restored for ${deps.retentionDays} days.`,
         )
         if (outcome !== 'allowed-once') {
@@ -282,6 +368,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     parameters: {
       limit: { type: 'integer', description: 'Max entries to show (default 50).' },
     },
+    beforeExecute: pruneIfDue,
     async execute(args) {
       const entries = await listSafeZone(deps.stateDir)
       if (entries.length === 0) return { ok: true, text: 'safe zone is empty' }
@@ -309,6 +396,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     parameters: {
       id: { type: 'string', required: true, description: 'Safe-zone id (from safe_delete or safe_zone_list).' },
     },
+    beforeExecute: pruneIfDue,
     async execute(args) {
       const id = String(args.id ?? '')
       if (id === '') return { ok: false, text: '', error: 'id is required' }
@@ -322,6 +410,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     name: 'safe_zone_status',
     description: 'Show the safe zone state: entry count, total size, retention window, capacity cap, and when the next entries expire.',
     parameters: {},
+    beforeExecute: pruneIfDue,
     async execute() {
       const entries = await listSafeZone(deps.stateDir)
       const total = safeZoneBytes(entries)
@@ -334,7 +423,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           `total size: ${humanBytes(total)}`,
           `capacity cap: ${humanBytes(deps.maxBytes)}`,
           `retention: ${deps.retentionDays} days`,
-          `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : 'on'}`,
+          `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : `on, checked every ${describeInterval(pruneIntervalMs)}`}`,
+          `confirm when a single delete exceeds: ${describeThresholds(deps)}`,
           next !== undefined ? `oldest entry expires: ${new Date(next.expiresAt).toISOString()}` : 'safe zone is empty',
         ].join('\n'),
       }
@@ -346,6 +436,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     description:
       'Read-only health check of the composition under $DSH_HOME: can each profile package.json be parsed, is each cordis.patch.yml readable, and are any row ids duplicated across layers (duplicates make the next boot fail). Writes nothing.',
     parameters: {},
+    beforeExecute: pruneIfDue,
     async execute() {
       return { ok: true, text: checkComposition(deps.env) }
     },
@@ -359,6 +450,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     parameters: {
       n: { type: 'integer', description: 'Number of records to show (default 20, max 200).' },
     },
+    beforeExecute: pruneIfDue,
     async execute(args) {
       const limit = Math.min(200, Math.max(1, Number(args.n) || 20))
       const records = readAudit(deps.stateDir, limit)
