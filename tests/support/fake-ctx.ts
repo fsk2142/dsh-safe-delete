@@ -56,6 +56,8 @@ export interface FakeCtx {
   systemPromptSections: Array<{ name: string; order?: number; text: string }>
   /** 已注册的斜杠命令（断言命令真的挂上了）。 */
   registeredCommands: Array<{ name: string; description: string }>
+  /** 已注册的 UI 槽位（断言插件页「配置」入口挂对了 key）。 */
+  registeredSlots: Array<Record<string, unknown>>
   /** 触发一次 `tools/pre-execute` 瀑布，返回最终决策。 */
   preExecute(exec: { name: string; arguments: Record<string, unknown> }): Promise<FakeDecision>
 }
@@ -64,6 +66,7 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
   const warnings: string[] = []
   const registeredTools: FakeRegisteredTool[] = []
   const registeredCommands: Array<{ name: string; description: string }> = []
+  const registeredSlots: Array<Record<string, unknown>> = []
   const systemPromptSections: Array<{ name: string; order?: number; text: string }> = []
   const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
 
@@ -79,6 +82,7 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
     warnings,
     registeredTools,
     registeredCommands,
+    registeredSlots,
     systemPromptSections,
     logger: {
       warn: (message: string) => {
@@ -99,6 +103,7 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
       // 与真实 cordis 一致：已挂载的服务既能用 `ctx.x` 访问，也能用 `ctx.get('x')` 取。
       if (id === 'tools') return (ctx as unknown as { tools?: unknown }).tools
       if (id === 'commands') return commandRegistry
+      if (id === 'slots') return (ctx as unknown as { slots?: unknown }).slots
       if (id === 'systemPrompt') return (ctx as unknown as { systemPrompt?: unknown }).systemPrompt
       if (id === 'logger') return ctx.logger
       return undefined
@@ -156,6 +161,19 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
   }
   withServices.tools = tools
   withServices.systemPrompt = systemPrompt
+
+  // 服务 `slots`：插件页的配置入口通过它注册。宿主按 key 找行，
+  // key 写错不会报错，只是永远不显示那个入口 —— 所以要把注册结果留下来断言。
+  ;(withServices as unknown as { slots?: unknown }).slots = {
+    inject(_name: string, factory: () => unknown) {
+      return factory()
+    },
+    register(spec: Record<string, unknown>, component: unknown) {
+      registeredSlots.push(spec)
+      void component
+      return () => {}
+    },
+  }
 
   // 服务 `commands`：默认缺席时的行为也要能测，所以由 options 控制。
   if (options.withCommands !== false) {

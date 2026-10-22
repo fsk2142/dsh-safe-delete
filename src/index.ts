@@ -386,7 +386,21 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
 
     // 目标解析不出来（变量、管道、通配）不是"误拦"，而是"看不清"——
     // 交给人类在卡片上看原文决定，而不是替他猜一个路径然后拒绝。
+    //
+    // **但 `never` 策略下不能返回 ask**：宿主会在派发前把它驳回成拒绝，
+    // 卡片根本不出现。结果是用户看到一次"工具被拒绝"却无从确认，
+    // 任务卡住且看不出原因 —— 这比放行更糟。没有审批通道时降级放行，
+    // 由别的防线（沙箱、审批策略本身）兜住。
     if (verdict.target === null || isUnresolvableTarget(verdict.target)) {
+      const policy = approvalPolicy()
+      if (policy === 'never') {
+        appendAudit(stateDir, {
+          event: 'ask',
+          tool: toolName,
+          detail: `unresolvable target, allowed under the never policy: ${text.trim().slice(0, 200)}`,
+        })
+        return next()
+      }
       appendAudit(stateDir, {
         event: 'ask',
         tool: toolName,
