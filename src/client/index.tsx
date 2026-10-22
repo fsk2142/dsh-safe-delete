@@ -531,13 +531,24 @@ export function apply(ctx: ClientContext): void {
       ctx.slots?.register?.(
         {
           name: 'plugins.row.config',
-          key: `${NAMESPACE}#safe-zone`,
+          // 契约：key 是 `<包名>#<行 id>`。
+          //
+          // 本插件的行 id 在 cordis.patch.yml 里声明为 `dsh-safe-delete`，
+          // 与包名相同 —— 所以两段一样。**不能用别的字符串**：宿主按 key 找
+          // 对应的行，对不上就静默不显示「配置」入口（也不报错）。
+          key: `${NAMESPACE}#${NAMESPACE}`,
           locale: NAMESPACE,
         },
         // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
-        // 传一个 `{ view, panel }` 的对象是错的 —— 宿主会把它当成组件去调用，
-        // 结果是一个不可渲染的值，表单根本不出现（而且不报错）。
-        ({ view }: { view?: string }) => (view === 'summary' ? '安全区设置' : <SafeZoneSettings />),
+        //
+        // 三种视图：
+        //   - `summary`：折叠摘要（放在标题下）
+        //   - `page`：宿主给表单的整页视图 —— 表单自带保存按钮时用它
+        //   - 其余：沿用表单本体
+        ({ view }: { view?: string }) => {
+          if (view === 'summary') return '安全区设置'
+          return <SafeZoneSettings />
+        },
       )
     })
   })
