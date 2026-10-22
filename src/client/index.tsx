@@ -744,6 +744,12 @@ export function apply(ctx: ClientContext): void {
     //      bundle，key 是**包名**（不是 `<包名>#<行 id>`，那是单行配置用的）。
     ctx.inject?.(['configForms'], (scoped) => {
       const service = scoped as {
+        // 子 ctx 同时带 slots 与 effect：父 fiber 已声明 slots，子 fiber 沿链能取到。
+        slots?: {
+          inject?: (name: string, factory: () => unknown) => unknown
+          register?: (spec: Record<string, unknown>, component: unknown) => unknown
+        }
+        effect?: (fn: () => unknown, label?: string) => unknown
         configForms?: {
           get?: (ns: string) => unknown
           whileServed?: (namespaces: string[], register: () => void) => unknown
@@ -763,11 +769,19 @@ export function apply(ctx: ClientContext): void {
       } catch (error) {
         console.error(`[dsh-safe-delete] configForms.get("${NAMESPACE}") threw:`, error)
       }
+
+      // 用**子 ctx** 的 slots/effect，而不是外层 ctx。
+      //
+      // 与官方 dsh-context 一致：`t.slots.inject(...)` 里的 `t` 是子插件 ctx。
+      // 为什么重要：`ctx.effect` 开头有 `assertActive()`，而 `whileServed` 的回调
+      // 可能在 `apply` 返回之后才触发 —— 那时外层 fiber 的活跃状态没有保证，
+      // 子 fiber 的才有（它正是为这段工作而创建的）。
+      const slots = service.slots ?? ctx.slots
       const attach = (): unknown => {
         // 回调必须**返回** register 的清理句柄：cordis 用它在这个 effect
         // 失效时注销插槽。返回 undefined 会让注册无法被追踪（官方插件就是
         // 把 register(...) 的返回值直接返回）。
-        const slot = ctx.slots?.register?.(
+        const slot = slots?.register?.(
           {
             name: 'plugins.bundle.config',
             key: NAMESPACE,
@@ -783,11 +797,14 @@ export function apply(ctx: ClientContext): void {
         return slot
       }
 
-      const runWhileServed = (): unknown => forms.whileServed?.([NAMESPACE], () => ctx.slots?.inject?.('plugins.bundle.config', attach))
+      const runWhileServed = (): unknown =>
+        forms.whileServed?.([NAMESPACE], () => slots?.inject?.('plugins.bundle.config', attach))
 
-      // 与官方插件一致：注册动作放在 effect 里，让 cordis 负责生命周期。
-      if (typeof ctx.effect === 'function') {
-        ctx.effect(runWhileServed, 'dsh-safe-delete: plugins-page card')
+      // 与官方插件一致：注册动作放在**子 ctx 的** effect 里。子 fiber 的生命周期
+      // 正好覆盖这段注册，且 `whileServed` 的回调晚于 apply 触发时它仍然活跃。
+      const effect = service.effect ?? ctx.effect
+      if (typeof effect === 'function') {
+        effect(runWhileServed, 'dsh-safe-delete: plugins-page card')
       } else {
         runWhileServed()
       }

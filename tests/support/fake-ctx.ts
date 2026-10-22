@@ -196,12 +196,24 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
   if (options.withInject !== false) {
     withServices.inject = (services, callback) => {
       // 真实 cordis 会等服务就绪后回调；这里同步回调，语义等价。
-      const scoped: Record<string, unknown> = {}
+      //
+      // 关键：回调参数是**子插件 ctx**，它**继承**父 ctx 已声明的服务
+      // （slots、effect 在父 inject 里，子 fiber 沿链取得到）。假 ctx 必须
+      // 复现这一点，否则测试会走 fallback 分支，测不到真实路径。
+      const scoped: Record<string, unknown> = {
+        slots: (withServices as unknown as { slots?: unknown }).slots,
+        effect: withServices.effect,
+      }
       if (services.includes('commands') && withServices.commands !== undefined) {
         scoped['commands'] = withServices.commands
       }
       if (services.includes('configForms') && (withServices as unknown as { configForms?: unknown }).configForms !== undefined) {
         scoped['configForms'] = (withServices as unknown as { configForms?: unknown }).configForms
+      }
+      if (services.includes('remote') || services.includes('remote.settings')) {
+        // 假 ctx 默认不提供 remote；由测试通过 options 决定是否注入。
+        const remote = (options as { remote?: unknown }).remote
+        if (remote !== undefined) scoped['remote'] = remote
       }
       callback(scoped)
       return () => {}
