@@ -17,6 +17,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, r
 import path from 'node:path'
 
 import { describeTarget } from './describe'
+import { moveToSystemRecycleBin, type Recycler } from './recycle'
 import type { TrashEntry } from './types'
 
 /** 移入选项。 */
@@ -293,11 +294,35 @@ function resolveStoredContent(stateDir: string, id: string): string | null {
 }
 
 /**
- * 销毁一条：真正从硬盘抹掉。
+ * 销毁一条：**优先移入系统回收站**，只有明确要求时才永久抹掉。
  *
- * **这是本文件唯一允许递归删除的地方**，且 `entryDir` 保证路径落在安全区内部。
+ * ## 为什么不是直接 rmSync
+ *
+ * 安全区和系统回收站是两道防线：
+ *
+ *   删除 → 安全区（保留期内 `safe_zone_restore` 可取回）
+ *        → 到期 → 系统回收站（用户清空之前都能还原）
+ *        → 用户手动清空回收站 → 才真正消失
+ *
+ * 如果这里直接 `rmSync`，就把「自动过期」升级成了最终删除 —— 而安全区的定时
+ * 清理是**无人值守**的，不该替用户做这个决定。
+ *
+ * ## 失败时不删除
+ *
+ * 移入回收站失败（权限、系统组件缺失、路径被占用）时，条目**留在安全区**并把
+ * 原因返回给调用方，由 `safe_zone_status` 报告。宁可占磁盘，也不能静默永久删除。
+ *
+ * @param stateDir 安全区根目录。
+ * @param id 条目 id。
+ * @param options `permanent: true` 时才真正 rmSync（用于「清空安全区」这类明示操作）；
+ *   `recycler` 可替换回收站实现（测试用替身，生产路径不传）。
+ * @returns 结果；失败时附带原因，条目未被删除。
  */
-export async function destroyEntry(stateDir: string, id: string): Promise<void> {
+export async function destroyEntry(
+  stateDir: string,
+  id: string,
+  options: { permanent?: boolean; recycler?: Recycler } = {},
+): Promise<{ ok: true; via: 'recycle' | 'permanent' } | { ok: false; reason: string }> {
   return serialized(async () => {
     const entries = await readIndex(stateDir)
     const entry = entries.find((e) => e.id === id)
@@ -310,11 +335,27 @@ export async function destroyEntry(stateDir: string, id: string): Promise<void> 
     if (!isUnder(dir, path.join(stateDir, ITEMS_DIR))) {
       throw new Error(`refusing to destroy a path outside the safe zone: ${dir}`)
     }
-    if (existsSync(dir)) {
+    if (!existsSync(dir)) {
+      // 磁盘上已经没有了：只清理索引，不算失败。
+      await writeIndex(stateDir, entries.filter((e) => e.id !== id))
+      return { ok: true, via: 'permanent' }
+    }
+
+    let via: 'recycle' | 'permanent' = 'permanent'
+    if (options.permanent !== true) {
+      const recycler = options.recycler ?? moveToSystemRecycleBin
+      const outcome = recycler(dir)
+      if (!outcome.ok) {
+        // 关键：不删除，把原因带回去。
+        return { ok: false, reason: outcome.reason }
+      }
+      via = 'recycle'
+    } else {
       rmSync(dir, { recursive: true, force: true })
     }
 
     await writeIndex(stateDir, entries.filter((e) => e.id !== id))
+    return { ok: true, via }
   })
 }
 

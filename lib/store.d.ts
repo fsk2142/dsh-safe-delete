@@ -1,4 +1,5 @@
 import { r as TrashEntry } from "./types-CLsWRquy.js";
+import { Recycler } from "./recycle.js";
 //#region src/store.d.ts
 /** 移入选项。 */
 export interface MoveOptions {
@@ -31,11 +32,40 @@ export declare function restoreFromSafeZone(stateDir: string, id: string): Promi
   restoredTo: string;
 }>;
 /**
- * 销毁一条：真正从硬盘抹掉。
+ * 销毁一条：**优先移入系统回收站**，只有明确要求时才永久抹掉。
  *
- * **这是本文件唯一允许递归删除的地方**，且 `entryDir` 保证路径落在安全区内部。
+ * ## 为什么不是直接 rmSync
+ *
+ * 安全区和系统回收站是两道防线：
+ *
+ *   删除 → 安全区（保留期内 `safe_zone_restore` 可取回）
+ *        → 到期 → 系统回收站（用户清空之前都能还原）
+ *        → 用户手动清空回收站 → 才真正消失
+ *
+ * 如果这里直接 `rmSync`，就把「自动过期」升级成了最终删除 —— 而安全区的定时
+ * 清理是**无人值守**的，不该替用户做这个决定。
+ *
+ * ## 失败时不删除
+ *
+ * 移入回收站失败（权限、系统组件缺失、路径被占用）时，条目**留在安全区**并把
+ * 原因返回给调用方，由 `safe_zone_status` 报告。宁可占磁盘，也不能静默永久删除。
+ *
+ * @param stateDir 安全区根目录。
+ * @param id 条目 id。
+ * @param options `permanent: true` 时才真正 rmSync（用于「清空安全区」这类明示操作）；
+ *   `recycler` 可替换回收站实现（测试用替身，生产路径不传）。
+ * @returns 结果；失败时附带原因，条目未被删除。
  */
-export declare function destroyEntry(stateDir: string, id: string): Promise<void>;
+export declare function destroyEntry(stateDir: string, id: string, options?: {
+  permanent?: boolean;
+  recycler?: Recycler;
+}): Promise<{
+  ok: true;
+  via: 'recycle' | 'permanent';
+} | {
+  ok: false;
+  reason: string;
+}>;
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 export declare function isEmptySafeZone(stateDir: string): Promise<boolean>;
 //#endregion

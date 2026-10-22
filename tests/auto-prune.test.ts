@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { createTools, type ToolDeps } from '../src/tools'
@@ -18,7 +18,22 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     requestApproval: async () => 'allowed-once',
     retentionDays: 7,
     maxBytes: 20 * 1024 ** 3,
+    // 替身：测试绝不能真的调系统回收站（慢，而且会往回收站里扔东西）。
+    // 生产路径不传 recycler，默认走真实实现。
+    recycler: fakeRecycler(),
     ...over,
+  }
+}
+
+/**
+ * 一个「总是成功」的回收站替身：只把路径从原位置移走，模拟真实行为。
+ *
+ * @returns 回收站替身。
+ */
+function fakeRecycler(): (absPath: string) => { ok: true } {
+  return (absPath: string) => {
+    rmSync(absPath, { recursive: true, force: true })
+    return { ok: true }
   }
 }
 

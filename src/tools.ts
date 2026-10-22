@@ -20,6 +20,8 @@ import {
   humanBytes,
 } from './delete-core'
 import { selectForPrune, safeZoneBytes } from './prune'
+import type { Recycler } from './recycle'
+import { canRecycle } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
 import type { TrashEntry } from './types'
 
@@ -78,6 +80,13 @@ export interface ToolDeps {
    * 用户打开它毫无效果。
    */
   crossVolumeCopy?: boolean
+  /**
+   * 可替换的「移入回收站」实现（仅测试用）。
+   *
+   * 真实实现要起 PowerShell / osascript 子进程，测试里跑它既慢又会污染系统回收站。
+   * 生产路径不传，默认走 `moveToSystemRecycleBin`。
+   */
+  recycler?: Recycler
   /**
    * 提前清理阈值（0-100）。
    *
@@ -195,7 +204,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   /** 上次真正跑清理的时间；`null` 表示本进程还没跑过。 */
   let lastPruneAt: number | null = null
 
-  /** 按策略清理安全区；返回被销毁的条目。 */
+  /** 按策略清理安全区；返回**真正移入回收站**的条目。 */
   const pruneNow = async (): Promise<TrashEntry[]> => {
     if (deps.autoPrune === false) return []
     const entries = await listSafeZone(deps.stateDir)
@@ -204,15 +213,29 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       maxBytes: deps.maxBytes,
       ...(deps.pruneAtPercent !== undefined ? { pruneAtPercent: deps.pruneAtPercent } : {}),
     })
+    const removed: TrashEntry[] = []
     for (const entry of selected) {
-      await destroyEntry(deps.stateDir, entry.id)
+      // 移入系统回收站；失败则**保留**该条目并记录原因。
+      // 宁可占磁盘，也不能因为回收站不可用就永久删掉。
+      const result = await destroyEntry(deps.stateDir, entry.id, {
+        ...(deps.recycler === undefined ? {} : { recycler: deps.recycler }),
+      })
+      if (!result.ok) {
+        appendAudit(deps.stateDir, {
+          event: 'prune',
+          target: entry.originalPath,
+          detail: `id=${entry.id} skipped: ${result.reason}`,
+        })
+        continue
+      }
+      removed.push(entry)
       appendAudit(deps.stateDir, {
         event: 'prune',
         target: entry.originalPath,
-        detail: `id=${entry.id} bytes=${entry.bytes}`,
+        detail: `id=${entry.id} bytes=${entry.bytes} via=${result.via}`,
       })
     }
-    return selected
+    return removed
   }
 
   /**
@@ -340,6 +363,12 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           `retention: ${deps.retentionDays} days`,
           `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : `on, checked every ${describeInterval(pruneIntervalMs)}`}`,
           `prune trigger: ${deps.autoPrune === false ? 'n/a' : describePruneTrigger(deps)}`,
+          // 清理去哪，是用户最该知道的一件事：进回收站（可还原）还是永久删。
+          `prune destination: ${
+            canRecycle()
+              ? 'system recycle bin (recoverable until you empty it)'
+              : `NOT SUPPORTED on ${process.platform} — expired entries stay in the safe zone`
+          }`,
           `confirm when a single delete exceeds: ${describeThresholds(deps)}`,
           next !== undefined ? `oldest entry expires: ${new Date(next.expiresAt).toISOString()}` : 'safe zone is empty',
         ].join('\n'),

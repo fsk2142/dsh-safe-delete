@@ -1,4 +1,5 @@
 import { t as ClassifyEnv } from "./classify-DBIbYKr1.js";
+import { Recycler } from "./recycle.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -59,6 +60,13 @@ export interface ToolDeps {
    * 用户打开它毫无效果。
    */
   crossVolumeCopy?: boolean;
+  /**
+   * 可替换的「移入回收站」实现（仅测试用）。
+   *
+   * 真实实现要起 PowerShell / osascript 子进程，测试里跑它既慢又会污染系统回收站。
+   * 生产路径不传，默认走 `moveToSystemRecycleBin`。
+   */
+  recycler?: Recycler;
   /**
    * 提前清理阈值（0-100）。
    *

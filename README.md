@@ -80,8 +80,8 @@ dsh plugin --profile <profile> add dsh-safe-delete
 /safe-delete <路径> --preview    只看会发生什么，不真的移动
 /safe-delete list                列出安全区里的条目
 /safe-delete restore <id>        把某个条目取回原位
-/safe-delete clean               立即清理安全区（过期与超容量部分）
-/safe-delete clean --dry-run     只报告会清理什么，不动手
+/safe-delete clean               把过期/超容量的条目移入系统回收站
+/safe-delete clean --dry-run     只报告会移走什么，不动手
 /safe-delete config              查看所有配置项：当前值、作用、影响、范围
 /safe-delete config <项> <值>     修改一项（例如 config maxBytes 30GB）
 /safe-delete status              安全区概况
@@ -104,6 +104,23 @@ dsh-safe-delete journal
 
 > 终端里没有审批通道，所以 `delete` 遇到需要人工确认的路径会**拒绝**并提示改用
 > DSH 里的 `/safe-delete`。这不是缺陷 —— 它保证「需要你点头的删除」永远先问到你。
+
+## 文件去哪了：三层结构
+
+删除不是一步到位的，中间隔了两道可反悔的关卡：
+
+| 层 | 什么时候发生 | 怎么取回 |
+|---|---|---|
+| **1. 安全区** | 删除的那一刻 | 保留期（默认 7 天）内用 `safe_zone_restore id=<id>` |
+| **2. 系统回收站** | 保留期结束、或超出容量上限 | 清空回收站之前，在资源管理器里「还原」都能拿回来 |
+| **3. 永久消失** | **你手动清空回收站** | 拿不回来了 |
+
+**关键是第 2 层不是自动的。** 安全区到期后，条目会被**移入系统回收站**，而不是
+直接抹掉 —— 因为安全区的定时清理是无人值守的，不该替你做「最终删除」这个决定。
+真正不可逆的那一步，永远由你手动触发。
+
+移入回收站失败的条目会**留在安全区**并在 `safe_zone_status` 里报告，**绝不会**
+因为回收站不可用就静默永久删除。
 
 ## 分级
 

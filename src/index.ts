@@ -646,11 +646,20 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           freedBytes: selected.reduce((sum, entry) => sum + entry.bytes, 0),
         }
       }
-      for (const entry of selected) await destroyEntry(stateDir, entry.id)
-      return {
-        removed: selected.map((entry) => `${entry.originalPath} (${entry.id})`),
-        freedBytes: selected.reduce((sum, entry) => sum + entry.bytes, 0),
+      // 移入**系统回收站**，不是永久删除。失败的条目留在安全区并计入 failures。
+      const removed: string[] = []
+      const failures: string[] = []
+      let movedBytes = 0
+      for (const entry of selected) {
+        const result = await destroyEntry(stateDir, entry.id)
+        if (!result.ok) {
+          failures.push(`${entry.originalPath}: ${result.reason}`)
+          continue
+        }
+        removed.push(`${entry.originalPath} (${entry.id})`)
+        movedBytes += entry.bytes
       }
+      return { removed, freedBytes: movedBytes, failures }
     },
     readConfig: async () => {
       // 合并：schema 默认值 + 宿主里已存的值。

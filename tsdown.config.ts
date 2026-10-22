@@ -39,6 +39,7 @@ const hostConfig: UserConfig = {
     'delete-core': 'src/delete-core.ts',
     commands: 'src/commands.ts',
     'settings-guide': 'src/settings-guide.ts',
+    recycle: 'src/recycle.ts',
   },
   outDir: 'lib',
   format: 'esm',

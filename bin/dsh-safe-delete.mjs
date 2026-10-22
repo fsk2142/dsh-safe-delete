@@ -218,16 +218,31 @@ async function main(argv) {
       const freed = safeZoneBytes(selected)
       if (dryRun) {
         for (const entry of selected) {
-          process.stdout.write(`would destroy ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+          process.stdout.write(`would move to recycle bin ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
         }
         process.stdout.write(`total: ${selected.length} entr(ies), ${humanBytes(freed)} (dry run — nothing changed)\n`)
         return 0
       }
+      // 移入系统回收站：失败的条目留在安全区，不永久删除。
+      let moved = 0
+      let failed = 0
       for (const entry of selected) {
-        await store.destroyEntry(stateDir(), entry.id)
-        process.stdout.write(`destroyed ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+        const result = await store.destroyEntry(stateDir(), entry.id)
+        if (result.ok) {
+          moved += 1
+          process.stdout.write(`recycled ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+        } else {
+          failed += 1
+          process.stderr.write(`skipped ${entry.id} (${entry.originalPath}): ${result.reason}\n`)
+        }
       }
-      process.stdout.write(`total: ${selected.length} entr(ies), ${humanBytes(freed)}\n`)
+      process.stdout.write(`total: ${moved} entr(ies) moved to the recycle bin, ${humanBytes(freed)}\n`)
+      if (failed > 0) {
+        process.stdout.write(
+          `${failed} entr(ies) left in the safe zone because the recycle bin was unavailable.\n`,
+        )
+        return 1
+      }
       return 0
     }
 
