@@ -75,6 +75,10 @@ function readConfigDefaults() {
   try {
     const profile = process.env.DSH_PROFILE
     if (profile === undefined || profile === '') return fallback
+    // 存放位置已在宿主上核实（2026-10-22）：`app-boot` 的 `PROFILE_PATCH_FILENAME`
+    // 就是 `cordis.patch.yml`，用户层配置由 `loadOverlayPatches(binName, patchPath)`
+    // 从这里读；实测真实 profile 里 `dsh-context` / `better-sidebar` 都带 `config:` 块。
+    // 若将来宿主改了落盘位置，这里会读不到并**明确标注退回默认值**，不会给错数。
     const patchFile = path.join(dshHome(), 'profiles', profile, 'cordis.patch.yml')
     if (!fs.existsSync(patchFile)) return fallback
 
