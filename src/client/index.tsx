@@ -679,59 +679,7 @@ export function SafeZoneSettings(): ReactElement {
   }, [])
 
   /**
-   * 启动诊断面板。
-   *
-   * 为什么需要它：配置页连续几版不显示，而三种失败（apply 没跑 / 注册被丢弃 /
-   * 表单没渲染）在界面上完全一样。把启动链路直接画在表单里，用户不必开控制台
-   * 就能告诉我卡在哪一步。
-   */
-  const diagPanel = (
-    <details
-      // 默认展开：诊断的存在意义就是"用户不需要额外操作就能看到"。
-      // 之前用折叠面板，结果打开页面看起来"什么都没有"——问题在最需要被看见时
-      // 恰好藏起来了。
-      open
-      style={{
-        marginBottom: '12px',
-        fontSize: '12px',
-        color: 'var(--dsw-alias-label-caption, #8a94a6)',
-        border: '1px dashed var(--dsw-alias-border-l2, #c9d1e0)',
-        borderRadius: 'var(--dsw-radius-md, 8px)',
-        padding: '8px 10px',
-      }}
-    >
-      <summary style={{ cursor: 'pointer', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>
-        启动诊断（{diagnostics.length} 步）
-      </summary>
-      <ul style={{ margin: '8px 0 0', paddingLeft: '18px', lineHeight: '1.7' }}>
-        {diagnostics.map((item, index) => (
-          <li
-            key={`${item.step}-${index}`}
-            style={{
-              color: item.ok
-                ? 'var(--dsw-alias-label-secondary, #5c6779)'
-                : 'var(--dsw-alias-state-error-primary, #d33)',
-              // 失败项加粗：一眼能看到哪一步不对。
-              fontWeight: item.ok ? 400 : 600,
-            }}
-          >
-            {item.ok ? '✓' : '✗'} {item.step}
-            {item.detail === undefined ? '' : ` — ${item.detail}`}
-          </li>
-        ))}
-      </ul>
-      {/*
-        指向手写文档。面板里这些行是程序记录的**现象**，而每一步"为什么查它、
-        显示 ✗ 时怎么办"写在 docs/DIAGNOSTICS.md 里 —— 那里能写表格和排查组合，
-        塞进这个面板会喧宾夺主。
-      */}
-      <div style={{ marginTop: '8px', lineHeight: '1.6' }}>
-        各步骤的含义与排查方法见仓库 <code>docs/DIAGNOSTICS.md</code>。
-      </div>
-    </details>
-  )
-
-  /** 状态卡片：加载中/出错也用同一套容器，避免布局跳动。 */
+   * 状态卡片：加载中/出错也用同一套容器，避免布局跳动。 */
   const statusCard = (body: ReactElement): ReactElement => (
     <section
       style={{
@@ -751,7 +699,6 @@ export function SafeZoneSettings(): ReactElement {
   if (status === 'loading') {
     return (
       <div style={{ padding: '4px 0' }}>
-        {diagPanel}
         {statusCard(
           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
             <span style={{ fontWeight: 600, fontSize: '14px' }}>安全区设置</span>
@@ -766,7 +713,6 @@ export function SafeZoneSettings(): ReactElement {
   if (status === 'error') {
     return (
       <div style={{ padding: '4px 0' }}>
-        {diagPanel}
         {statusCard(
           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
             <span style={{ fontWeight: 600, fontSize: '14px' }}>安全区设置</span>
@@ -802,7 +748,6 @@ export function SafeZoneSettings(): ReactElement {
         原来只放在 loading / error 分支里，于是最需要它的场景（"读到了但读的是空"、
         "保存成功但回读不到"）恰恰看不到 —— 那些都是 status='ready'。
       */}
-      {diagPanel}
       {/*
         **一张卡片装下所有设置，项与项之间没有分隔线。**
 
