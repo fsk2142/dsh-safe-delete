@@ -189,6 +189,7 @@ node scripts/clean-test-tmp.mjs   # 清掉测试遗留的临时目录
 | `verify-interception.ts` | 用真实命令跑完整拦截链，确认没有静默失效 |
 | `verify-settings-contract.mjs` | 按宿主真实契约验证设置页的读写形状 |
 | `verify-client.mjs` | 模拟宿主 loader 跑一遍客户端 `apply()` |
+| `verify-activation.mjs` | **按宿主规则判定 `inject` 是否可满足** —— 缺一个服务，`apply` 就永不执行，界面上什么都不出现 |
 | `verify-client-render.mjs` | 渲染表单，确认字段与默认值都在 |
 | `adversarial-probe.ts` | 找「该拦却没拦」；同时列出已知边界 |
 | `false-positive-probe.ts` | 找「不该拦却拦了」 |

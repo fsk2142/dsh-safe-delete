@@ -19,9 +19,11 @@ import { makeFakeCtx } from './support/fake-ctx'
  * 之前失效的真正原因。
  */
 describe('client apply', () => {
-  it('declares the services the config page depends on', () => {
-    expect(inject).toContain('slots')
-    expect(inject).toContain('configForms')
+  it('declares only the services the host always provides', () => {
+    // 宿主会检查顶层 inject 里的每个服务，缺一个就把 fiber 停在 pending，
+    // **apply 永远不执行**。所以这个数组必须只含启动必备的服务。
+    // 对照 dsh-context（真实可用的带配置页插件）就是 ['slots','locale']。
+    expect(inject).toEqual(['slots', 'locale'])
   })
 
   it('registers on plugins.bundle.config, keyed by the package name', () => {
