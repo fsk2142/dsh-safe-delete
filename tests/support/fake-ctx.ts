@@ -58,6 +58,8 @@ export interface FakeCtx {
   registeredCommands: Array<{ name: string; description: string }>
   /** 已注册的 UI 槽位（断言插件页「配置」入口挂对了 key）。 */
   registeredSlots: Array<Record<string, unknown>>
+  /** cordis 服务注入（等 `configForms` 就绪用）。 */
+  inject?: (services: string[], callback: (scoped: Record<string, unknown>) => void) => unknown
   /** 触发一次 `tools/pre-execute` 瀑布，返回最终决策。 */
   preExecute(exec: { name: string; arguments: Record<string, unknown> }): Promise<FakeDecision>
 }
@@ -175,6 +177,16 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
     },
   }
 
+  // 服务 `configForms`：配置页必须等它就绪才能注册（宿主渲染时要用）。
+  // `whileServed` 在真实宿主里会随服务撤销自动注销；这里同步执行回调即可。
+  ;(withServices as unknown as { configForms?: unknown }).configForms = {
+    get: (_ns: string) => ({}),
+    whileServed: (_namespaces: string[], register: () => void) => {
+      register()
+      return () => {}
+    },
+  }
+
   // 服务 `commands`：默认缺席时的行为也要能测，所以由 options 控制。
   if (options.withCommands !== false) {
     withServices.commands = commandRegistry
@@ -184,9 +196,12 @@ export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
   if (options.withInject !== false) {
     withServices.inject = (services, callback) => {
       // 真实 cordis 会等服务就绪后回调；这里同步回调，语义等价。
-      const scoped: { commands?: typeof commandRegistry } = {}
+      const scoped: Record<string, unknown> = {}
       if (services.includes('commands') && withServices.commands !== undefined) {
-        scoped.commands = withServices.commands
+        scoped['commands'] = withServices.commands
+      }
+      if (services.includes('configForms') && (withServices as unknown as { configForms?: unknown }).configForms !== undefined) {
+        scoped['configForms'] = (withServices as unknown as { configForms?: unknown }).configForms
       }
       callback(scoped)
       return () => {}
