@@ -148,7 +148,45 @@ dsh-safe-delete journal
   恢复），插件安装器也会自己回滚 `package.json` 与 lockfile。重复实现只会多一份
   要维护的代码。
 - **不拦读操作**：`str_replace_editor view` 照常放行。
-- **不写浏览器端 UI**：审批卡片由 DSH 自带，配置走 Cordis 配置文件。
+- **不隐藏任何东西**：拦了什么、为什么拦、配置是什么，都能从 `/safe-delete config`
+  或 `/safe-delete journal` 直接看到。
+
+## 开发
+
+```bash
+pnpm install
+pnpm typecheck     # 类型检查
+pnpm vitest run    # 测试
+pnpm build         # 产物到 lib/（必须一起提交）
+```
+
+`lib/` 是发布产物且**必须进版本库**：`main` 与 `cordis.patch.yml` 都指向它。
+改完 `src/` 记得重新 `pnpm build` 并提交 `lib/`。
+
+### 验证脚本
+
+这些脚本不在测试套件里，是发布前的独立检查：
+
+| 脚本 | 作用 |
+|---|---|
+| `verify-interception.ts` | 用真实命令跑完整拦截链，确认没有静默失效 |
+| `verify-settings-contract.mjs` | 按宿主真实契约验证设置页的读写形状 |
+| `verify-client.mjs` | 模拟宿主 loader 跑一遍客户端 `apply()` |
+| `verify-client-render.mjs` | 渲染表单，确认字段与默认值都在 |
+| `adversarial-probe.ts` | 找「该拦却没拦」；同时列出已知边界 |
+| `false-positive-probe.ts` | 找「不该拦却拦了」 |
+| `privacy-audit.mjs` | 发布前扫个人信息与凭据 |
+| `check-docs.mjs` | 文档与实现是否一致 |
+| `where-is-safe-zone.mjs` | 打印安全区默认位置与所在卷 |
+| `render-icon.mjs` | 渲染 `icon.svg` 的预览图 |
+
+## 已知限制
+
+- **静态分析看不到动态构造的命令**：`$c = "Re" + "move-Item"; & $c -Recurse X`
+  这类写法无法在解析阶段识别。要防它需要运行时拦截，不是文本分析能解决的。
+- **需要审批的删除在终端里做不到**：CLI 没有审批通道，`delete` 遇到这类路径会
+  拒绝并提示改用 DSH 内的 `/safe-delete`。
+- **配置改动需重启生效**：值本身立即写入，但拦截线是在启动时装配的。
 
 ## 开发
 
