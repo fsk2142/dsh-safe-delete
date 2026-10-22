@@ -32,8 +32,17 @@ export interface CommandDeps {
   listSafeZone: () => Promise<readonly { id: string; originalPath: string; expiresAt: number }[]>
   /** 按 id 取回一项。 */
   restore: (id: string) => Promise<{ ok: true; restoredTo: string } | { ok: false; error: string }>
-  /** 现在清理一次；`dryRun` 只报告。 */
-  clean: (dryRun: boolean) => Promise<{ removed: readonly string[]; freedBytes: number }>
+  /**
+   * 现在清理一次；`dryRun` 只报告。
+   *
+   * `failures` 是**移入回收站失败、因此仍留在安全区**的条目及原因。
+   * 必须显示给用户：否则他会以为清理成功，而磁盘没释放、条目其实还在。
+   */
+  clean: (dryRun: boolean) => Promise<{
+    removed: readonly string[]
+    freedBytes: number
+    failures?: readonly string[]
+  }>
   /** 读当前配置。 */
   readConfig: () => Promise<Record<string, unknown>>
   /** 写一项配置。 */
@@ -165,13 +174,29 @@ export async function runCommand(rawInput: string, deps: CommandDeps): Promise<C
   if (verb === 'clean') {
     const dryRun = rest.includes('--dry-run')
     const result = await deps.clean(dryRun)
-    if (result.removed.length === 0) {
+    const failures = result.failures ?? []
+
+    if (result.removed.length === 0 && failures.length === 0) {
       return { kind: 'success', text: '没有需要清理的条目（都还在保留期内，且未超容量）。' }
     }
-    const head = dryRun
-      ? `将清理 ${result.removed.length} 项（dry run，什么都没动）：`
-      : `已清理 ${result.removed.length} 项：`
-    return { kind: 'success', text: [head, ...result.removed.map((item) => `  ${item}`)].join('\n') }
+
+    const lines: string[] = []
+    if (result.removed.length > 0) {
+      const head = dryRun
+        ? `将移入回收站 ${result.removed.length} 项（dry run，什么都没动）：`
+        : `已移入回收站 ${result.removed.length} 项：`
+      lines.push(head, ...result.removed.map((item) => `  ${item}`))
+    }
+
+    // 失败必须显式列出：否则用户以为清完了，而磁盘没释放、条目还在安全区。
+    if (failures.length > 0) {
+      lines.push('', `⚠ ${failures.length} 项未能移入回收站，已**留在安全区**（不会永久删除）：`)
+      lines.push(...failures.map((item) => `  ${item}`))
+      return { kind: 'error', text: lines.join('\n') }
+    }
+
+    if (!dryRun) lines.push('', '回收站里在你清空之前都能还原。')
+    return { kind: 'success', text: lines.join('\n') }
   }
 
   if (verb === 'config') {

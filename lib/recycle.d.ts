@@ -48,6 +48,16 @@ export type Recycler = (absPath: string) => RecycleOutcome;
  */
 export declare function canRecycle(): boolean;
 /**
+ * 回收站是否已被熔断。
+ *
+ * @returns 连续失败达到阈值时返回 `true`。
+ */
+export declare function recycleIsTripped(): boolean;
+/**
+ * 重置熔断状态（测试用，或用户在状态命令里主动重试时）。
+ */
+export declare function resetRecycleBreaker(): void;
+/**
  * 把一个路径移入系统回收站。
  *
  * @param absPath 要移入的绝对路径（文件或目录）。
