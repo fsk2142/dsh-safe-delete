@@ -75,6 +75,16 @@ export function selectForPrune(entries: TrashEntry[], opts: PruneOptions): Trash
 
   // 容量层：用「总量 - 已选」判断，避免重复累加已删条目。
   const cap = effectiveCapBytes(opts)
+
+  // `maxBytes: 0` 的语义是「清空全部」（配置页的「立即清理」就是这么调的）。
+  //
+  // 不能只依赖下面的 `remaining <= cap` 循环退出：若安全区里全是 0 字节条目
+  // （空目录），`remaining` 一开始就是 0，循环立刻结束 → 一条都不选。
+  // 那与「清空全部」的承诺不符，所以这里显式全选。
+  if (cap <= 0) {
+    return [...ordered]
+  }
+
   let remaining = safeZoneBytes(entries.filter((e) => !selectedIds.has(e.id)))
   if (remaining <= cap) return selected
 
