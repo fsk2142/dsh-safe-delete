@@ -720,7 +720,7 @@ export function SafeZoneSettings(): ReactElement {
   const statusCard = (body: ReactElement): ReactElement => (
     <section
       style={{
-        border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
+        border: '1px solid var(--dsw-alias-border-l3, #d6dde8)',
         borderRadius: 'var(--dsw-radius-lg, 12px)',
         background: 'var(--dsw-alias-bg-layer-2, transparent)',
         padding: '16px 18px',
@@ -794,7 +794,7 @@ export function SafeZoneSettings(): ReactElement {
       */}
       <section
         style={{
-          border: '1px solid var(--dsw-alias-border-l1, #e3e8f0)',
+          border: '1px solid var(--dsw-alias-border-l3, #d6dde8)',
           borderRadius: 'var(--dsw-radius-lg, 12px)',
           background: 'var(--dsw-alias-bg-layer-2, transparent)',
           padding: '14px 16px',
@@ -945,7 +945,12 @@ export function SafeZoneSettings(): ReactElement {
         })}
       </section>
 
-      {/* 操作区：独立一行，与卡片保持呼吸感。 */}
+      {/*
+        操作区只有**保存**。
+
+        为什么把「立即清理」挪走：它和保存放在一起会被读成"另一个保存按钮"，
+        而它做的是完全不同的事（清空安全区）。语义不同的操作不该并排。
+      */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
         {/*
           保存按钮只在**有改动时**出现。
@@ -973,36 +978,6 @@ export function SafeZoneSettings(): ReactElement {
             {saving ? '保存中…' : '保存'}
           </button>
         ) : null}
-        {/*
-          「立即清理」：把安全区里的条目全部移入系统回收站。
-
-          ## 它怎么真正执行
-
-          配置页拿不到"跑清理"的调用接口（`tools` 没有 remote，`commands/execute`
-          和 `terminal/*` 都要 agentId）。所以走宿主的**配置变更 → HMR 重载插件**
-          这条通道：把时间戳写进 `cleanRequestedAt`，插件重载时 `apply` 重跑并执行清理。
-
-          代价是点一次会让插件重载（工具短暂不可用），对手动清理这种低频操作可接受。
-        */}
-        <button
-          type="button"
-          onClick={() => void runClean()}
-          disabled={status !== 'ready' || cleaning}
-          title="把安全区里的条目全部移入系统回收站（可在清空回收站之前还原）"
-          style={{
-            padding: '6px 18px',
-            borderRadius: 'var(--dsw-radius-md, 8px)',
-            border: '1px solid var(--dsw-alias-border-l2, #c9d1e0)',
-            cursor: status !== 'ready' || cleaning ? 'default' : 'pointer',
-            background: 'transparent',
-            color: 'var(--dsw-alias-label-primary, inherit)',
-            font: 'inherit',
-            fontSize: '13px',
-            opacity: status !== 'ready' || cleaning ? 0.55 : 1,
-          }}
-        >
-          {cleaning ? '清理中…' : '立即清理'}
-        </button>
         {message !== '' ? (
           <span
             aria-live="polite"
@@ -1017,6 +992,57 @@ export function SafeZoneSettings(): ReactElement {
             {message}
           </span>
         ) : null}
+      </div>
+
+      {/*
+        「立即清理」单独一块，放在最下方。
+
+        ## 为什么用分隔设计
+
+        它**不受上方任何配置影响**：按下去就是把安全区现有条目全部移入回收站，
+        不看保留期、也不看容量上限。因此不该跟"保存"并排——那会让人以为它保存
+        当前表单。独立成块 + 一行说明，语义才清楚。
+
+        ## 它怎么真正执行
+
+        配置页拿不到"跑清理"的调用接口（`tools` 没有 remote，`commands/execute`
+        和 `terminal/*` 都要 agentId）。走宿主的**配置变更 → HMR 重载插件**通道：
+        把时间戳写进 `cleanRequestedAt`，插件重载时 `apply` 重跑并执行清理。
+
+        代价是点一次会让插件重载（工具短暂不可用），对手动清理这种低频操作可接受。
+      */}
+      <div
+        style={{
+          borderTop: '1px solid var(--dsw-alias-border-l2, #d9dee8)',
+          paddingTop: '12px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '6px',
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => void runClean()}
+          disabled={status !== 'ready' || cleaning}
+          title="把安全区里的条目全部移入系统回收站（可在清空回收站之前还原）"
+          style={{
+            alignSelf: 'flex-start',
+            padding: '6px 18px',
+            borderRadius: 'var(--dsw-radius-md, 8px)',
+            border: '1px solid var(--dsw-alias-border-l3, #d6dde8)',
+            cursor: status !== 'ready' || cleaning ? 'default' : 'pointer',
+            background: 'transparent',
+            color: 'var(--dsw-alias-label-primary, inherit)',
+            font: 'inherit',
+            fontSize: '13px',
+            opacity: status !== 'ready' || cleaning ? 0.55 : 1,
+          }}
+        >
+          {cleaning ? '清理中…' : '立即清理安全区'}
+        </button>
+        <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
+          把安全区现有条目全部移入系统回收站，不受保留期与容量上限限制。
+        </span>
       </div>
     </div>
   )
