@@ -13,7 +13,7 @@
  *      除此之外本文件不删任何用户数据。
  */
 
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 import { describeTarget } from './describe'
@@ -43,6 +43,52 @@ function indexPath(stateDir: string): string {
 /** 条目内容目录。 */
 function entryDir(stateDir: string, id: string): string {
   return path.join(stateDir, ITEMS_DIR, id)
+}
+
+/**
+ * 把内容搬回原处、再收掉刚建的 `items/<id>` 目录。
+ *
+ * ## 为什么需要它
+ *
+ * `moveToSafeZone` 的顺序是：建目录 → 移动内容（rename）→ 写索引。**第三步失败**
+ * 时，前两步已经成功：内容真的被移进了 `items/<id>/`，而索引里没有记录指向它。
+ *
+ * 此时如果只 `rmdir`（空目录才行）就会失败，目录连同**用户的数据**一起变成孤儿：
+ * 清理逻辑只遍历索引，所以它既不会被自动清理，也不会出现在 `safe_zone_list` 里
+ * —— 用户以为文件还在安全区，其实已经"失联"了。
+ *
+ * 实测踩到过：一次清理后留下 3 个孤儿目录，`safe_zone_status` 报 87 条而磁盘上
+ * 有 90 个目录。
+ *
+ * ## 正确的补救顺序
+ *
+ * 1. 先把内容**搬回原路径**（`renameSync` 回去），让用户的数据回到原位；
+ * 2. 再删掉现在（应当）已空的 `items/<id>`；
+ * 3. 任何一步失败都**只记录不抛**——不能覆盖原始的索引错误。
+ *
+ * 关键取舍：**宁可不删目录，也不能删掉里面的数据**。所以只有确认搬回成功（或
+ * 目录本来就空）才 `rmdir`；如果搬不回去，目录留着 —— 至少数据还在盘上，
+ * 用户手动也能捞出来。
+ *
+ * @param entryRoot 条目目录。
+ * @param dest 内容实际落点（`entryRoot/<basename>`）。
+ * @param target 原始路径。
+ */
+function rollbackEntry(entryRoot: string, dest: string, target: string): void {
+  // 1. 内容搬回原处。目标位置若已被占用（极少见），搬回会失败，此时不动它。
+  try {
+    if (existsSync(dest) && !existsSync(target)) {
+      renameSync(dest, target)
+    }
+  } catch {
+    /* 搬不回去就保持现状：数据至少还在 items/ 里，不要冒险删 */
+  }
+  // 2. 只有目录确实空了才收掉。
+  try {
+    rmdirSync(entryRoot)
+  } catch {
+    /* 非空（搬回失败留下内容）或已不存在：两种都无需处理 */
+  }
 }
 
 /**
@@ -160,6 +206,9 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
     if (code !== 'EXDEV') throw error
     // 跨卷：默认拒绝，让人自己决定是把安全区换到同一卷、还是接受一次真实复制。
     if (opts.crossVolumeCopy !== true) {
+      // 拒绝之前必须把刚建的 `items/<id>` 空目录收掉，否则它会变成"索引里没有、
+      // 磁盘上却存在"的孤儿，越攒越多且没人清。
+      rollbackEntry(entryRoot, dest, target)
       throw new Error(
         `cannot move "${target}" into the safe zone: they are on different volumes. ` +
           'Move the safe zone to the same volume, or enable crossVolumeCopy to copy instead.',
@@ -197,6 +246,9 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
         /* 回滚失败也要把原始错误抛出去 */
       }
     }
+    // 无论哪种失败，`items/<id>` 都是这次刚建的，必须收掉：
+    // 索引没写成 → 没有任何记录指向它 → 它就是垃圾。
+    rollbackEntry(entryRoot, dest, target)
     throw error
   }
 
