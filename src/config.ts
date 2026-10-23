@@ -62,6 +62,32 @@ export const Config = z.object({
 
   /** 跨卷时是否允许复制式移入。 */
   crossVolumeCopy: z.boolean().default(false),
+
+  /**
+   * 「立即清理」的触发戳（毫秒时间戳；0 表示从未请求）。
+   *
+   * ## 为什么用配置项当按钮
+   *
+   * 浏览器里的按钮要触发宿主动作，必须有一条「界面 → 宿主」的通道。实测下来
+   * 现成的通道都用不了：
+   *
+   *   - `tools` 根本没有 remote 端点 —— 浏览器调不到插件工具；
+   *   - `commands/execute`、`terminal/*`、`dynamicCordisRunner/*` 都需要 agentId，
+   *     而配置页不属于任何会话；
+   *   - 自建 remote 需要 typert 生成器的整套分析管线（tsconfig.host/client +
+   *     双面模型 + 产物发布），对一个按钮而言成本过高。
+   *
+   * 但宿主自带一条通道：**配置写入会触发 HMR 重载插件**，`apply` 因此重跑。
+   * 于是把这个字段当信号灯：
+   *
+   *   1. 用户点按钮 → 客户端写入当前时间戳；
+   *   2. HMR 检测到配置变化 → 卸载并重新 apply 本插件；
+   *   3. apply 发现时间戳比上次执行的新 → 跑一次清理（过期条目移入回收站）。
+   *
+   * 代价：点按钮会让插件重载一次（几十毫秒），期间工具短暂不可用。对手动清理
+   * 这种低频操作可以接受。
+   */
+  cleanRequestedAt: z.number().default(0).volatile(),
 })
 
 /** 配置的类型（含缺省值）。 */
