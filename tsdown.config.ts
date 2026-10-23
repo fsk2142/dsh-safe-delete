@@ -29,17 +29,21 @@ const hostConfig: UserConfig = {
   name: `${PACKAGE_NAME}/host`,
   entry: {
     index: 'src/index.ts',
-    // 独立 CLI 需要能单独 import 安全区与清理策略：插件入口带着 cordis 接线，
-    // 不该被一个只跑 `undo` 的命令行拉进来。
+    /*
+     * 下面这些是**独立入口**，只保留真正需要的。
+     *
+     * 判据：`bin/dsh-safe-delete.mjs` 用动态 import 按需加载它们（CLI 不该把整个
+     * 插件入口连同 cordis 接线一起拉进来），或 `package.json#exports` 对外导出。
+     *
+     * 曾经还多出四个入口（config / commands / settings-guide / recycle）。它们既不在
+     * exports 里、CLI 也不加载，代码已经打包进 index.js，独立产物纯属冗余 —— 删掉
+     * 可让 lib/ 少 4 个文件，也少一份"这个模块是公开 API"的误导。
+     */
     store: 'src/store.ts',
     prune: 'src/prune.ts',
     tools: 'src/tools.ts',
     audit: 'src/audit.ts',
-    config: 'src/config.ts',
     'delete-core': 'src/delete-core.ts',
-    commands: 'src/commands.ts',
-    'settings-guide': 'src/settings-guide.ts',
-    recycle: 'src/recycle.ts',
   },
   outDir: 'lib',
   format: 'esm',

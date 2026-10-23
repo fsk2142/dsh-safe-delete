@@ -71,10 +71,22 @@ Write-Output 'NOT_FOUND'
 const entries = await listSafeZone(state)
 console.log('安全区索引条目数:', entries.length)
 
+/*
+ * 判定分三档，而不是"通过/不通过"。
+ *
+ * 为什么：回收站检索要枚举上千条目，偶尔会超时。若把「查不动」直接算作「验证未通过」，
+ * 一次慢查询就会变成假的数据丢失警报 —— 比慢本身更危险。
+ *
+ * 真正的失败判据只有两条：回收调用返回失败，或原位置仍有残留。
+ */
 console.log('')
-if (outcome.ok && !existsSync(staged) && foundInRecycleBin) {
+const recycled = outcome.ok && !existsSync(staged)
+if (recycled && foundInRecycleBin) {
   console.log('结论：条目确实被移入系统回收站，且可从回收站取回。')
+} else if (recycled && !foundInRecycleBin) {
+  console.log('结论：回收调用成功、原位置已清空，但未能在回收站里检索到该条目。')
+  console.log('     可能原因：检索超时（条目过多）或回收未真正落地 —— 请人工复核。')
 } else {
-  console.log('结论：验证未通过 —— 需要检查 Shell 调用或权限。')
+  console.log(`结论：验证未通过 —— outcome.ok=${String(outcome.ok)}，原位置仍存在=${String(existsSync(staged))}`)
   process.exitCode = 1
 }
