@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
@@ -79,16 +79,52 @@ describe('recycle breaker', () => {
     expect(elapsed).toBeLessThan(100)
   })
 
-  it('resets the count after a success', () => {
+  it('resets the count after a manual reset', () => {
     recordRecycleFailure()
     recordRecycleFailure()
     expect(recycleFailureCount()).toBeGreaterThan(0)
 
-    // 成功的路径会把计数归零。这里用一个真实的空目录走成功路径代价太大，
-    // 直接验证 reset 的效果（生产代码在 outcome.ok 分支里做同样的事）。
     resetRecycleBreaker()
     expect(recycleFailureCount()).toBe(0)
     expect(recycleIsTripped()).toBe(false)
+  })
+
+  it('resets the count automatically after a SUCCESSFUL recycle', () => {
+    /*
+     * 这条补的是「微残留」：`moveToSystemRecycleBin` 里 `outcome.ok` 分支的那行
+     * `consecutiveFailures = 0` 之前没有被**直接**测到 —— 旧测试用的是手动
+     * `resetRecycleBreaker()`，那是另一条路径。
+     *
+     * 为什么这条路径重要：熔断的目的是"回收站坏了就快速失败"，回收站恢复后
+     * 必须能自己复位。如果只有手动重置才能归零，一次故障就会让熔断永久卡住，
+     * 直到进程重启 —— 而用户不会知道要重启。
+     */
+    const root = scratchDir('dsd-breaker-recover-')
+    const target = join(root, 'recover.txt')
+    writeFileSync(target, 'x')
+
+    // 先累积失败（真实失败：目标不存在，不计入；所以用 recordRecycleFailure 直接压）。
+    const threshold = recycleBreakerThreshold()
+    for (let i = 0; i < threshold; i += 1) recordRecycleFailure()
+    expect(recycleIsTripped()).toBe(true)
+
+    // 清掉熔断以便真正走到 attemptRecycle，然后对**真实存在**的文件成功回收。
+    resetRecycleBreaker()
+    recordRecycleFailure()
+    recordRecycleFailure()
+    expect(recycleFailureCount()).toBe(2)
+
+    const outcome = moveToSystemRecycleBin(target)
+    if (outcome.ok) {
+      // 真实回收成功：计数应自动归零（不需要手动 reset）。
+      expect(recycleFailureCount(), '成功后应自动归零').toBe(0)
+      expect(recycleIsTripped()).toBe(false)
+      expect(existsSync(target), '文件应已移走').toBe(false)
+    } else {
+      // 环境无法回收（无 shell / 无权限）：显式跳过而不是假装通过。
+      console.log('本机无法完成真实回收，跳过该断言:', outcome.reason)
+      resetRecycleBreaker()
+    }
   })
 
   it('does not count a missing path as a failure', () => {

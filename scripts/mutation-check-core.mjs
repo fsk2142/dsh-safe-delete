@@ -28,7 +28,10 @@ const mutations = [
   },
   {
     label: '去掉审批环节（危险路径直接放行）',
-    from: 'if (gate.needsApproval) {',
+    // 锚点曾因重构漂移导致整条变异被 SKIP（第十五轮 N-s）：
+    // 审批条件从 `gate.needsApproval` 扩成 `gate.needsApproval || risks.length > 0`
+    // （加了空间风险提示）。锚点跟着改，否则这条断言会静默失效。
+    from: 'if (gate.needsApproval || risks.length > 0) {',
     to: 'if (false) {',
   },
   {
