@@ -277,13 +277,36 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
    *   - 有服务但策略是 `never`：用户明确选择了"别问我"。此时 ask 只会被静默驳回，
    *     返回它等于废掉删除能力，所以降级放行到安全删除。
    */
-  const approvalPolicy = (): 'ask' | 'never' | 'absent' => {
+  const approvalPolicy = (session: unknown): 'ask' | 'never' | 'absent' => {
     const approval = ctx.get('approval') as
       | { effectivePolicy?: (session: unknown) => unknown; overrideOf?: (session: unknown) => unknown }
       | undefined
     if (approval === undefined || approval === null) return 'absent'
     try {
-      const override = approval.overrideOf?.(undefined)
+      /*
+       * 必须用 `effectivePolicy(session)`，**不能**用 `overrideOf(undefined)`。
+       *
+       * 宿主 `ApprovalService` 的实现是：
+       *
+       *     effectivePolicy(session) {
+       *       return this.overrideOf(session) ?? this.config.policy ?? 'ask'
+       *     }
+       *
+       * 也就是说 `overrideOf` **只返回会话级覆盖**，不含配置里的默认策略。
+       *
+       * 曾经的写法是 `overrideOf?.(undefined)`，两个错误叠在一起：
+       *
+       *   1. 传 `undefined` —— 拿不到任何会话的覆盖，永远返回 `undefined`；
+       *   2. 于是下面的 fallback 把策略判成 `'ask'`，**绕过了配置里的 `never`**。
+       *
+       * 后果不是"多问一次"：`never` 下宿主会在瀑布分发前就把 `ask` 驳回，
+       * 卡片不出现，模型只收到 `the user rejected tool "..."`。用户看到的是
+       * "删除被拒绝且没有提示"，而真实原因是插件误以为策略是 ask。
+       */
+      const policy = approval.effectivePolicy?.(session)
+      if (policy === 'ask' || policy === 'never') return policy
+      // 服务在但读不到有效策略：退回会话覆盖再看一眼，仍拿不到就当作保守的 ask。
+      const override = approval.overrideOf?.(session)
       if (override === 'ask' || override === 'never') return override
     } catch {
       /* 取不到就按保守判断 */
@@ -317,11 +340,29 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   // 错误的会话与撤销信号上。正确做法是在这里返回 `kind: 'ask'`，让工具管线用
   // **它自己手上那份 exec** 去调 `ctx.approval.request()` —— 天然按调用隔离。
   const onPreExecute = async (
-    exec: { name?: string; arguments?: Record<string, unknown> },
+    exec: {
+      name?: string
+      arguments?: Record<string, unknown>
+      /**
+       * 宿主会传这两个字段，但我们的类型以前没声明它们。
+       *
+       * 为什么现在必须声明：判断审批策略要**按会话**读（`effectivePolicy(session)`）。
+       * 只传 `undefined` 拿不到会话覆盖，会误判成 `ask` —— 这正是"never 下删除被
+       * 静默拒绝且无卡片"的根因。
+       *
+       * 宿主自己的实现（`dsh-experimental-auto-review`）也是这么取的：
+       * `ctx.approval.overrideOf(agent.session)`。
+       */
+      agent?: { session?: unknown }
+      session?: unknown
+    },
     next: () => Promise<unknown>,
   ): Promise<unknown> => {
     const toolName = exec?.name
     if (toolName === undefined) return next()
+
+    /** 本次调用的会话；取不到时为 `undefined`，由 `effectivePolicy` 回落到默认策略。 */
+    const session = exec.agent?.session ?? exec.session
 
     // ── 写保护：启动关键路径不许被写坏 ──────────────────────────────────
     //
@@ -439,7 +480,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       // 这个降级有真实代价，必须说清楚：危险路径（家目录、profile 清单、node_modules）
       // 的删除失去了一次人类确认的机会，只剩"可恢复"这一层。降低风险的办法是把安全区
       // 保留期配长一些，以及定期用 `safe_zone_list` 看一眼。
-      if (approvalPolicy() === 'never') return next()
+      if (approvalPolicy(session) === 'never') return next()
 
       const isBatch = plan.resolved.length > 1
       const shown = plan.resolved.slice(0, 5)
@@ -484,7 +525,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     // 任务卡住且看不出原因 —— 这比放行更糟。没有审批通道时降级放行，
     // 由别的防线（沙箱、审批策略本身）兜住。
     if (verdict.target === null || isUnresolvableTarget(verdict.target)) {
-      const policy = approvalPolicy()
+      const policy = approvalPolicy(session)
       if (policy === 'never') {
         appendAudit(stateDir, {
           event: 'ask',
