@@ -9,14 +9,21 @@ export interface ToolResult {
   text: string;
   error?: string;
 }
+/** 单个属性的 schema（参数与输出通用）。 */
+export interface JsonSchemaProperty {
+  type: string;
+  description?: string;
+  enum?: string[];
+  /** 仅 `type: 'array'` 时有意义：元素 schema。 */
+  items?: {
+    type: string;
+    description?: string;
+  };
+}
 /** 手写的 JSON Schema 子集。 */
 export interface JsonSchemaSubset {
   type: 'object';
-  properties: Record<string, {
-    type: string;
-    description?: string;
-    enum?: string[];
-  }>;
+  properties: Record<string, JsonSchemaProperty>;
   required: string[];
   additionalProperties: false;
 }

@@ -14,11 +14,15 @@ import path from 'node:path'
 import { appendAudit, readAudit } from './audit'
 import type { ClassifyEnv } from './classify'
 import {
+  decideGate,
   deletePath,
   describeMoved,
   describePreview,
   humanBytes,
+  type DeleteContext,
+  type DeleteRequest,
 } from './delete-core'
+import { describeTarget } from './describe'
 import { selectForPrune, safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
 import { canRecycle } from './recycle'
@@ -35,10 +39,19 @@ export interface ToolResult {
   error?: string
 }
 
+/** 单个属性的 schema（参数与输出通用）。 */
+export interface JsonSchemaProperty {
+  type: string
+  description?: string
+  enum?: string[]
+  /** 仅 `type: 'array'` 时有意义：元素 schema。 */
+  items?: { type: string; description?: string }
+}
+
 /** 手写的 JSON Schema 子集。 */
 export interface JsonSchemaSubset {
   type: 'object'
-  properties: Record<string, { type: string; description?: string; enum?: string[] }>
+  properties: Record<string, JsonSchemaProperty>
   required: string[]
   additionalProperties: false
 }
@@ -107,13 +120,16 @@ export interface ToolDeps {
 }
 
 /** 参数 spec → JSON Schema 子集。 */
-function toJsonSchema(spec: Record<string, { type: string; description?: string; enum?: string[]; required?: boolean }>): JsonSchemaSubset {
+function toJsonSchema(spec: Record<string, JsonSchemaProperty & { required?: boolean }>): JsonSchemaSubset {
   const properties: JsonSchemaSubset['properties'] = {}
   const required: string[] = []
   for (const [key, meta] of Object.entries(spec)) {
-    const prop: { type: string; description?: string; enum?: string[] } = { type: meta.type }
+    const prop: JsonSchemaProperty = { type: meta.type }
     if (meta.description !== undefined) prop.description = meta.description
     if (meta.enum !== undefined) prop.enum = meta.enum
+    // `items` 必须一起带过去：丢了它，数组参数在线上的 schema 里只剩
+    // `{ type: 'array' }`，模型不知道该传什么元素类型，很可能干脆不用这个参数。
+    if (meta.items !== undefined) prop.items = meta.items
     properties[key] = prop
     if (meta.required === true) required.push(key)
   }
@@ -136,7 +152,7 @@ const OUTPUT_SCHEMA: JsonSchemaSubset = {
 function makeTool(spec: {
   name: string
   description: string
-  parameters: Record<string, { type: string; description?: string; enum?: string[]; required?: boolean }>
+  parameters: Record<string, JsonSchemaProperty & { required?: boolean }>
   execute: (args: Record<string, unknown>) => Promise<ToolResult>
   /** 每次执行前的钩子（用于按间隔触发清理）。钩子失败不影响工具本身。 */
   beforeExecute?: () => Promise<void>
@@ -194,6 +210,156 @@ function describePruneTrigger(deps: ToolDeps): string {
   if (percent <= 0 || percent >= 100) return `when it exceeds ${humanBytes(deps.maxBytes)}`
   const trigger = Math.floor((deps.maxBytes * percent) / 100)
   return `at ${percent}% (${humanBytes(trigger)}) of the ${humanBytes(deps.maxBytes)} cap`
+}
+
+/**
+ * 把工具参数统一成「待删除路径列表」。
+ *
+ * 接受 `path`（单个）或 `paths`（数组），两者互斥。为什么不做「两者都给就合并」：
+ * 那会让调用方以为可以随便混用，实际行为取决于顺序，是模糊语义。明确二选一，
+ * 出错时给出清楚的提示，比"聪明地合并"更可靠。
+ *
+ * @param args 工具原始参数。
+ * @returns 路径列表，或一条错误信息。
+ */
+function normaliseDeleteTargets(args: Record<string, unknown>): { paths: string[]; error?: undefined } | { paths?: undefined; error: string } {
+  const single = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
+  const list = Array.isArray(args.paths)
+    ? args.paths.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
+    : undefined
+
+  if (single !== undefined && list !== undefined && list.length > 0) {
+    return { error: 'pass either `path` (one item) or `paths` (several), not both' }
+  }
+  if (single !== undefined) return { paths: [single] }
+  if (list !== undefined && list.length > 0) {
+    // 去重：同一个路径传两次会让第二个变成 "not found"，是噪音而不是错误。
+    return { paths: [...new Set(list)] }
+  }
+  return { error: 'pass `path` (one item) or `paths` (an array of items)' }
+}
+
+/**
+ * 批量删除：**一次审批覆盖整批**，逐条执行，汇总结果。
+ *
+ * ## 为什么合并审批
+ *
+ * 每删除一个文件弹一次确认，删 20 个就要点 20 次 —— 用户会开始无脑点"允许"，
+ * 确认就失去了意义。合并成一次、并在文案里写清"共 N 项、合计 X 字节、其中哪些
+ * 需要你确认"，人才能真正判断。
+ *
+ * ## 逐条执行而不是打包
+ *
+ * 每条独立走 `deletePath`，所以：单条失败不影响其他条；每条都有自己的审计记录；
+ * 单条的保护区/安全区自检照常生效。批量的意义是省调用次数与确认次数，不是绕过检查。
+ *
+ * @param paths 待删除路径。
+ * @param base 公共请求参数（preview / reason）。
+ * @param ctx 删除上下文；审批调用会被替换成"合并版"。
+ * @returns 工具结果。
+ */
+async function deleteMany(
+  paths: string[],
+  base: Pick<DeleteRequest, 'preview' | 'reason'>,
+  ctx: DeleteContext,
+): Promise<{ ok: boolean; text: string; error?: string }> {
+  // 1. 先给每一条做描述与门禁判定（只读，不动任何东西）。
+  interface Plan {
+    target: string
+    description: ReturnType<typeof describeTarget>
+    gate: ReturnType<typeof decideGate>
+  }
+  const plans: Plan[] = []
+  const immediatelyRejected: Array<{ target: string; error: string }> = []
+
+  for (const target of paths) {
+    const resolved = path.resolve(target)
+    if (!existsSync(resolved)) {
+      immediatelyRejected.push({ target: resolved, error: 'not found' })
+      continue
+    }
+    const description = describeTarget(resolved)
+    plans.push({ target: resolved, description, gate: decideGate(resolved, description, ctx) })
+  }
+
+  // 2. 预览：只列出会移动什么、哪些需要确认。
+  if (base.preview === true) {
+    const lines: string[] = [`PREVIEW (nothing moved): ${plans.length} item(s)`]
+    let totalBytes = 0
+    for (const plan of plans) {
+      totalBytes += plan.description.bytes
+      const size = plan.description.isDirectory
+        ? `dir, ${plan.description.fileCount} entries, ${humanBytes(plan.description.bytes)}`
+        : `file, ${humanBytes(plan.description.bytes)}`
+      const needs = plan.gate.needsApproval ? ` — needs your OK (${plan.gate.reasons.join('; ')})` : ''
+      lines.push(`  ${plan.target}  [${size}]${needs}`)
+    }
+    if (immediatelyRejected.length > 0) {
+      lines.push('', `Skipped (${immediatelyRejected.length}):`)
+      for (const item of immediatelyRejected) lines.push(`  ${item.target} — ${item.error}`)
+    }
+    const needing = plans.filter((p) => p.gate.needsApproval).length
+    lines.push(
+      '',
+      `total: ${humanBytes(totalBytes)}${needing > 0 ? `; ${needing} item(s) would need one confirmation` : ''}`,
+    )
+    return { ok: true, text: lines.join('\n') }
+  }
+
+  // 3. 需要确认的项：合并成**一次**审批。
+  const needing = plans.filter((p) => p.gate.needsApproval)
+  if (needing.length > 0) {
+    const totalBytes = needing.reduce((sum, p) => sum + p.description.bytes, 0)
+    const totalFiles = needing.reduce((sum, p) => sum + p.description.fileCount, 0)
+    const reasons = [...new Set(needing.flatMap((p) => p.gate.reasons))]
+    const sample = needing.slice(0, 5).map((p) => p.target)
+    const more = needing.length > sample.length ? `\n  …and ${needing.length - sample.length} more` : ''
+    const text =
+      `Delete ${needing.length} item(s) in one batch? ` +
+      `Total ${totalFiles} entries, ${humanBytes(totalBytes)}.\n` +
+      `Why this needs your OK: ${reasons.join('; ')}.\n` +
+      `Items:\n  ${sample.join('\n  ')}${more}\n\n` +
+      `Approving covers the whole batch. Everything goes into the safe zone and can be restored ` +
+      `with safe_zone_restore for ${ctx.retentionDays} day(s).`
+
+    const outcome = await ctx.requestApproval(text)
+    if (outcome !== 'allowed-once') {
+      return {
+        ok: false,
+        text: '',
+        error:
+          `batch delete of ${needing.length} item(s) was not approved (${outcome}); nothing was moved. ` +
+          'Ask the user how they want to proceed.',
+      }
+    }
+  }
+
+  // 4. 逐条执行。审批已在上一步覆盖整批，所以这里不再逐条问。
+  const moved: string[] = []
+  const failed: Array<{ target: string; error: string }> = [...immediatelyRejected]
+  const alreadyApprovedCtx: DeleteContext = {
+    ...ctx,
+    // 已经合并审批过；逐条再问会变成"确认 N 次"，正是要避免的。
+    requestApproval: async () => 'allowed-once',
+  }
+
+  for (const plan of plans) {
+    const result = await deletePath({ ...base, path: plan.target }, alreadyApprovedCtx)
+    if (result.ok && result.kind === 'moved') {
+      moved.push(`${plan.target}  →  id ${result.entry.id}`)
+    } else if (!result.ok) {
+      failed.push({ target: plan.target, error: result.error })
+    }
+  }
+
+  const lines: string[] = [`Deleted ${moved.length} of ${paths.length} item(s) into the safe zone:`]
+  lines.push(...moved.map((m) => `  ${m}`))
+  if (failed.length > 0) {
+    lines.push('', `Failed (${failed.length}) — these were NOT moved:`)
+    lines.push(...failed.map((f) => `  ${f.target} — ${f.error}`))
+  }
+  lines.push('', `Restorable with safe_zone_restore for ${ctx.retentionDays} day(s).`)
+  return { ok: failed.length === 0, text: lines.join('\n') }
 }
 
 /** 创建全部工具。 */
@@ -260,11 +426,24 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   const safeDelete = makeTool({
     name: 'safe_delete',
     description:
-      'Delete a file or directory the safe way: it is moved into the safe zone (restorable via safe_zone_restore) instead of being erased. ' +
+      'Delete files or directories the safe way: they are moved into the safe zone (restorable via safe_zone_restore) instead of being erased. ' +
+      'Pass `paths` (an array) to delete several in ONE call — this is strongly preferred over calling the tool once per file: fewer round-trips, ' +
+      'and a batch needs only a single user approval instead of one per item. ' +
       'Dangerous paths (the OS home directory, plugin sources, profile manifests, node_modules) require the user to approve in the UI; ordinary workspace files move without asking. ' +
       'Run with preview:true first to see exactly what would be moved. This is the ONLY sanctioned way to delete in DSH — raw shell deletes are blocked.',
     parameters: {
-      path: { type: 'string', required: true, description: 'Absolute path of the file or directory to delete.' },
+      path: {
+        type: 'string',
+        description:
+          'Absolute path of the single file or directory to delete. Use this OR `paths`, not both.',
+      },
+      paths: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Absolute paths of several files/directories to delete in one call. Preferred when removing more than one ' +
+          'item: one approval covers the whole batch. Use this OR `path`, not both.',
+      },
       preview: { type: 'boolean', description: 'Only describe what would be moved; change nothing.' },
       reason: { type: 'string', description: 'Why this is being deleted (recorded in the safe zone and the audit trail).' },
       force: {
@@ -274,29 +453,36 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     },
     beforeExecute: pruneIfDue,
     async execute(args) {
-      const result = await deletePath(
-        {
-          path: String(args.path ?? ''),
-          preview: args.preview === true,
-          ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
-        },
-        {
-          stateDir: deps.stateDir,
-          env: deps.env,
-          retentionDays: deps.retentionDays,
-          confirmFileCount: deps.confirmFileCount ?? 0,
-          confirmBytes: deps.confirmBytes ?? 0,
-          ...(deps.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
-          requestApproval: deps.requestApproval,
-          now,
-          afterMove: () => pruneNow(),
-        },
-      )
+      const targets = normaliseDeleteTargets(args)
+      if (targets.error !== undefined) return { ok: false, text: '', error: targets.error }
 
-      if (!result.ok) return { ok: false, text: '', error: result.error }
-      return result.kind === 'preview'
-        ? { ok: true, text: describePreview(result, deps.retentionDays) }
-        : { ok: true, text: describeMoved(result, deps.retentionDays) }
+      const deleteCtx = {
+        stateDir: deps.stateDir,
+        env: deps.env,
+        retentionDays: deps.retentionDays,
+        confirmFileCount: deps.confirmFileCount ?? 0,
+        confirmBytes: deps.confirmBytes ?? 0,
+        ...(deps.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+        requestApproval: deps.requestApproval,
+        now,
+        afterMove: () => pruneNow(),
+      }
+      const base = {
+        preview: args.preview === true,
+        ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
+      }
+
+      // 单路径：保持原有行为不变。
+      if (targets.paths.length === 1) {
+        const result = await deletePath({ ...base, path: targets.paths[0] as string }, deleteCtx)
+        if (!result.ok) return { ok: false, text: '', error: result.error }
+        return result.kind === 'preview'
+          ? { ok: true, text: describePreview(result, deps.retentionDays) }
+          : { ok: true, text: describeMoved(result, deps.retentionDays) }
+      }
+
+      // 多路径：合并成一次审批，逐条执行，汇总结果。
+      return deleteMany(targets.paths, base, deleteCtx)
     },
   })
 
