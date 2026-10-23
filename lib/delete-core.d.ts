@@ -20,6 +20,23 @@ export interface DeleteContext {
   /** 单次删除的字节数阈值；`0` 表示关闭。 */
   confirmBytes: number;
   /**
+   * 安全区容量上限（字节）。用于**删除前预告**「这一删会不会把安全区撑爆」。
+   *
+   * 为什么需要：安全区满了时，`afterMove` 的清理会把**刚删进去的条目**立刻踢进
+   * 回收站 —— 而删除输出仍写着「7 天可恢复」。承诺与实际不符。有了这个值，
+   * 就能在动手之前告诉用户真实后果。
+   *
+   * `undefined` 表示不做这项判定（旧调用方/测试未提供时保持原行为）。
+   */
+  safeZoneCapBytes?: number;
+  /**
+   * 当前安全区已占用的字节数（异步读取，因为要列目录）。
+   *
+   * 抽成回调而不是传数值：`deletePath` 只在需要时才读一次，避免每次删除都
+   * 列一遍安全区目录。
+   */
+  readSafeZoneUsageBytes?: () => Promise<number>;
+  /**
    * 跨卷时是否允许「复制 + 删源」。
    *
    * 必须从配置透传到 `moveToSafeZone`：不透传的话，用户在配置里打开这个开关
@@ -71,9 +88,68 @@ export type DeleteResult = {
  */
 export declare function decideGate(target: string, description: TargetDescription, ctx: Pick<DeleteContext, 'env' | 'confirmFileCount' | 'confirmBytes'>): GateDecision;
 /**
+ * 一次删除的「空间后果」预估。
+ *
+ * 为什么需要它：安全区的容量上限只决定**何时清理**，不阻止删除。于是会出现两种
+ * 用户没预期的情况：
+ *
+ *   1. 删进去的条目超过上限 → 同一轮的 `afterMove` 立刻把它清到回收站，
+ *      但输出仍写着「7 天可恢复」；
+ *   2. 跨卷时（源在 D、安全区在 C）会**真实复制一份到 C 盘**，把系统盘吃掉
+ *      同等大小的空间，而"清理到回收站"只是同卷 rename，**并不会还回来**。
+ *
+ * 所以动手之前就要把这两件事说清楚。
+ */
+export interface SpaceForecast {
+  /** 删除后安全区的总占用（字节）。 */
+  afterBytes: number;
+  /** 安全区上限；`undefined` 表示未配置，不做判定。 */
+  capBytes?: number;
+  /** 这一删会不会把安全区撑过上限。 */
+  overCap: boolean;
+  /** 源与安全区是否真的在不同卷上（按盘符/挂载点判断，不看开关）。 */
+  crossesVolumes: boolean;
+  /** 跨卷时需要复制过去的字节数（同卷为 0，因为 rename 不占额外空间）。 */
+  copyBytes: number;
+  /** 安全区所在卷的剩余空间；`undefined` 表示取不到。 */
+  freeBytes?: number;
+  /** 跨卷复制会不会写不下。 */
+  copyWillNotFit: boolean;
+  /** 跨卷但没开 crossVolumeCopy —— 这次删除会被策略直接拒绝。 */
+  blockedByPolicy: boolean;
+}
+/**
+ * 估算这次删除的空间后果。
+ *
+ * 任何一项取不到（列目录失败、磁盘信息不可用）都**不阻断删除** —— 预估只是
+ * 用来提示，不是权限判定。宁可少提示一句，也不该因为读不到磁盘信息就拒绝删除。
+ *
+ * @param description 目标描述（大小）。
+ * @param ctx 删除上下文。
+ * @returns 预估结果。
+ */
+export declare function forecastSpace(description: TargetDescription, ctx: Pick<DeleteContext, 'stateDir' | 'safeZoneCapBytes' | 'readSafeZoneUsageBytes' | 'crossVolumeCopy'>, target: string): Promise<SpaceForecast>;
+/**
+ * 把空间预估写成给人看的风险说明。没有风险时返回空数组。
+ *
+ * @param forecast 预估结果。
+ * @param retentionDays 保留天数（用来说明"清理后还剩什么"）。
+ * @returns 风险条目，可能为空。
+ */
+export declare function describeSpaceRisks(forecast: SpaceForecast, retentionDays: number): string[];
+/**
  * 执行一次删除。
  *
  * 顺序即正确性：先证明目标存在且不是禁区，再描述，再（必要时）问人，最后才移动。
+ *
+ * ## 什么时候才问人
+ *
+ * 只在**真的有风险**时问，普通删除绝不打扰（频繁弹确认会训练用户无脑点允许，
+ * 反而更危险）。三个独立理由，任一命中问**一次**（不叠加问多次）：
+ *
+ *   1. 路径危险（家目录、profile 清单、node_modules…）
+ *   2. 这一单太大（条目数或字节数超阈值）
+ *   3. 空间后果异常：会把安全区撑过上限，或跨卷复制写不下
  */
 export declare function deletePath(request: DeleteRequest, ctx: DeleteContext): Promise<DeleteResult>;
 /**

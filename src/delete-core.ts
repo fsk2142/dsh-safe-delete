@@ -13,7 +13,7 @@
  * @module dsh-safe-delete/delete-core
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, statfsSync } from 'node:fs'
 import path from 'node:path'
 
 import { appendAudit } from './audit'
@@ -41,6 +41,23 @@ export interface DeleteContext {
   confirmFileCount: number
   /** 单次删除的字节数阈值；`0` 表示关闭。 */
   confirmBytes: number
+  /**
+   * 安全区容量上限（字节）。用于**删除前预告**「这一删会不会把安全区撑爆」。
+   *
+   * 为什么需要：安全区满了时，`afterMove` 的清理会把**刚删进去的条目**立刻踢进
+   * 回收站 —— 而删除输出仍写着「7 天可恢复」。承诺与实际不符。有了这个值，
+   * 就能在动手之前告诉用户真实后果。
+   *
+   * `undefined` 表示不做这项判定（旧调用方/测试未提供时保持原行为）。
+   */
+  safeZoneCapBytes?: number
+  /**
+   * 当前安全区已占用的字节数（异步读取，因为要列目录）。
+   *
+   * 抽成回调而不是传数值：`deletePath` 只在需要时才读一次，避免每次删除都
+   * 列一遍安全区目录。
+   */
+  readSafeZoneUsageBytes?: () => Promise<number>
   /**
    * 跨卷时是否允许「复制 + 删源」。
    *
@@ -123,9 +140,155 @@ export function decideGate(
 }
 
 /**
+ * 一次删除的「空间后果」预估。
+ *
+ * 为什么需要它：安全区的容量上限只决定**何时清理**，不阻止删除。于是会出现两种
+ * 用户没预期的情况：
+ *
+ *   1. 删进去的条目超过上限 → 同一轮的 `afterMove` 立刻把它清到回收站，
+ *      但输出仍写着「7 天可恢复」；
+ *   2. 跨卷时（源在 D、安全区在 C）会**真实复制一份到 C 盘**，把系统盘吃掉
+ *      同等大小的空间，而"清理到回收站"只是同卷 rename，**并不会还回来**。
+ *
+ * 所以动手之前就要把这两件事说清楚。
+ */
+export interface SpaceForecast {
+  /** 删除后安全区的总占用（字节）。 */
+  afterBytes: number
+  /** 安全区上限；`undefined` 表示未配置，不做判定。 */
+  capBytes?: number
+  /** 这一删会不会把安全区撑过上限。 */
+  overCap: boolean
+  /** 源与安全区是否真的在不同卷上（按盘符/挂载点判断，不看开关）。 */
+  crossesVolumes: boolean
+  /** 跨卷时需要复制过去的字节数（同卷为 0，因为 rename 不占额外空间）。 */
+  copyBytes: number
+  /** 安全区所在卷的剩余空间；`undefined` 表示取不到。 */
+  freeBytes?: number
+  /** 跨卷复制会不会写不下。 */
+  copyWillNotFit: boolean
+  /** 跨卷但没开 crossVolumeCopy —— 这次删除会被策略直接拒绝。 */
+  blockedByPolicy: boolean
+}
+
+/**
+ * 估算这次删除的空间后果。
+ *
+ * 任何一项取不到（列目录失败、磁盘信息不可用）都**不阻断删除** —— 预估只是
+ * 用来提示，不是权限判定。宁可少提示一句，也不该因为读不到磁盘信息就拒绝删除。
+ *
+ * @param description 目标描述（大小）。
+ * @param ctx 删除上下文。
+ * @returns 预估结果。
+ */
+export async function forecastSpace(
+  description: TargetDescription,
+  ctx: Pick<DeleteContext, 'stateDir' | 'safeZoneCapBytes' | 'readSafeZoneUsageBytes' | 'crossVolumeCopy'>,
+  target: string,
+): Promise<SpaceForecast> {
+  let used = 0
+  if (ctx.readSafeZoneUsageBytes !== undefined) {
+    try {
+      used = await ctx.readSafeZoneUsageBytes()
+    } catch {
+      /* 读不到就按 0 算：不因此阻断，只是少一次提示 */
+    }
+  }
+  const afterBytes = used + description.bytes
+  const capBytes = ctx.safeZoneCapBytes !== undefined && ctx.safeZoneCapBytes > 0 ? ctx.safeZoneCapBytes : undefined
+  const overCap = capBytes !== undefined && afterBytes > capBytes
+
+  /*
+   * 是否**真的**跨卷，要按两个路径的卷根判断，而不是看 `crossVolumeCopy` 开关。
+   *
+   * 开关只表示"允许在需要时复制"，不表示这次就需要：源和安全区同盘时，
+   * 即使开关打开也是 rename，一个字节都不复制。按开关判断会误报
+   * "将占用 X GB"，而实际根本没占用 —— 假警报比不报更糟。
+   */
+  const sourceRoot = path.parse(path.resolve(target)).root.toLowerCase()
+  const stateRoot = path.parse(path.resolve(ctx.stateDir)).root.toLowerCase()
+  const crossesVolumes = sourceRoot !== stateRoot
+
+  const copyBytes = crossesVolumes ? description.bytes : 0
+  let freeBytes: number | undefined
+  if (crossesVolumes) {
+    try {
+      const stat = statfsSync(path.resolve(ctx.stateDir))
+      freeBytes = stat.bavail * stat.bsize
+    } catch {
+      /* statfs 在某些文件系统/平台不可用，取不到就当作未知 */
+    }
+  }
+  const copyWillNotFit = copyBytes > 0 && freeBytes !== undefined && copyBytes > freeBytes
+
+  return {
+    afterBytes,
+    ...(capBytes === undefined ? {} : { capBytes }),
+    overCap,
+    crossesVolumes,
+    copyBytes,
+    ...(freeBytes === undefined ? {} : { freeBytes }),
+    copyWillNotFit,
+    /** 跨盘但用户没开 crossVolumeCopy：这次删除会被直接拒绝。 */
+    blockedByPolicy: crossesVolumes && ctx.crossVolumeCopy !== true,
+  }
+}
+
+/**
+ * 把空间预估写成给人看的风险说明。没有风险时返回空数组。
+ *
+ * @param forecast 预估结果。
+ * @param retentionDays 保留天数（用来说明"清理后还剩什么"）。
+ * @returns 风险条目，可能为空。
+ */
+export function describeSpaceRisks(forecast: SpaceForecast, retentionDays: number): string[] {
+  const risks: string[] = []
+  if (forecast.overCap) {
+    const cap = forecast.capBytes === undefined ? 'the cap' : humanBytes(forecast.capBytes)
+    risks.push(
+      `the safe zone will be over its ${cap} cap after this (${humanBytes(forecast.afterBytes)}), ` +
+        `so older entries — possibly this one — will be moved into the system recycle bin immediately. ` +
+        `The "${retentionDays}-day restore window" would not apply to them.`,
+    )
+  }
+  if (forecast.copyWillNotFit) {
+    const free = forecast.freeBytes === undefined ? 'less than needed' : humanBytes(forecast.freeBytes)
+    risks.push(
+      `this crosses volumes, so ${humanBytes(forecast.copyBytes)} will be copied onto the safe zone's disk ` +
+        `(only ${free} free). Move the safe zone to the source volume, or free space first.`,
+    )
+  } else if (forecast.copyBytes > 0) {
+    // 不会写不下，但也要告诉用户"这会占目标盘空间" —— 清理到回收站并不会还回来。
+    risks.push(
+      `this crosses volumes, so ${humanBytes(forecast.copyBytes)} will be copied onto the safe zone's disk ` +
+        `and stays there until the entry expires. Pruning to the recycle bin does not free it (same-volume rename).`,
+    )
+  }
+  if (forecast.blockedByPolicy) {
+    // 跨盘且未开 crossVolumeCopy：moveToSafeZone 会直接抛 EXDEV。
+    // 与其让用户撞到一条报错，不如在确认卡里就说清两条出路。
+    risks.push(
+      'this crosses volumes and crossVolumeCopy is off, so the move will be refused. ' +
+        'Either move the safe zone onto the source volume, or enable crossVolumeCopy to accept a real copy.',
+    )
+  }
+  return risks
+}
+
+
+/**
  * 执行一次删除。
  *
  * 顺序即正确性：先证明目标存在且不是禁区，再描述，再（必要时）问人，最后才移动。
+ *
+ * ## 什么时候才问人
+ *
+ * 只在**真的有风险**时问，普通删除绝不打扰（频繁弹确认会训练用户无脑点允许，
+ * 反而更危险）。三个独立理由，任一命中问**一次**（不叠加问多次）：
+ *
+ *   1. 路径危险（家目录、profile 清单、node_modules…）
+ *   2. 这一单太大（条目数或字节数超阈值）
+ *   3. 空间后果异常：会把安全区撑过上限，或跨卷复制写不下
  */
 export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Promise<DeleteResult> {
   const raw = request.path ?? ''
@@ -152,15 +315,59 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     return { ok: true, kind: 'preview', target, description, gate }
   }
 
-  // 5. 需要人确认时问一次。
-  if (gate.needsApproval) {
-    const outcome = await ctx.requestApproval(describeApprovalRequest(target, description, gate, ctx.retentionDays))
+  /*
+   * 5. 空间后果评估。
+   *
+   * 单盘和多盘各有一次"承诺与实际不符"的机会：
+   *
+   *   - 安全区放不下：条目进去后立刻被容量清理踢进回收站，但输出仍写
+   *     「7 天可恢复」；
+   *   - 跨盘复制：源在 D、安全区在 C 时会真的复制一份到 C，把系统盘吃掉；
+   *     而清理到回收站只是同卷 rename，不会还回来。
+   *
+   * 关键设计：**不为此额外弹一次审批**。它只并入下面那一次确认，
+   * 或者在没有其它风险时也不打扰 —— 用户明确要求"除非超限或有预警，别随时弹"。
+   */
+  const forecast = await forecastSpace(
+    description,
+    {
+      stateDir: ctx.stateDir,
+      ...(ctx.safeZoneCapBytes === undefined ? {} : { safeZoneCapBytes: ctx.safeZoneCapBytes }),
+      ...(ctx.readSafeZoneUsageBytes === undefined ? {} : { readSafeZoneUsageBytes: ctx.readSafeZoneUsageBytes }),
+      ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+    },
+    target,
+  )
+  const risks = describeSpaceRisks(forecast, ctx.retentionDays)
+
+  /*
+   * 只有"目标盘真的放不下"才**拒绝**；其余风险只是告知，随确认卡一起给出。
+   *
+   * 判断必须用结构化字段（`forecast.copyWillNotFit`），不能去匹配文案里的
+   * 关键词 —— 那会在改一句话之后悄悄失效。
+   */
+  if (forecast.copyWillNotFit) {
+    const free = forecast.freeBytes === undefined ? 'less than needed' : humanBytes(forecast.freeBytes)
+    return {
+      ok: false,
+      target,
+      error:
+        `not enough free space on the safe zone's volume: need ${humanBytes(forecast.copyBytes)}, ` +
+        `only ${free} free. Move the safe zone onto the source volume, or free space first`,
+    }
+  }
+
+  // 6. 需要人确认时问一次（危险路径 / 超阈值 / 空间风险，合并成一次）。
+  if (gate.needsApproval || risks.length > 0) {
+    const base = describeApprovalRequest(target, description, gate, ctx.retentionDays)
+    const text = risks.length === 0 ? base : `${base}\n\nSpace warning:\n- ${risks.join('\n- ')}`
+    const outcome = await ctx.requestApproval(text)
     if (outcome !== 'allowed-once') {
       return { ok: false, target, error: approvalFailureText(outcome, target) }
     }
   }
 
-  // 6. 移入安全区。
+  // 7. 移入安全区。
   const entry = await moveToSafeZone(ctx.stateDir, target, {
     retentionDays: ctx.retentionDays,
     now: ctx.now(),

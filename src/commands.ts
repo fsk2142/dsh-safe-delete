@@ -62,10 +62,11 @@ const HELP = `安全删除 —— 把删除变成可撤销的操作
   /safe-delete clean               立即清理安全区（过期与超容量部分）
   /safe-delete clean --dry-run     只报告会清理什么，不动手
   /safe-delete config              查看所有可配置项、当前值、含义与范围
-  /safe-delete config <项> <值>     修改一项配置（例如 config maxBytes 30GB）
+  /safe-delete config <项> <值>     修改一项配置（例如 config confirmBytes 512MB）
   /safe-delete status              安全区概况
 
-提示：这里的删除**不是永久删除** —— 东西会进安全区，保留期内随时能取回。`
+提示：这里的删除**不是永久删除** —— 东西先进安全区（默认 1 天），到期后移入
+系统回收站，你仍能在那里取回，直到自己清空回收站。`
 
 /**
  * 渲染配置清单。
@@ -88,9 +89,8 @@ export function renderConfigList(
     lines.push('')
   }
   lines.push('示例：')
-  lines.push('  /safe-delete config maxBytes 30GB       安全区上限改成 30 GB')
-  lines.push('  /safe-delete config pruneAtPercent 80   用到 80% 就开始提前清理')
   lines.push('  /safe-delete config confirmBytes 512MB  超过 512 MB 的删除要确认')
+  lines.push('  /safe-delete config confirmFileCount 100 超过 100 条的删除要确认')
   return lines.join('\n')
 }
 

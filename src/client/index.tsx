@@ -63,37 +63,17 @@ const GIGABYTE = 1024 * 1024 * 1024
 /**
  * 表单字段。
  *
- * 刻意只放**用户真正会调**的项：`stateDir`、`blockShellDeletes` 这类要么改动风险高
- * （换目录会让现有安全区「消失」）、要么属于核心安全语义（关掉拦截），不放进表单。
+ * ## 只剩两项：都是「单次删除要不要额外确认」的阈值
+ *
+ * 容量相关的三个参数（`maxBytes` / `pruneAtPercent` / `autoPruneIntervalMs`）
+ * 已经**从产品和配置里移除**：安全区只按保留期（固定 1 天）清理，到点把条目交给
+ * 系统回收站。不留容量管理，语义才可预测——删进去的东西不会因为"超上限"被立刻
+ * 推走，而界面却还说能恢复。
+ *
+ * `stateDir`、`blockShellDeletes` 这类也不放表单：前者改动风险高（换目录等于让
+ * 现有安全区「消失」），后者属于核心安全语义（关掉拦截）。
  */
 const FIELDS: FieldSpec[] = [
-  {
-    key: 'maxBytes',
-    label: '最大安全区容量',
-    hint: '超过这个大小就开始清理最旧的条目。最少 1 GB。',
-    kind: 'bytes',
-    min: 1,
-    fallback: 20 * GIGABYTE,
-  },
-  {
-    key: 'pruneAtPercent',
-    label: '提前清理阈值',
-    hint: '占用达到该百分比就开始清理，为新删除腾出空间。0 表示只在超过容量上限时才清。取值 0–100。',
-    kind: 'percent',
-    min: 0,
-    max: 100,
-    fallback: 90,
-  },
-  {
-    key: 'autoPruneIntervalMs',
-    label: '定时清理间隔',
-    hint: '每次工具调用时顺路检查，超过这个间隔才真正清理一次。最少 1 分钟，最多 30 天。',
-    kind: 'duration',
-    min: 60 * 1000,
-    // 上限必须有：否则能填 9999 天，等于永久不清理，而配置看起来"设过了"。
-    max: 30 * 24 * 60 * 60 * 1000,
-    fallback: 60 * 60 * 1000,
-  },
   {
     key: 'confirmFileCount',
     label: '单次删除条目数确认',

@@ -22,7 +22,6 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
     requestApproval: async () => 'allowed-once',
     retentionDays: 7,
-    maxBytes: 20 * 1024 ** 3,
     ...over,
   }
 }
@@ -149,10 +148,13 @@ describe('safe_zone_list', () => {
 })
 
 describe('safe_zone_status', () => {
-  it('reports the retention window and the byte cap', async () => {
+  it('reports the retention window and says there is no capacity cap', async () => {
     const result = await toolOf(createTools(deps()), 'safe_zone_status').execute({})
-    expect(result.text).toMatch(/7/)
-    expect(result.text).toMatch(/20/)
+    // 保留期来自 deps（测试里是 7 天）；容量上限已从产品移除。
+    expect(result.text).toMatch(/retention: 7d/)
+    expect(result.text).toContain('no capacity cap')
+    // 必须说清"清理只在工具调用时发生"，否则保留期会被误解成准点。
+    expect(result.text).toContain('only when a safe_zone_* tool is called')
   })
 })
 

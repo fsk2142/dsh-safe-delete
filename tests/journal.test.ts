@@ -15,7 +15,6 @@ function deps(): ToolDeps {
     env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
     requestApproval: async () => 'allowed-once',
     retentionDays: 7,
-    maxBytes: 20 * 1024 ** 3,
   }
 }
 

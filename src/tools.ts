@@ -75,8 +75,11 @@ export interface ToolDeps {
   /** 请求用户授权；无审批通道时返回 `'unavailable'`。 */
   requestApproval: (reason: string) => Promise<ApprovalOutcome>
   retentionDays: number
-  maxBytes: number
-  /** 是否自动按时间/容量清理。 */
+  /**
+   * 是否按保留期自动清理（默认 true）。
+   *
+   * 关掉后安全区只增不减，需要手动清理。
+   */
   autoPrune?: boolean
   /**
    * 单次删除的条目数阈值：超过就额外要一次人工确认。
@@ -100,21 +103,6 @@ export interface ToolDeps {
    * 生产路径不传，默认走 `moveToSystemRecycleBin`。
    */
   recycler?: Recycler
-  /**
-   * 提前清理阈值（0-100）。
-   *
-   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
-   * `0` 表示只在超过 `maxBytes` 时才清。
-   */
-  pruneAtPercent?: number
-  /**
-   * 自动清理的检查间隔（毫秒）。默认 1 小时。
-   *
-   * 为什么需要它：原先清理只在"执行一次安全删除"时顺带发生 —— 长期不删东西，
-   * 安全区就永远不会被清理，过期条目会一直占着盘。现在每次工具调用都会看一眼
-   * 距上次清理有多久，超过间隔才真正跑一次。
-   */
-  autoPruneIntervalMs?: number
   /** 当前时间（测试可注入）。 */
   now?: () => number
 }
@@ -183,16 +171,6 @@ function makeTool(spec: {
   }
 }
 
-/** 人类可读的时长。 */
-function describeInterval(ms: number): string {
-  if (ms <= 0) return 'every call'
-  const minutes = ms / 60000
-  if (minutes < 60) return `${Math.round(minutes)} min`
-  const hours = minutes / 60
-  if (hours < 24) return `${hours % 1 === 0 ? hours : hours.toFixed(1)} h`
-  return `${(hours / 24).toFixed(1)} days`
-}
-
 /** 描述单次删除的确认阈值。 */
 function describeThresholds(deps: ToolDeps): string {
   const count = deps.confirmFileCount ?? 0
@@ -202,14 +180,6 @@ function describeThresholds(deps: ToolDeps): string {
   if (count > 0) parts.push(`${count} entries`)
   if (bytes > 0) parts.push(humanBytes(bytes))
   return parts.join(' or ')
-}
-
-/** 描述清理的触发点。 */
-function describePruneTrigger(deps: ToolDeps): string {
-  const percent = deps.pruneAtPercent ?? 0
-  if (percent <= 0 || percent >= 100) return `when it exceeds ${humanBytes(deps.maxBytes)}`
-  const trigger = Math.floor((deps.maxBytes * percent) / 100)
-  return `at ${percent}% (${humanBytes(trigger)}) of the ${humanBytes(deps.maxBytes)} cap`
 }
 
 /**
@@ -222,7 +192,7 @@ function describePruneTrigger(deps: ToolDeps): string {
  * @param args 工具原始参数。
  * @returns 路径列表，或一条错误信息。
  */
-function normaliseDeleteTargets(args: Record<string, unknown>): { paths: string[]; error?: undefined } | { paths?: undefined; error: string } {
+export function normaliseDeleteTargets(args: Record<string, unknown>): { paths: string[]; error?: undefined } | { paths?: undefined; error: string } {
   const single = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
   const list = Array.isArray(args.paths)
     ? args.paths.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
@@ -381,7 +351,6 @@ async function deleteMany(
 /** 创建全部工具。 */
 export function createTools(deps: ToolDeps): ToolDefinition[] {
   const now = deps.now ?? (() => Date.now())
-  const pruneIntervalMs = deps.autoPruneIntervalMs !== undefined && deps.autoPruneIntervalMs > 0 ? deps.autoPruneIntervalMs : 60 * 60 * 1000
 
   /** 上次真正跑清理的时间；`null` 表示本进程还没跑过。 */
   let lastPruneAt: number | null = null
@@ -390,11 +359,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   const pruneNow = async (): Promise<TrashEntry[]> => {
     if (deps.autoPrune === false) return []
     const entries = await listSafeZone(deps.stateDir)
-    const selected = selectForPrune(entries, {
-      now: now(),
-      maxBytes: deps.maxBytes,
-      ...(deps.pruneAtPercent !== undefined ? { pruneAtPercent: deps.pruneAtPercent } : {}),
-    })
+    // 只看保留期：没有容量层，没有百分比阈值。
+    const selected = selectForPrune(entries, { now: now() })
     const removed: TrashEntry[] = []
     for (const entry of selected) {
       // 移入系统回收站；失败则**保留**该条目并记录原因。
@@ -429,8 +395,13 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
    */
   const pruneIfDue = async (): Promise<void> => {
     if (deps.autoPrune === false) return
+    // 间隔参数已移除：现在每次工具调用都检查一次。
+    //
+    // 为什么不保留间隔：容量层去掉后，清理只是"扫一遍索引，挑出过期的"，
+    // 开销从"可能搬上千个文件"降到"读一个 JSON"。再为此维护一个计时器
+    // 和它的持久化，反而更复杂。
     const at = now()
-    if (lastPruneAt !== null && at - lastPruneAt < pruneIntervalMs) return
+    if (lastPruneAt !== null && at - lastPruneAt < 1000) return
     lastPruneAt = at
     try {
       await pruneNow()
@@ -472,6 +443,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         confirmFileCount: deps.confirmFileCount ?? 0,
         confirmBytes: deps.confirmBytes ?? 0,
         ...(deps.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+        // 容量上限已移除，预告只剩"跨盘复制会不会写不下"这一项。
+        // 不传 safeZoneCapBytes，forecastSpace 就不会做超容量判定。
         requestApproval: deps.requestApproval,
         now,
         afterMove: () => pruneNow(),
@@ -564,9 +537,17 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         ok: true,
         text: [
           `dir: ${deps.stateDir}`,
-          `entries: ${entries.length}  size: ${humanBytes(total)} / ${humanBytes(deps.maxBytes)}`,
-          `retention: ${deps.retentionDays}d`,
-          `auto prune: ${deps.autoPrune === false ? 'off' : `${describeInterval(pruneIntervalMs)}, ${describePruneTrigger(deps)}`}`,
+          `entries: ${entries.length}  size: ${humanBytes(total)}`,
+          `retention: ${deps.retentionDays}d (time-only, no capacity cap)`,
+          `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : 'on'}`,
+          /*
+           * 明确写出"什么时候才会真的清理"。
+           *
+           * 没有常驻定时器是刻意取舍（避免插件在 DSH 空闲时保有生命周期），
+           * 代价是清理**不保证准点**：保留期到了，也要等下一次工具调用才动。
+           * 不说清楚，用户会以为"1 天后自动进回收站"是准点的。
+           */
+          `prune runs: only when a safe_zone_* tool is called (no background timer)`,
           // 清理去哪是用户最该知道的一点：进回收站（可还原）还是永久删。
           `prune to: ${canRecycle() ? 'system recycle bin (restorable)' : `NOT SUPPORTED on ${process.platform} — entries stay put`}`,
           `confirm over: ${describeThresholds(deps)}`,

@@ -9,21 +9,33 @@ import z from "@deepseek-ai/schemastery";
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
   /** 安全区状态目录。 */
   stateDir: z<string, string, "defined">;
-  /** 保留天数。 */
-  retentionDays: z<number, number, "volatile-defined">;
-  /** 容量上限（字节）。 */
-  maxBytes: z<number, number, "volatile-defined">;
   /**
-   * 占用达到该百分比时就开始清理，为新的删除腾出空间。
+   * 保留天数：**固定 1 天**，不暴露给界面，也不建议改。
    *
-   * 与 `maxBytes` 的区别：`maxBytes` 是硬上限（超过了才清），这个比例是**提前量**。
-   * 设为 90 表示用到 18 GB（20 GB 的 90%）就开始清最旧的条目，而不是等撑满。
-   * 设为 0 表示只在超过硬上限时才清。
+   * ## 为什么是 1 天且不给改
+   *
+   * 安全区的定位是"删除后的短暂缓冲"——防的是「刚删就后悔」。过了这个窗口，
+   * 东西会被移入**系统回收站**（不是永久删除），用户仍能在那里取回，直到自己
+   * 清空回收站为止。
+   *
+   * 既然第二层（回收站）已经兜住了长期的后悔，安全区再留很久的意义就不大了：
+   *   - 留 7 天会让安全区体积增长 7 倍；
+   *   - 两个"冷藏室"叠在一起，用户反而不知道该去哪个找。
+   *
+   * 所以固定 1 天，也从表单里移除了这个字段——少一个参数要理解。
+   *
+   * ## 仍然保留为配置项的原因
+   *
+   * 不是为了给用户调，而是为了**测试可以注入不同值**（验证过期边界），
+   * 以及万一有人确实需要更长的窗口时改配置文件仍能达到。
    */
-  pruneAtPercent: z<number, number, "volatile-defined">;
-  /** 自动清理的检查间隔（毫秒）。 */
-  autoPruneIntervalMs: z<number, number, "volatile-defined">;
-  /** 是否自动清理。 */
+  retentionDays: z<number, number, "defined">;
+  /**
+   * 是否按保留期自动清理。
+   *
+   * 关掉后安全区只增不减，需要手动清理 —— 极端情况下想要"永不自动动手"时用。
+   * 默认开。
+   */
   autoPrune: z<boolean, boolean, "volatile-defined">;
   /** 单次删除的条目数阈值；超过就额外确认一次。0 表示不启用。 */
   confirmFileCount: z<number, number, "volatile-defined">;
@@ -63,21 +75,33 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
 }>>, Schemastery.ObjectT<NoInfer<{
   /** 安全区状态目录。 */
   stateDir: z<string, string, "defined">;
-  /** 保留天数。 */
-  retentionDays: z<number, number, "volatile-defined">;
-  /** 容量上限（字节）。 */
-  maxBytes: z<number, number, "volatile-defined">;
   /**
-   * 占用达到该百分比时就开始清理，为新的删除腾出空间。
+   * 保留天数：**固定 1 天**，不暴露给界面，也不建议改。
    *
-   * 与 `maxBytes` 的区别：`maxBytes` 是硬上限（超过了才清），这个比例是**提前量**。
-   * 设为 90 表示用到 18 GB（20 GB 的 90%）就开始清最旧的条目，而不是等撑满。
-   * 设为 0 表示只在超过硬上限时才清。
+   * ## 为什么是 1 天且不给改
+   *
+   * 安全区的定位是"删除后的短暂缓冲"——防的是「刚删就后悔」。过了这个窗口，
+   * 东西会被移入**系统回收站**（不是永久删除），用户仍能在那里取回，直到自己
+   * 清空回收站为止。
+   *
+   * 既然第二层（回收站）已经兜住了长期的后悔，安全区再留很久的意义就不大了：
+   *   - 留 7 天会让安全区体积增长 7 倍；
+   *   - 两个"冷藏室"叠在一起，用户反而不知道该去哪个找。
+   *
+   * 所以固定 1 天，也从表单里移除了这个字段——少一个参数要理解。
+   *
+   * ## 仍然保留为配置项的原因
+   *
+   * 不是为了给用户调，而是为了**测试可以注入不同值**（验证过期边界），
+   * 以及万一有人确实需要更长的窗口时改配置文件仍能达到。
    */
-  pruneAtPercent: z<number, number, "volatile-defined">;
-  /** 自动清理的检查间隔（毫秒）。 */
-  autoPruneIntervalMs: z<number, number, "volatile-defined">;
-  /** 是否自动清理。 */
+  retentionDays: z<number, number, "defined">;
+  /**
+   * 是否按保留期自动清理。
+   *
+   * 关掉后安全区只增不减，需要手动清理 —— 极端情况下想要"永不自动动手"时用。
+   * 默认开。
+   */
   autoPrune: z<boolean, boolean, "volatile-defined">;
   /** 单次删除的条目数阈值；超过就额外确认一次。0 表示不启用。 */
   confirmFileCount: z<number, number, "volatile-defined">;
@@ -142,27 +166,15 @@ export declare const inject: string[];
 export interface SafeDeleteConfig {
   /** 安全区状态目录；默认 `<DSH_HOME>/.dsh-safe-delete`。 */
   stateDir?: string;
-  /** 保留天数；默认 7。 */
+  /**
+   * 保留天数；默认 1。
+   *
+   * 安全区只是「刚删就后悔」的短暂缓冲：到期后条目被移入**系统回收站**
+   * （不是永久删除），用户仍能在那里取回，直到自己清空。
+   */
   retentionDays?: number;
-  /** 容量上限（字节）；默认 20 GB（`21474836480`）。 */
-  maxBytes?: number;
-  /**
-   * 自动清理的检查间隔（毫秒）；默认 1 小时（`3600000`）。
-   *
-   * 每次工具调用都会看一眼距上次清理多久，超过这个间隔才真正跑一次。
-   * 设为 `0` 表示沿用默认值。
-   */
-  autoPruneIntervalMs?: number;
-  /** 是否自动清理；默认 true。关掉后只剩手动清理。 */
+  /** 是否按保留期自动清理；默认 true。关掉后只剩手动清理。 */
   autoPrune?: boolean;
-  /**
-   * 提前清理阈值（0-100）；默认 90。
-   *
-   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
-   * 例如上限 20 GB、阈值 90 → 用到 18 GB 就动手，而不是等撑满。
-   * 设为 `0` 或 `>= 100` 表示只在超过 `maxBytes` 本身时才清。
-   */
-  pruneAtPercent?: number;
   /**
    * 单次删除的条目数阈值；超过就额外要一次人工确认。默认 `5000`。
    *

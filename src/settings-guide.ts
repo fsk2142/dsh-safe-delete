@@ -34,38 +34,14 @@ const GB = 1024 * 1024 * 1024
  */
 export const SETTING_GUIDES: readonly SettingGuide[] = [
   {
-    key: 'maxBytes',
-    unit: 'bytes',
-    summary: '安全区最多占用多少磁盘。超过后最旧的条目会被真正删除。',
-    effect: '调大：能留住更久的删除历史，占盘更多。调小：更早清掉旧条目，取回窗口更短。',
-    range: '至少 1 MB；建议 5 GB 以上',
-    defaultValue: 20 * GB,
-  },
-  {
-    key: 'pruneAtPercent',
-    unit: 'percent',
-    summary: '占用达到「容量上限」的百分之多少时就开始提前清理，为下一次删除腾空间。',
-    effect:
-      '调大（如 95）：更贴近上限才清理，盘用得更满但清理更频繁地逼近上限。' +
-      '调小（如 70）：更早开始清，盘更宽裕，但旧条目留得更短。设为 0 表示只在超过上限时才清。',
-    range: '0 到 100；0 与 100 等价于「只在超过上限时清理」',
-    defaultValue: 90,
-  },
-  {
-    key: 'autoPruneIntervalMs',
-    unit: 'milliseconds',
-    summary: '多久检查一次该不该清理。检查在每次使用插件时顺路发生，不是后台定时器。',
-    effect: '调大：检查更少，过期条目可能多留一会儿。调小：检查更频繁，但每次都只是看一眼，开销很小。',
-    range: '至少 1 分钟；默认 1 小时',
-    defaultValue: 60 * 60 * 1000,
-  },
-  {
     key: 'retentionDays',
     unit: 'days',
-    summary: '删掉的东西在安全区里放多少天，超过期限就会被真正删除。',
-    effect: '调大：取回窗口更长，占盘更多。调小：更早彻底删除，误删的挽回时间更短。',
-    range: '至少 1 天；默认 7 天',
-    defaultValue: 7,
+    summary: '删掉的东西在安全区里放多少天。到期后移入**系统回收站**（不是永久删除）。',
+    effect:
+      '调大：在安全区里停留更久，取回更从容，但占用磁盘更久。' +
+      '调小：更早交给回收站 —— 那里同样能取回，只是要去回收站找。',
+    range: '至少 1 天；默认 1 天',
+    defaultValue: 1,
   },
   {
     key: 'confirmFileCount',

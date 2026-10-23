@@ -1,34 +1,20 @@
 import { r as TrashEntry } from "./types-CLsWRquy.js";
 //#region src/prune.d.ts
-/** 清理参数。 */
+/** 清理策略的输入。 */
 export interface PruneOptions {
   /** 当前时间戳。 */
   now: number;
-  /** 安全区容量上限（字节）。 */
-  maxBytes: number;
-  /**
-   * 提前清理阈值（0-100）。
-   *
-   * 占用达到 `maxBytes × percent%` 就开始清理。`0` 或省略表示只在超过
-   * `maxBytes` 本身时才清（旧行为）。
-   */
-  pruneAtPercent?: number;
 }
-/** 安全区条目总字节数。 */
+/** 安全区条目总字节数（用于状态展示）。 */
 export declare function safeZoneBytes(entries: TrashEntry[]): number;
 /**
- * 实际触发清理的字节阈值。
+ * 挑出该移入回收站的条目：**只看保留期**。
  *
- * @param opts 清理参数。
- * @returns 生效上限；阈值不合法时退回 `maxBytes`。
- */
-export declare function effectiveCapBytes(opts: PruneOptions): number;
-/**
- * 选出应当销毁的条目，按销毁顺序排列（最旧优先）。
+ * 按 `movedAt` 升序返回，保证「最旧优先」在任何输入顺序下都成立。
  *
- * @param entries 当前条目（顺序无关）。
- * @param opts 时间与容量策略。
- * @returns 待销毁条目；空数组表示什么都不用删。
+ * @param entries 安全区全部条目。
+ * @param opts 当前时间。
+ * @returns 待清理条目；空数组表示还没有到期的。
  */
 export declare function selectForPrune(entries: TrashEntry[], opts: PruneOptions): TrashEntry[];
 //#endregion

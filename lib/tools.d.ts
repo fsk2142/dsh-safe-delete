@@ -48,8 +48,11 @@ export interface ToolDeps {
   /** 请求用户授权；无审批通道时返回 `'unavailable'`。 */
   requestApproval: (reason: string) => Promise<ApprovalOutcome>;
   retentionDays: number;
-  maxBytes: number;
-  /** 是否自动按时间/容量清理。 */
+  /**
+   * 是否按保留期自动清理（默认 true）。
+   *
+   * 关掉后安全区只增不减，需要手动清理。
+   */
   autoPrune?: boolean;
   /**
    * 单次删除的条目数阈值：超过就额外要一次人工确认。
@@ -73,24 +76,26 @@ export interface ToolDeps {
    * 生产路径不传，默认走 `moveToSystemRecycleBin`。
    */
   recycler?: Recycler;
-  /**
-   * 提前清理阈值（0-100）。
-   *
-   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
-   * `0` 表示只在超过 `maxBytes` 时才清。
-   */
-  pruneAtPercent?: number;
-  /**
-   * 自动清理的检查间隔（毫秒）。默认 1 小时。
-   *
-   * 为什么需要它：原先清理只在"执行一次安全删除"时顺带发生 —— 长期不删东西，
-   * 安全区就永远不会被清理，过期条目会一直占着盘。现在每次工具调用都会看一眼
-   * 距上次清理有多久，超过间隔才真正跑一次。
-   */
-  autoPruneIntervalMs?: number;
   /** 当前时间（测试可注入）。 */
   now?: () => number;
 }
+/**
+ * 把工具参数统一成「待删除路径列表」。
+ *
+ * 接受 `path`（单个）或 `paths`（数组），两者互斥。为什么不做「两者都给就合并」：
+ * 那会让调用方以为可以随便混用，实际行为取决于顺序，是模糊语义。明确二选一，
+ * 出错时给出清楚的提示，比"聪明地合并"更可靠。
+ *
+ * @param args 工具原始参数。
+ * @returns 路径列表，或一条错误信息。
+ */
+export declare function normaliseDeleteTargets(args: Record<string, unknown>): {
+  paths: string[];
+  error?: undefined;
+} | {
+  paths?: undefined;
+  error: string;
+};
 /** 创建全部工具。 */
 export declare function createTools(deps: ToolDeps): ToolDefinition[];
 /**

@@ -42,10 +42,9 @@ function codeDefault(key) {
 }
 
 const documentedKeys = [
+  // 容量相关的三个字段（maxBytes / pruneAtPercent / autoPruneIntervalMs）
+  // 已从产品移除，不再要求文档列出。
   'retentionDays',
-  'maxBytes',
-  'pruneAtPercent',
-  'autoPruneIntervalMs',
   'confirmFileCount',
   'confirmBytes',
 ]

@@ -19,7 +19,6 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps & { approvals: number } {
       return 'allowed-once'
     },
     retentionDays: 7,
-    maxBytes: 20 * 1024 ** 3,
     ...over,
     approvals: 0,
   }
