@@ -804,6 +804,71 @@ interface CommandRegistry {
 const CLEAN_MARKER = 'last-clean-request.json'
 
 /**
+ * 跨代清理锁（放在安全区根目录）。
+ *
+ * ## 为什么要跨代锁
+ *
+ * 清理是异步的（每条目一次 PowerShell，可达 20 秒），而 `apply` 不等待它。
+ * 如果清理期间用户又改了配置，HMR 会**卸载并重建插件模块**——新模块实例有自己的
+ * `serialized()` Promise 链，与旧实例那条**互不互斥**。于是旧代的清理和新代的
+ * 安全区操作会并发写索引，可能丢一条索引记录。
+ *
+ * 模块作用域里的变量扛不过重载，所以锁必须落在文件系统上。
+ */
+const CLEAN_LOCK = 'clean.lock'
+
+/** 锁的存活上限：超过就视为上次异常退出的残留，强行接管。 */
+const CLEAN_LOCK_STALE_MS = 5 * 60 * 1000
+
+/**
+ * 尝试获取跨代清理锁。
+ *
+ * 用 `wx`（独占创建）实现：文件已存在就失败，这是原子的，不需要额外的竞态处理。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 拿到锁返回释放函数；已有别人持锁返回 `undefined`。
+ */
+async function acquireCleanLock(stateDir: string): Promise<(() => void) | undefined> {
+  const lockPath = path.join(stateDir, CLEAN_LOCK)
+  try {
+    await fs.promises.mkdir(stateDir, { recursive: true })
+    await fs.promises.writeFile(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() }), {
+      encoding: 'utf8',
+      flag: 'wx',
+    })
+    return () => {
+      try {
+        fs.rmSync(lockPath, { force: true })
+      } catch {
+        /* 释放失败不影响正确性，锁会因过期被接管 */
+      }
+    }
+  } catch {
+    // 已存在 → 检查是否过期。过期就接管（上次进程崩溃留下的）。
+    try {
+      const stat = await fs.promises.stat(lockPath)
+      if (Date.now() - stat.mtimeMs > CLEAN_LOCK_STALE_MS) {
+        await fs.promises.writeFile(
+          lockPath,
+          JSON.stringify({ pid: process.pid, at: Date.now() }),
+          'utf8',
+        )
+        return () => {
+          try {
+            fs.rmSync(lockPath, { force: true })
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch {
+      /* 锁在检查途中消失：让下次 apply 重试即可 */
+    }
+    return undefined
+  }
+}
+
+/**
  * 响应配置页的「立即清理」按钮。
  *
  * ## 触发方式
@@ -845,39 +910,55 @@ async function maybeRunRequestedClean(
     // 时间戳不新于已消费的 → 这次 apply 不是按钮触发的。
     if (opts.requestedAt <= consumed) return
 
-    const entries = await listSafeZone(opts.stateDir)
-    const selected = selectForPrune(entries, {
-      now: Date.now(),
-      // 「立即清理」的语义是**清空安全区**：用户手动按下就是要腾空间，
-      // 不该再受保留期或容量阈值过滤。所以把两个门槛都放宽。
-      maxBytes: 0,
-      pruneAtPercent: 100,
-    })
-
-    let moved = 0
-    for (const entry of selected) {
-      const result = await destroyEntry(opts.stateDir, entry.id)
-      if (result.ok) {
-        moved += 1
-        appendAudit(opts.stateDir, {
-          event: 'prune',
-          target: entry.originalPath,
-          detail: `id=${entry.id} bytes=${entry.bytes} via=panel-request/${result.via}`,
-        })
-      } else {
-        appendAudit(opts.stateDir, {
-          event: 'prune',
-          target: entry.originalPath,
-          detail: `id=${entry.id} skipped: ${result.reason}`,
-        })
-      }
+    // 跨代互斥：清理期间若 HMR 重载插件，旧代与新代的索引操作会并行。
+    // 拿不到锁就放弃，让新代（或下次 apply）来做 —— 请求戳还没被标记消费，
+    // 所以不会丢。
+    const release = await acquireCleanLock(opts.stateDir)
+    if (release === undefined) {
+      ;(ctx as { logger?: { info?: (msg: string) => void } }).logger?.info?.(
+        '[dsh-safe-delete] clean request skipped: another generation holds the clean lock',
+      )
+      return
     }
 
-    // 只有真正跑过（无论移走几条）才记下已消费，避免失败时下次重试被吞掉。
-    await fs.promises.writeFile(markerPath, JSON.stringify({ consumedAt: opts.requestedAt, moved }), 'utf8')
-    ;(ctx as { logger?: { info?: (msg: string) => void } }).logger?.info?.(
-      `[dsh-safe-delete] panel clean request: moved ${moved} entr(ies) to the recycle bin`,
-    )
+    try {
+      const entries = await listSafeZone(opts.stateDir)
+      const selected = selectForPrune(entries, {
+        now: Date.now(),
+        // 「立即清理」的语义是**清空安全区**：用户手动按下就是要腾空间，
+        // 不该再受保留期或容量阈值过滤。所以把两个门槛都放宽。
+        maxBytes: 0,
+        pruneAtPercent: 100,
+      })
+
+      let moved = 0
+      for (const entry of selected) {
+        const result = await destroyEntry(opts.stateDir, entry.id)
+        if (result.ok) {
+          moved += 1
+          appendAudit(opts.stateDir, {
+            event: 'prune',
+            target: entry.originalPath,
+            detail: `id=${entry.id} bytes=${entry.bytes} via=panel-request/${result.via}`,
+          })
+        } else {
+          appendAudit(opts.stateDir, {
+            event: 'prune',
+            target: entry.originalPath,
+            detail: `id=${entry.id} skipped: ${result.reason}`,
+          })
+        }
+      }
+
+      // 只有真正跑过（无论移走几条）才记下已消费，避免失败时下次重试被吞掉。
+      await fs.promises.writeFile(markerPath, JSON.stringify({ consumedAt: opts.requestedAt, moved }), 'utf8')
+      ;(ctx as { logger?: { info?: (msg: string) => void } }).logger?.info?.(
+        `[dsh-safe-delete] panel clean request: moved ${moved} entr(ies) to the recycle bin`,
+      )
+    } finally {
+      // 无论成功失败都必须释放，否则后续 apply 会一直被锁在外。
+      release()
+    }
   } catch (error) {
     // 绝不因为清理失败而让插件激活失败。
     try {

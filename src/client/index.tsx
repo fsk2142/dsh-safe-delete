@@ -321,6 +321,8 @@ export function SafeZoneSettings(): ReactElement {
   const [errors, setErrors] = useState<Record<string, string>>({})
   /** 「立即清理」进行中：防止连点产生多个重载。 */
   const [cleaning, setCleaning] = useState(false)
+  /** 「立即清理」已进入二次确认态：第一次点击只到这里。 */
+  const [confirmingClean, setConfirmingClean] = useState(false)
   /** 读到的修订号：宿主的并发围栏，写入必须带上它。 */
   const [revision, setRevision] = useState<number | undefined>(undefined)
   /**
@@ -663,6 +665,20 @@ export function SafeZoneSettings(): ReactElement {
   )
 
   /**
+   * 进入「立即清理」的二次确认态。
+   *
+   * 8 秒后自动退回：避免用户点了第一下就走开，下次回来看到的是「确定清理」，
+   * 一不留神就真清了。
+   */
+  const armClean = useCallback((): void => {
+    setConfirmingClean(true)
+    setMessage('')
+    // 用 effect 里的定时器更严谨，但这里只是一个 UI 退避，直接 setTimeout 足够，
+    // 且组件卸载后 setState 在 React 18+ 是空操作，不会告警。
+    setTimeout(() => setConfirmingClean(false), 8000)
+  }, [])
+
+  /**
    * 「立即清理」：把安全区条目全部移入系统回收站。
    *
    * ## 实现方式
@@ -712,6 +728,9 @@ export function SafeZoneSettings(): ReactElement {
       setMessage(`清理请求失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setCleaning(false)
+      // 无论成功失败都退出确认态：成功了界面会随插件重载刷新，失败则让用户
+      // 重新走一遍确认，而不是停在那里、再点一下就又发一次请求。
+      setConfirmingClean(false)
     }
   }, [cleaning, revision])
 
@@ -856,8 +875,8 @@ export function SafeZoneSettings(): ReactElement {
                 // 一项 = 两列网格（标签 | 输入+说明）。
                 //
                 // 不画任何边框/底色：整组设置共用外层那一张卡片，项与项之间靠
-                // 外层 gap 分隔。之前每项都带 border-bottom，视觉上是一排贯穿
-                // 全宽的横杠（用户原话："为什么会有横杠杠"）。
+                // 外层 gap 分隔。早期版本每项都带 border-bottom，视觉上是一排
+                // 贯穿全宽的横线，读起来像表格而不是设置页。
                 display: 'grid',
                 gridTemplateColumns: '150px minmax(0, 1fr)',
                 columnGap: '16px',
@@ -1020,26 +1039,88 @@ export function SafeZoneSettings(): ReactElement {
           gap: '6px',
         }}
       >
-        <button
-          type="button"
-          onClick={() => void runClean()}
-          disabled={status !== 'ready' || cleaning}
-          title="把安全区里的条目全部移入系统回收站（可在清空回收站之前还原）"
-          style={{
-            alignSelf: 'flex-start',
-            padding: '6px 18px',
-            borderRadius: 'var(--dsw-radius-md, 8px)',
-            border: '1px solid var(--dsw-alias-border-l3, #d6dde8)',
-            cursor: status !== 'ready' || cleaning ? 'default' : 'pointer',
-            background: 'transparent',
-            color: 'var(--dsw-alias-label-primary, inherit)',
-            font: 'inherit',
-            fontSize: '13px',
-            opacity: status !== 'ready' || cleaning ? 0.55 : 1,
-          }}
-        >
-          {cleaning ? '清理中…' : '立即清理安全区'}
-        </button>
+        {/*
+          二次确认：第一次点击只把按钮切成"确认"状态，再点一次才真的执行。
+
+          为什么用同按钮切换而不是弹窗：
+            - 弹窗在配置页这种轻量场景里太重，而且宿主的模态层不归插件管；
+            - 两段式按钮的意图很明确（"你确定吗？"写在按钮上），不会误点。
+
+          确认状态在以下情况自动撤销：点"取消"、切换配置项、或 8 秒内没再点。
+          最后一条避免用户离开后按钮一直停在"确认"，下次回来误触。
+        */}
+        {confirmingClean ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <span
+              aria-live="polite"
+              style={{
+                fontSize: '13px',
+                fontWeight: 500,
+                color: 'var(--dsw-alias-state-warn-primary, #b45309)',
+              }}
+            >
+              确定要清空安全区？
+            </span>
+            <button
+              type="button"
+              onClick={() => void runClean()}
+              disabled={cleaning}
+              style={{
+                padding: '6px 16px',
+                borderRadius: 'var(--dsw-radius-md, 8px)',
+                border: 'none',
+                cursor: cleaning ? 'default' : 'pointer',
+                background: 'var(--dsw-alias-state-error-primary, #d33)',
+                color: '#fff',
+                font: 'inherit',
+                fontSize: '13px',
+                fontWeight: 500,
+                opacity: cleaning ? 0.6 : 1,
+              }}
+            >
+              {cleaning ? '清理中…' : '确定清理'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmingClean(false)}
+              disabled={cleaning}
+              style={{
+                padding: '6px 16px',
+                borderRadius: 'var(--dsw-radius-md, 8px)',
+                border: '1px solid var(--dsw-alias-border-l3, #d6dde8)',
+                cursor: cleaning ? 'default' : 'pointer',
+                background: 'transparent',
+                color: 'var(--dsw-alias-label-primary, inherit)',
+                font: 'inherit',
+                fontSize: '13px',
+                opacity: cleaning ? 0.6 : 1,
+              }}
+            >
+              取消
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => armClean()}
+            disabled={status !== 'ready' || cleaning}
+            title="把安全区里的条目全部移入系统回收站（会在清空回收站之前可还原）"
+            style={{
+              alignSelf: 'flex-start',
+              padding: '6px 18px',
+              borderRadius: 'var(--dsw-radius-md, 8px)',
+              border: '1px solid var(--dsw-alias-border-l3, #d6dde8)',
+              cursor: status !== 'ready' || cleaning ? 'default' : 'pointer',
+              background: 'transparent',
+              color: 'var(--dsw-alias-label-primary, inherit)',
+              font: 'inherit',
+              fontSize: '13px',
+              opacity: status !== 'ready' || cleaning ? 0.55 : 1,
+            }}
+          >
+            立即清理安全区
+          </button>
+        )}
         <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
           把安全区现有条目全部移入系统回收站，不受保留期与容量上限限制。
         </span>

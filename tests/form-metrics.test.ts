@@ -44,14 +44,32 @@ describe('settings form layout', () => {
   it('keeps the clean button out of the save row', () => {
     // 「立即清理」与「保存」语义不同：前者清空安全区、不受上方配置影响。
     // 并排会被读成"另一个保存按钮"，所以它必须独占一块（有 borderTop 分隔）。
+    // 注意按钮文案现在有两处（待确认态与确认态），用 `indexOf` 找的是第一处。
     const actionArea = sliceAfter('{/*\n        操作区只有**保存**。', 900)
     expect(actionArea, '定位失败').not.toBe('')
     expect(actionArea, '保存行里不应出现清理按钮').not.toContain('立即清理安全区')
 
-    // borderTop 挂在清理块的父 div 上，位置在按钮之前，所以往前多取一些。
+    // borderTop 挂在清理块的父 div 上，位置比按钮早约 3000 字符（中间隔着
+    // 二次确认那段的注释与 JSX）。取 4000 留足余量。
     const cleanAt = source.indexOf('立即清理安全区')
-    const before = source.slice(Math.max(0, cleanAt - 1200), cleanAt)
+    expect(cleanAt, '定位失败：找不到清理按钮').toBeGreaterThan(0)
+    const before = source.slice(Math.max(0, cleanAt - 4000), cleanAt)
     expect(before, '清理块应自带顶部分隔线').toContain('borderTop:')
+  })
+
+  it('asks for confirmation before cleaning', () => {
+    // 破坏性操作必须二次确认。第一阶段只切状态（armClean），
+    // 真正的 runClean 挂在确认态的按钮上。
+    expect(source, '应有确认态状态位').toContain('confirmingClean')
+    expect(source, '第一次点击应只进入确认态').toContain('onClick={() => armClean()}')
+
+    // 确认态里同时要有"确定清理"和"取消"。
+    const confirmBlock = sliceAfter('确定要清空安全区？', 1400)
+    expect(confirmBlock, '确认态缺少确定按钮').toContain('确定清理')
+    expect(confirmBlock, '确认态缺少取消按钮').toContain('取消')
+
+    // 确认态必须能自动撤销，避免用户离开后按钮停在"确定"。
+    expect(source, '确认态应自动退回').toMatch(/setTimeout\(\(\) => setConfirmingClean\(false\)/)
   })
 
   it('does not draw dividers between settings', () => {
