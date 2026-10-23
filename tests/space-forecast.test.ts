@@ -4,16 +4,22 @@ import { describeSpaceRisks, forecastSpace, type SpaceForecast } from '../src/de
 import type { TargetDescription } from '../src/types'
 
 /**
- * 空间风险预告。
+ * 跨卷删除的空间风险。
  *
- * ## 为什么必须靠模拟
+ * ## 只剩一件事要判断
  *
- * 这两个场景在单盘设备上**无法真实复现**：
- *   - 安全区放不下（要求上限小于待删文件）
- *   - 跨盘复制（要求两个真实盘符，且目标盘空间紧张）
+ * v0.3.0 移除了容量层，所以不再有"会不会撑爆安全区"的判定。剩下的真实风险是：
  *
- * 所以测试注入「已用字节」与「安全区路径」，用路径的盘符差异来驱动跨盘判定。
- * 这不是"假装跨盘"，而是**直接验证判定逻辑**：`path.parse().root` 不同即跨盘。
+ *   1. `crossVolumeCopy` 关着而源与安全区**真的**跨盘 → 删除会被拒绝；
+ *   2. 开着但目标盘放不下 → 复制中途失败。
+ *
+ * 另外要分清"跨盘"与"开关打开"：**同盘时即使开关打开也不会复制**，
+ * 一个字节都不占。按开关误报"将占用 X GB"比不报更糟。
+ *
+ * ## 为什么靠模拟
+ *
+ * 单盘设备无法真实复现跨盘。这里用路径的盘符差异驱动判定——`path.parse().root`
+ * 不同即跨盘，这正是生产代码的判断依据，所以测的是真逻辑而非替身。
  */
 
 /**
@@ -33,77 +39,21 @@ function desc(bytes: number): TargetDescription {
   } as TargetDescription
 }
 
-/** 构造一个"已用 X 字节"的读取器。 */
-const used = (n: number) => async (): Promise<number> => n
-
-describe('forecastSpace: safe zone capacity', () => {
-  it('flags over-cap when the delete would exceed the cap', async () => {
-    const f = await forecastSpace(
-      desc(500),
-      { stateDir: 'C:\\safe', safeZoneCapBytes: 1000, readSafeZoneUsageBytes: used(800) },
-      'C:\\safe\\..\\file.bin',
-    )
-    // 800 + 500 = 1300 > 1000
-    expect(f.overCap).toBe(true)
-    expect(f.afterBytes).toBe(1300)
-  })
-
-  it('does not flag when it still fits', async () => {
-    const f = await forecastSpace(
-      desc(100),
-      { stateDir: 'C:\\safe', safeZoneCapBytes: 1000, readSafeZoneUsageBytes: used(800) },
-      'C:\\safe\\..\\file.bin',
-    )
-    expect(f.overCap).toBe(false)
-  })
-
-  it('treats an unset cap as no judgement', async () => {
-    const f = await forecastSpace(desc(10 ** 12), { stateDir: 'C:\\safe', readSafeZoneUsageBytes: used(0) }, 'C:\\x')
-    expect(f.overCap).toBe(false)
-    expect(f.capBytes).toBeUndefined()
-  })
-
-  it('survives a failing usage read instead of blocking', async () => {
-    // 读不到占用就按 0 算：宁可少提示一句，也不能因此拒绝删除。
-    const f = await forecastSpace(
-      desc(100),
-      {
-        stateDir: 'C:\\safe',
-        safeZoneCapBytes: 1000,
-        readSafeZoneUsageBytes: async () => {
-          throw new Error('index unreadable')
-        },
-      },
-      'C:\\safe\\..\\x',
-    )
-    expect(f.overCap).toBe(false)
-    expect(f.afterBytes).toBe(100)
-  })
-})
-
 describe('forecastSpace: cross-volume detection', () => {
-  it('treats same-drive paths as NOT crossing', async () => {
-    // 关键：开关打开并不代表真的会复制。同盘时是 rename，一个字节都不占。
-    const f = await forecastSpace(
-      desc(5000),
-      { stateDir: 'C:\\safe', crossVolumeCopy: true },
-      'C:\\Work\\data.bin',
-    )
+  it('treats same-drive paths as NOT crossing, even with the switch on', async () => {
+    // 关键：开关打开不等于真的会复制。同盘是 rename，不占额外空间。
+    const f = await forecastSpace(desc(5000), { stateDir: 'C:\\safe', crossVolumeCopy: true }, 'C:\\Work\\data.bin')
     expect(f.crossesVolumes).toBe(false)
     expect(f.copyBytes).toBe(0)
   })
 
   it('detects different drive letters', async () => {
-    const f = await forecastSpace(
-      desc(5000),
-      { stateDir: 'C:\\safe', crossVolumeCopy: true },
-      'D:\\data.bin',
-    )
+    const f = await forecastSpace(desc(5000), { stateDir: 'C:\\safe', crossVolumeCopy: true }, 'D:\\data.bin')
     expect(f.crossesVolumes).toBe(true)
     expect(f.copyBytes).toBe(5000)
   })
 
-  it('reports the policy block when crossing without crossVolumeCopy', async () => {
+  it('reports the policy block when crossing without the switch', async () => {
     const f = await forecastSpace(desc(5000), { stateDir: 'C:\\safe' }, 'D:\\data.bin')
     expect(f.crossesVolumes).toBe(true)
     expect(f.blockedByPolicy, '跨盘且未开开关，会被直接拒绝').toBe(true)
@@ -113,12 +63,17 @@ describe('forecastSpace: cross-volume detection', () => {
     const f = await forecastSpace(desc(5000), { stateDir: 'C:\\safe', crossVolumeCopy: true }, 'D:\\data.bin')
     expect(f.blockedByPolicy).toBe(false)
   })
+
+  it('never blocks when source and safe zone share a volume', async () => {
+    const f = await forecastSpace(desc(10 ** 12), { stateDir: 'C:\\safe' }, 'C:\\huge.bin')
+    expect(f.crossesVolumes).toBe(false)
+    expect(f.blockedByPolicy).toBe(false)
+    expect(f.copyWillNotFit).toBe(false)
+  })
 })
 
 describe('describeSpaceRisks: wording', () => {
   const base: SpaceForecast = {
-    afterBytes: 0,
-    overCap: false,
     crossesVolumes: false,
     copyBytes: 0,
     copyWillNotFit: false,
@@ -127,36 +82,44 @@ describe('describeSpaceRisks: wording', () => {
 
   it('says nothing when there is no risk (no gratuitous prompts)', () => {
     // 用户明确要求：没有风险就不要打扰。
-    expect(describeSpaceRisks(base, 7)).toHaveLength(0)
-  })
-
-  it('explains the over-cap consequence honestly', () => {
-    const risks = describeSpaceRisks({ ...base, overCap: true, capBytes: 1000, afterBytes: 5000 }, 7)
-    expect(risks).toHaveLength(1)
-    // 关键是说清"保留期承诺不适用"，而不是含糊地"可能被清理"。
-    expect(risks[0]).toContain('recycle bin')
-    expect(risks[0]).toContain('7-day')
+    expect(describeSpaceRisks(base)).toHaveLength(0)
   })
 
   it('warns that a cross-volume copy is not freed by pruning', () => {
-    const risks = describeSpaceRisks({ ...base, crossesVolumes: true, copyBytes: 5000 }, 7)
+    const risks = describeSpaceRisks({ ...base, crossesVolumes: true, copyBytes: 5000 })
     expect(risks[0]).toContain('crosses volumes')
     expect(risks[0], '要指出清理不会释放这份空间').toContain('does not free')
   })
 
   it('escalates when the copy will not fit', () => {
-    const risks = describeSpaceRisks(
-      { ...base, crossesVolumes: true, copyBytes: 5000, freeBytes: 100, copyWillNotFit: true },
-      7,
-    )
+    const risks = describeSpaceRisks({
+      ...base,
+      crossesVolumes: true,
+      copyBytes: 5000,
+      freeBytes: 100,
+      copyWillNotFit: true,
+    })
     expect(risks[0]).toContain('only')
     expect(risks[0]).toContain('free')
   })
 
   it('offers both ways out when crossVolumeCopy is off', () => {
-    const risks = describeSpaceRisks({ ...base, crossesVolumes: true, blockedByPolicy: true }, 7)
+    const risks = describeSpaceRisks({ ...base, crossesVolumes: true, blockedByPolicy: true })
     expect(risks[0]).toContain('crossVolumeCopy')
     // 与其让用户撞一条报错，不如说明两条出路。
     expect(risks[0]).toContain('move the safe zone')
+  })
+
+  it('no longer mentions any capacity cap', () => {
+    // 容量层已移除，任何风险文案都不该再提"上限/撑爆"。
+    const all = [
+      ...describeSpaceRisks({ ...base, crossesVolumes: true, copyBytes: 1 }),
+      ...describeSpaceRisks({ ...base, crossesVolumes: true, copyBytes: 1, copyWillNotFit: true, freeBytes: 0 }),
+      ...describeSpaceRisks({ ...base, crossesVolumes: true, blockedByPolicy: true }),
+    ]
+    for (const text of all) {
+      expect(text.toLowerCase()).not.toContain('cap')
+      expect(text.toLowerCase()).not.toContain('over its')
+    }
   })
 })

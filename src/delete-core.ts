@@ -41,23 +41,13 @@ export interface DeleteContext {
   confirmFileCount: number
   /** 单次删除的字节数阈值；`0` 表示关闭。 */
   confirmBytes: number
-  /**
-   * 安全区容量上限（字节）。用于**删除前预告**「这一删会不会把安全区撑爆」。
+  /*
+   * 注意：这里曾经有 `safeZoneCapBytes`（安全区容量上限）与
+   * `readSafeZoneUsageBytes`（读取当前占用），用于"删除前预告会不会撑爆安全区"。
    *
-   * 为什么需要：安全区满了时，`afterMove` 的清理会把**刚删进去的条目**立刻踢进
-   * 回收站 —— 而删除输出仍写着「7 天可恢复」。承诺与实际不符。有了这个值，
-   * 就能在动手之前告诉用户真实后果。
-   *
-   * `undefined` 表示不做这项判定（旧调用方/测试未提供时保持原行为）。
+   * v0.3.0 把容量层整个移除后，**没有调用方再传这两个字段**，超容量判定永远休眠。
+   * 留着它们是死代码，还会让人以为插件仍在管理容量。已删除。
    */
-  safeZoneCapBytes?: number
-  /**
-   * 当前安全区已占用的字节数（异步读取，因为要列目录）。
-   *
-   * 抽成回调而不是传数值：`deletePath` 只在需要时才读一次，避免每次删除都
-   * 列一遍安全区目录。
-   */
-  readSafeZoneUsageBytes?: () => Promise<number>
   /**
    * 跨卷时是否允许「复制 + 删源」。
    *
@@ -153,12 +143,6 @@ export function decideGate(
  * 所以动手之前就要把这两件事说清楚。
  */
 export interface SpaceForecast {
-  /** 删除后安全区的总占用（字节）。 */
-  afterBytes: number
-  /** 安全区上限；`undefined` 表示未配置，不做判定。 */
-  capBytes?: number
-  /** 这一删会不会把安全区撑过上限。 */
-  overCap: boolean
   /** 源与安全区是否真的在不同卷上（按盘符/挂载点判断，不看开关）。 */
   crossesVolumes: boolean
   /** 跨卷时需要复制过去的字节数（同卷为 0，因为 rename 不占额外空间）。 */
@@ -172,32 +156,24 @@ export interface SpaceForecast {
 }
 
 /**
- * 估算这次删除的空间后果。
+ * 估算这次删除的**跨卷**后果。
  *
- * 任何一项取不到（列目录失败、磁盘信息不可用）都**不阻断删除** —— 预估只是
- * 用来提示，不是权限判定。宁可少提示一句，也不该因为读不到磁盘信息就拒绝删除。
+ * 只关心一件事：跨盘复制会不会把安全区所在盘写满。容量上限已在 v0.3.0 移除，
+ * 所以这里不再有"会不会撑爆安全区"的判定。
+ *
+ * 任何一项取不到（磁盘信息不可用）都**不阻断删除** —— 预估只是用来提示，
+ * 不是权限判定。宁可少提示一句，也不该因为读不到磁盘信息就拒绝删除。
  *
  * @param description 目标描述（大小）。
  * @param ctx 删除上下文。
+ * @param target 源路径（用于判断卷）。
  * @returns 预估结果。
  */
 export async function forecastSpace(
   description: TargetDescription,
-  ctx: Pick<DeleteContext, 'stateDir' | 'safeZoneCapBytes' | 'readSafeZoneUsageBytes' | 'crossVolumeCopy'>,
+  ctx: Pick<DeleteContext, 'stateDir' | 'crossVolumeCopy'>,
   target: string,
 ): Promise<SpaceForecast> {
-  let used = 0
-  if (ctx.readSafeZoneUsageBytes !== undefined) {
-    try {
-      used = await ctx.readSafeZoneUsageBytes()
-    } catch {
-      /* 读不到就按 0 算：不因此阻断，只是少一次提示 */
-    }
-  }
-  const afterBytes = used + description.bytes
-  const capBytes = ctx.safeZoneCapBytes !== undefined && ctx.safeZoneCapBytes > 0 ? ctx.safeZoneCapBytes : undefined
-  const overCap = capBytes !== undefined && afterBytes > capBytes
-
   /*
    * 是否**真的**跨卷，要按两个路径的卷根判断，而不是看 `crossVolumeCopy` 开关。
    *
@@ -222,9 +198,6 @@ export async function forecastSpace(
   const copyWillNotFit = copyBytes > 0 && freeBytes !== undefined && copyBytes > freeBytes
 
   return {
-    afterBytes,
-    ...(capBytes === undefined ? {} : { capBytes }),
-    overCap,
     crossesVolumes,
     copyBytes,
     ...(freeBytes === undefined ? {} : { freeBytes }),
@@ -235,22 +208,16 @@ export async function forecastSpace(
 }
 
 /**
- * 把空间预估写成给人看的风险说明。没有风险时返回空数组。
+ * 把跨卷风险写成给人看的说明。没有风险时返回空数组。
+ *
+ * 容量相关的提示已随容量层一起移除（v0.3.0）—— 安全区不再有上限，
+ * 因此不存在"会不会撑爆"这回事。这里只剩跨盘复制这一项。
  *
  * @param forecast 预估结果。
- * @param retentionDays 保留天数（用来说明"清理后还剩什么"）。
  * @returns 风险条目，可能为空。
  */
-export function describeSpaceRisks(forecast: SpaceForecast, retentionDays: number): string[] {
+export function describeSpaceRisks(forecast: SpaceForecast): string[] {
   const risks: string[] = []
-  if (forecast.overCap) {
-    const cap = forecast.capBytes === undefined ? 'the cap' : humanBytes(forecast.capBytes)
-    risks.push(
-      `the safe zone will be over its ${cap} cap after this (${humanBytes(forecast.afterBytes)}), ` +
-        `so older entries — possibly this one — will be moved into the system recycle bin immediately. ` +
-        `The "${retentionDays}-day restore window" would not apply to them.`,
-    )
-  }
   if (forecast.copyWillNotFit) {
     const free = forecast.freeBytes === undefined ? 'less than needed' : humanBytes(forecast.freeBytes)
     risks.push(
@@ -332,13 +299,11 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     description,
     {
       stateDir: ctx.stateDir,
-      ...(ctx.safeZoneCapBytes === undefined ? {} : { safeZoneCapBytes: ctx.safeZoneCapBytes }),
-      ...(ctx.readSafeZoneUsageBytes === undefined ? {} : { readSafeZoneUsageBytes: ctx.readSafeZoneUsageBytes }),
       ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
     },
     target,
   )
-  const risks = describeSpaceRisks(forecast, ctx.retentionDays)
+  const risks = describeSpaceRisks(forecast)
 
   /*
    * 只有"目标盘真的放不下"才**拒绝**；其余风险只是告知，随确认卡一起给出。
