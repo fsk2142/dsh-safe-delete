@@ -352,8 +352,24 @@ async function deleteMany(
     }
   }
 
-  const lines: string[] = [`Deleted ${moved.length} of ${paths.length} item(s) into the safe zone:`]
-  lines.push(...moved.map((m) => `  ${m}`))
+  /*
+   * 输出按次计费，所以批量结果**不逐个列出成功项**。
+   *
+   * 删除 100 个文件时，逐条打印路径 + id 会产生几千 token，而模型接下来通常
+   * 只会说一句"删好了"。真正需要知道的是：删了几个、失败的是哪几个、怎么取回。
+   *
+   * 失败项仍然逐条列出 —— 那些是需要处理的异常，模型必须看到。
+   * 完整清单在 safe_zone_list 里，需要时再查。
+   */
+  const lines: string[] = [`Deleted ${moved.length} of ${paths.length} item(s) into the safe zone (${humanBytes(
+    plans.reduce((sum, p) => sum + p.description.bytes, 0),
+  )}).`]
+  // 少量成功项时列出路径（方便用户核对）；多了就只给数量。
+  if (moved.length <= 5) {
+    lines.push(...moved.map((m) => `  ${m}`))
+  } else {
+    lines.push(...moved.slice(0, 3).map((m) => `  ${m}`), `  …and ${moved.length - 3} more`)
+  }
   if (failed.length > 0) {
     lines.push('', `Failed (${failed.length}) — these were NOT moved:`)
     lines.push(...failed.map((f) => `  ${f.target} — ${f.error}`))
@@ -426,30 +442,23 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   const safeDelete = makeTool({
     name: 'safe_delete',
     description:
-      'Delete files or directories the safe way: they are moved into the safe zone (restorable via safe_zone_restore) instead of being erased. ' +
-      'Pass `paths` (an array) to delete several in ONE call — this is strongly preferred over calling the tool once per file: fewer round-trips, ' +
-      'and a batch needs only a single user approval instead of one per item. ' +
-      'Dangerous paths (the OS home directory, plugin sources, profile manifests, node_modules) require the user to approve in the UI; ordinary workspace files move without asking. ' +
-      'Run with preview:true first to see exactly what would be moved. This is the ONLY sanctioned way to delete in DSH — raw shell deletes are blocked.',
+      // 工具描述在每次请求里都会发给模型，是最该精简的地方。
+      // 原来这里把「batch 更省」「危险路径要审批」「先 preview」各说了两遍
+      // （描述里一遍、参数描述里一遍），压掉重复不损失任何信息。
+      'Move files/directories into the safe zone (restorable via safe_zone_restore). This is the ONLY sanctioned way to delete in DSH; raw shell deletes are blocked. ' +
+      'Pass `paths` to delete several in one call — one approval covers the batch. ' +
+      'Dangerous paths (home dir, plugin sources, profile manifests, node_modules) need user approval; ordinary workspace files move silently. ' +
+      'Use `preview: true` to see what would move without moving it.',
     parameters: {
-      path: {
-        type: 'string',
-        description:
-          'Absolute path of the single file or directory to delete. Use this OR `paths`, not both.',
-      },
+      path: { type: 'string', description: 'One absolute path. Mutually exclusive with `paths`.' },
       paths: {
         type: 'array',
         items: { type: 'string' },
-        description:
-          'Absolute paths of several files/directories to delete in one call. Preferred when removing more than one ' +
-          'item: one approval covers the whole batch. Use this OR `path`, not both.',
+        description: 'Several absolute paths in one call. Mutually exclusive with `path`.',
       },
-      preview: { type: 'boolean', description: 'Only describe what would be moved; change nothing.' },
-      reason: { type: 'string', description: 'Why this is being deleted (recorded in the safe zone and the audit trail).' },
-      force: {
-        type: 'boolean',
-        description: 'Ignored. Kept for compatibility: a model-set flag is never a user approval.',
-      },
+      preview: { type: 'boolean', description: 'Describe only; change nothing.' },
+      reason: { type: 'string', description: 'Why this is deleted (recorded in audit).' },
+      force: { type: 'boolean', description: 'Ignored; a model-set flag is never user approval.' },
     },
     beforeExecute: pruneIfDue,
     async execute(args) {
@@ -490,25 +499,36 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     name: 'safe_zone_list',
     description: 'List what is currently in the safe zone, newest last, with ids you can pass to safe_zone_restore.',
     parameters: {
-      limit: { type: 'integer', description: 'Max entries to show (default 50).' },
+      limit: { type: 'integer', description: 'Max entries to show (default 20).' },
     },
     beforeExecute: pruneIfDue,
     async execute(args) {
       const entries = await listSafeZone(deps.stateDir)
       if (entries.length === 0) return { ok: true, text: 'safe zone is empty' }
-      const limit = Math.max(1, Number(args.limit) || 50)
+      /*
+       * 默认只显示 20 条（原来是 50）。
+       *
+       * 输出按次计费：50 条 × 完整绝对路径 + ISO 日期 ≈ 700 token，而模型多数
+       * 时候只想确认"有没有东西 / 最新的几个是什么"。真要看全部它会显式传 limit。
+       *
+       * 日期也从完整 ISO 截成 `MM-DD`：年份和毫秒对"哪天过期"没有信息量。
+       */
+      const limit = Math.max(1, Number(args.limit) || 20)
       const shown = entries.slice(-limit)
       const lines = shown.map(
         (e) =>
           `${e.id}  ${e.isDirectory ? '[dir] ' : '[file]'}  ${humanBytes(e.bytes)}  ` +
-          `expires ${new Date(e.expiresAt).toISOString().slice(0, 10)}  ${e.originalPath}`,
+          `${new Date(e.expiresAt).toISOString().slice(5, 10)}  ${e.originalPath}`,
       )
       return {
         ok: true,
         text:
-          `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} in the safe zone:\n` +
+          `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} in the safe zone` +
+          ` (${humanBytes(safeZoneBytes(entries))}):\n` +
           lines.join('\n') +
-          (entries.length > shown.length ? `\n… ${entries.length - shown.length} older entr(ies) not shown` : ''),
+          (entries.length > shown.length
+            ? `\n… ${entries.length - shown.length} older entr(ies) not shown; pass limit to see more`
+            : ''),
       }
     },
   })
@@ -539,24 +559,18 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       const entries = await listSafeZone(deps.stateDir)
       const total = safeZoneBytes(entries)
       const next = entries[0]
+      // 输出按次计费，尽量用短标签。`state dir` 这类模型用不上的信息压成 dir。
       return {
         ok: true,
         text: [
-          `state dir: ${deps.stateDir}`,
-          `entries: ${entries.length}`,
-          `total size: ${humanBytes(total)}`,
-          `capacity cap: ${humanBytes(deps.maxBytes)}`,
-          `retention: ${deps.retentionDays} days`,
-          `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : `on, checked every ${describeInterval(pruneIntervalMs)}`}`,
-          `prune trigger: ${deps.autoPrune === false ? 'n/a' : describePruneTrigger(deps)}`,
-          // 清理去哪，是用户最该知道的一件事：进回收站（可还原）还是永久删。
-          `prune destination: ${
-            canRecycle()
-              ? 'system recycle bin (recoverable until you empty it)'
-              : `NOT SUPPORTED on ${process.platform} — expired entries stay in the safe zone`
-          }`,
-          `confirm when a single delete exceeds: ${describeThresholds(deps)}`,
-          next !== undefined ? `oldest entry expires: ${new Date(next.expiresAt).toISOString()}` : 'safe zone is empty',
+          `dir: ${deps.stateDir}`,
+          `entries: ${entries.length}  size: ${humanBytes(total)} / ${humanBytes(deps.maxBytes)}`,
+          `retention: ${deps.retentionDays}d`,
+          `auto prune: ${deps.autoPrune === false ? 'off' : `${describeInterval(pruneIntervalMs)}, ${describePruneTrigger(deps)}`}`,
+          // 清理去哪是用户最该知道的一点：进回收站（可还原）还是永久删。
+          `prune to: ${canRecycle() ? 'system recycle bin (restorable)' : `NOT SUPPORTED on ${process.platform} — entries stay put`}`,
+          `confirm over: ${describeThresholds(deps)}`,
+          next !== undefined ? `oldest expires in ${Math.max(0, Math.round((next.expiresAt - now()) / 86_400_000))}d` : 'safe zone is empty',
         ].join('\n'),
       }
     },
@@ -565,7 +579,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   const safeZoneCheck = makeTool({
     name: 'safe_zone_check',
     description:
-      'Read-only health check of the composition under $DSH_HOME: can each profile package.json be parsed, is each cordis.patch.yml readable, and are any row ids duplicated across layers (duplicates make the next boot fail). Writes nothing.',
+      'Read-only health check of the composition under $DSH_HOME: profile package.json parseable, cordis.patch.yml readable, ' +
+      'row ids not duplicated across layers (duplicates break the next boot). Writes nothing.',
     parameters: {},
     beforeExecute: pruneIfDue,
     async execute() {

@@ -729,12 +729,14 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       name: 'dsh-safe-delete:policy',
       order: 200,
       text:
-        'Deleting files — deletion in DSH goes through the `safe_delete` tool, not through the shell.\n' +
-        '- Before deleting anything you are unsure about, call `safe_delete` with `preview: true`. It reports the size, the entry count and whether the path is dangerous, and changes nothing.\n' +
-        '- Then call `safe_delete` without `preview` to move it into the safe zone. Ordinary workspace files move straight away; dangerous paths (the OS home directory, plugin sources, profile manifests, node_modules) show the user an approval card first.\n' +
-        '- If a raw shell delete is blocked, do NOT retry it, do not switch to another tool, and do not rename or encode your way around it. Use `safe_delete`. That is the only sanctioned delete path.\n' +
-        '- If the user rejects an approval, stop and ask what they actually want. Do not look for another route.\n' +
-        '- Deleted items stay in the safe zone for a while and can be brought back with `safe_zone_restore id=<id>`; `safe_zone_list` shows what is there.',
+        // 这段在**每次请求**里都会发给模型，所以每句话都要有存在理由。
+        // 删掉的是与工具描述重复的内容（"用 safe_delete"已写在工具描述里），
+        // 以及可以用一句话说清、原来写成两句的说明。
+        'Deleting files: use `safe_delete`, never the shell.\n' +
+        '- Unsure about a path? Call `safe_delete` with `preview: true` first — it reports size, entry count and danger level without changing anything.\n' +
+        '- Pass `paths: [...]` to delete several items in one call; a batch needs one approval, not one each.\n' +
+        '- Blocked shell deletes: do NOT retry, switch tools, or rename/encode around it. If an approval is rejected, ask the user what they want instead of looking for another route.\n' +
+        '- Deleted items are restorable via `safe_zone_restore id=<id>` until they expire.',
     })
   }
 }
