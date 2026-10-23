@@ -282,3 +282,7 @@ node scripts/clean-test-tmp.mjs   # 清掉测试遗留的临时目录
 
 配置页出问题时，看 [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) —— 它逐条解释了启动链的
 每一步在做什么、失败意味着什么，以及不同失败组合该怎么排查。
+
+怀疑某个插件让 DSH 起不来时，看 [`docs/STARTUP-SAFETY.md`](docs/STARTUP-SAFETY.md) ——
+它说明了插件失败的三层半径（顶层 import / `apply` / 钩子），本插件在每一层的实测
+表现，以及"哪一行代码会让整个应用起不来"的通用自查方法。
