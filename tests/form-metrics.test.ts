@@ -28,9 +28,30 @@ describe('settings form layout', () => {
 
   it('wraps all settings in a single card', () => {
     // 卡片特征：描边 + 圆角 + 底色，三样齐全。
-    expect(card).toContain("border: '1px solid var(--dsw-alias-border-l1")
+    expect(card).toContain("border: '1px solid var(--dsw-alias-border-l3")
     expect(card).toContain("borderRadius: 'var(--dsw-radius-lg, 12px)'")
     expect(card).toContain("background: 'var(--dsw-alias-bg-layer-2, transparent)'")
+  })
+
+  it('uses a border deep enough to see', () => {
+    // 用 l1（最浅一档）时用户反馈"框框的颜色太浅"。修正为 l3。
+    // 官方卡片（settings-subagent 的 .JDOnoa_models）用的是 l4，我们取 l3，
+    // 既明显又不至于压过牌面。
+    expect(card, '卡片描边不应再是最浅的 l1').not.toContain('border-l1,')
+    expect(card).toMatch(/border-l[34],/)
+  })
+
+  it('keeps the clean button out of the save row', () => {
+    // 「立即清理」与「保存」语义不同：前者清空安全区、不受上方配置影响。
+    // 并排会被读成"另一个保存按钮"，所以它必须独占一块（有 borderTop 分隔）。
+    const actionArea = sliceAfter('{/*\n        操作区只有**保存**。', 900)
+    expect(actionArea, '定位失败').not.toBe('')
+    expect(actionArea, '保存行里不应出现清理按钮').not.toContain('立即清理安全区')
+
+    // borderTop 挂在清理块的父 div 上，位置在按钮之前，所以往前多取一些。
+    const cleanAt = source.indexOf('立即清理安全区')
+    const before = source.slice(Math.max(0, cleanAt - 1200), cleanAt)
+    expect(before, '清理块应自带顶部分隔线').toContain('borderTop:')
   })
 
   it('does not draw dividers between settings', () => {
