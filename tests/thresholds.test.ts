@@ -123,6 +123,7 @@ describe('confirmation thresholds', () => {
   it('reports disabled thresholds as disabled', async () => {
     const d = deps({ confirmFileCount: 0, confirmBytes: 0 })
     const status = await toolOf(createTools(d), 'safe_zone_status').execute({})
-    expect(status.text).toMatch(/confirm when a single delete exceeds: disabled/)
+    // 输出标签在 token 优化里缩短为 `confirm over:`（原来是整句）。
+    expect(status.text).toMatch(/confirm over: disabled/)
   })
 })

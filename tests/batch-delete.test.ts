@@ -159,9 +159,9 @@ describe('safe_delete with paths (batch)', () => {
 
     const result = await safeDeleteOf(tools).execute({ paths: [p, p] })
     expect(result.ok, '去重后只剩一项，应正常删除').toBe(true)
-    // 只剩一项时走单路径分支，输出是 "moved to the safe zone" 而不是批量汇总 ——
-    // 两种格式都表示成功，这里断言"没有报错且确实移动了"更稳妥。
-    expect(result.text.toLowerCase()).toMatch(/moved to the safe zone|deleted 1 of 1/)
+    // 只剩一项时走单路径分支，输出是 "moved to safe zone" 而不是批量汇总 ——
+    // 两种格式都表示成功（token 优化里 "the" 被省掉了）。
+    expect(result.text.toLowerCase()).toMatch(/moved to safe zone|deleted 1 of 1/)
     expect(result.text, '不应出现"未找到"的噪音').not.toContain('NOT moved')
     expect(require('node:fs').existsSync(p), '应已移走').toBe(false)
   })

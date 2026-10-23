@@ -249,18 +249,25 @@ export function describePreview(result: Extract<DeleteResult, { kind: 'preview' 
 /** 把移动结论拼成人看的文本。 */
 export function describeMoved(result: Extract<DeleteResult, { kind: 'moved' }>, retentionDays: number): string {
   const d = result.description
+  // 输出是**按次**付费的，所以这里只保留模型真正会用到的信息：
+  //   - 移到哪、id 是什么（取回要用）
+  //   - 大小与条目数（让模型能向用户复述"删了多大"）
+  //   - 天数（而不是完整 ISO 时间戳：模型不会去算日期差，人也不看）
+  // 原来 id 打印了两次、时间戳带毫秒 ISO 串，压缩后信息不减。
+  //
+  // `id: <value>` 这个形状**不能改**：测试用 `/id:\s*(\S+)/` 提取它，模型也照着
+  // 这个格式复制 id 去调 safe_zone_restore。输出格式是隐含契约。
   const top =
     d.topEntries.length > 0
       ? `\n  ${d.topEntries.slice(0, 10).join('\n  ')}${d.truncated ? `\n  … and ${d.fileCount - 10} more` : ''}`
       : ''
+  const size = d.isDirectory ? `${d.fileCount} entries, ${humanBytes(d.bytes)}` : `file, ${humanBytes(d.bytes)}`
   return (
-    `moved to the safe zone: ${result.target}\n` +
-    `id: ${result.entry.id}\n` +
-    `${d.isDirectory ? 'directory' : 'file'}: ${d.fileCount} entr${d.fileCount === 1 ? 'y' : 'ies'}, ${humanBytes(d.bytes)}${top}\n` +
-    `restore with: safe_zone_restore id=${result.entry.id}\n` +
-    `expires: ${new Date(result.entry.expiresAt).toISOString()} (${retentionDays} days)` +
+    `moved to safe zone: ${result.target}\n` +
+    `  id: ${result.entry.id}  ${size}${top}\n` +
+    `  restore: safe_zone_restore id=${result.entry.id} (${retentionDays}d)` +
     (result.pruned.length > 0
-      ? `\npruned ${result.pruned.length} expired/over-cap entr${result.pruned.length === 1 ? 'y' : 'ies'}`
+      ? `\n  pruned ${result.pruned.length} expired/over-cap entr${result.pruned.length === 1 ? 'y' : 'ies'}`
       : '')
   )
 }
