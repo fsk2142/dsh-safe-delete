@@ -443,7 +443,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         confirmFileCount: deps.confirmFileCount ?? 0,
         confirmBytes: deps.confirmBytes ?? 0,
         ...(deps.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
-        // 容量层已移除（v0.3.0），所以没有容量相关的字段要传。
+        // 容量层已移除，所以没有容量相关的字段要传。
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
         now,
