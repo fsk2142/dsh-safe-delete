@@ -703,6 +703,22 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
 
   registerCommands(ctx as never, commandAdapter)
 
+  /*
+   * 「立即清理」按钮的宿主侧响应。
+   *
+   * 客户端点按钮时把时间戳写进 `cleanRequestedAt`；配置写入触发 HMR 重载插件，
+   * 于是本函数重跑，这里发现时间戳比上次执行的新，就清理一次。
+   *
+   * 为什么要持久化「上次执行到哪个时间戳」：`apply` 会在**任何**配置改动后重跑
+   * （改容量、改阈值都会），如果只判断「时间戳非 0」，那么改个容量也会顺带触发
+   * 清理 —— 用户没要求的副作用。用一个文件记住已消费的时间戳，才能做到
+   * "只有按钮按过才清理"。
+   */
+  void maybeRunRequestedClean(ctx, {
+    stateDir,
+    requestedAt: numeric('cleanRequestedAt', 0),
+  })
+
   // 行为约定：把「怎么删」讲清楚，而不只是拒绝。
   // 只拒绝不解释，模型只会换个姿势继续试。
   const systemPrompt = ctx.get('systemPrompt') as
@@ -782,4 +798,92 @@ interface CommandRegistry {
     input?: { hint: string }
     handler: (payload: { rawInput: string }) => Promise<{ kind: 'success' | 'error'; text: string }>
   }) => unknown
+}
+
+/** 记录「已消费到哪个清理请求戳」的文件名（放在安全区根目录）。 */
+const CLEAN_MARKER = 'last-clean-request.json'
+
+/**
+ * 响应配置页的「立即清理」按钮。
+ *
+ * ## 触发方式
+ *
+ * 客户端把时间戳写进 `cleanRequestedAt` 配置项 → 配置写入触发 HMR 重载插件 →
+ * 本函数随 `apply` 重跑 → 发现时间戳比上次消费的新 → 清一次。
+ *
+ * ## 为什么需要标记文件
+ *
+ * `apply` 会在**任何**配置改动后重跑。如果只看"时间戳非 0"，那么用户改容量、
+ * 改阈值也会顺带触发清理 —— 一个他没要求的副作用。标记文件记住已消费的时间戳，
+ * 才能做到"只有按过按钮才清理"。
+ *
+ * ## 失败不抛
+ *
+ * 这个函数在 `apply` 里调用。它若抛错，会让整个插件激活失败（工具、拦截全部
+ * 消失）—— 为了一次清理付出这个代价毫无道理。所以全部包在 try 里，失败只写日志。
+ *
+ * @param ctx 插件上下文（用于日志）。
+ * @param opts 状态目录与请求戳。
+ */
+async function maybeRunRequestedClean(
+  ctx: PluginContext,
+  opts: { stateDir: string; requestedAt: number },
+): Promise<void> {
+  try {
+    if (!Number.isFinite(opts.requestedAt) || opts.requestedAt <= 0) return
+
+    const markerPath = path.join(opts.stateDir, CLEAN_MARKER)
+    let consumed = 0
+    try {
+      const raw = await fs.promises.readFile(markerPath, 'utf8')
+      const parsed = JSON.parse(raw) as { consumedAt?: unknown }
+      if (typeof parsed.consumedAt === 'number') consumed = parsed.consumedAt
+    } catch {
+      /* 首次运行没有标记文件，视为从未消费 */
+    }
+
+    // 时间戳不新于已消费的 → 这次 apply 不是按钮触发的。
+    if (opts.requestedAt <= consumed) return
+
+    const entries = await listSafeZone(opts.stateDir)
+    const selected = selectForPrune(entries, {
+      now: Date.now(),
+      // 「立即清理」的语义是**清空安全区**：用户手动按下就是要腾空间，
+      // 不该再受保留期或容量阈值过滤。所以把两个门槛都放宽。
+      maxBytes: 0,
+      pruneAtPercent: 100,
+    })
+
+    let moved = 0
+    for (const entry of selected) {
+      const result = await destroyEntry(opts.stateDir, entry.id)
+      if (result.ok) {
+        moved += 1
+        appendAudit(opts.stateDir, {
+          event: 'prune',
+          target: entry.originalPath,
+          detail: `id=${entry.id} bytes=${entry.bytes} via=panel-request/${result.via}`,
+        })
+      } else {
+        appendAudit(opts.stateDir, {
+          event: 'prune',
+          target: entry.originalPath,
+          detail: `id=${entry.id} skipped: ${result.reason}`,
+        })
+      }
+    }
+
+    // 只有真正跑过（无论移走几条）才记下已消费，避免失败时下次重试被吞掉。
+    await fs.promises.writeFile(markerPath, JSON.stringify({ consumedAt: opts.requestedAt, moved }), 'utf8')
+    ;(ctx as { logger?: { info?: (msg: string) => void } }).logger?.info?.(
+      `[dsh-safe-delete] panel clean request: moved ${moved} entr(ies) to the recycle bin`,
+    )
+  } catch (error) {
+    // 绝不因为清理失败而让插件激活失败。
+    try {
+      ;(ctx as { logger?: { error?: (msg: unknown) => void } }).logger?.error?.(error)
+    } catch {
+      /* logger 也不可用就算了 */
+    }
+  }
 }

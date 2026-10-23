@@ -319,6 +319,8 @@ export function SafeZoneSettings(): ReactElement {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  /** 「立即清理」进行中：防止连点产生多个重载。 */
+  const [cleaning, setCleaning] = useState(false)
   /** 读到的修订号：宿主的并发围栏，写入必须带上它。 */
   const [revision, setRevision] = useState<number | undefined>(undefined)
   /**
@@ -661,22 +663,57 @@ export function SafeZoneSettings(): ReactElement {
   )
 
   /**
-   * 说明清理是什么、怎么做。
+   * 「立即清理」：把安全区条目全部移入系统回收站。
    *
-   * ## 为什么这里不能直接执行
+   * ## 实现方式
    *
-   * 配置页拿不到「跑一次清理」的接口：
-   *   - `remote.settings` 只有 describe/mutate；
-   *   - `commands/execute` 需要 agentId，配置页不属于任何会话；
-   *   - 自定义 remote 需要 typert 生成器，宿主只发了 loader。
+   * 配置页没有"跑清理"的调用接口，所以借用宿主的**配置变更 → HMR 重载插件**通道：
+   * 把当前时间戳写进 `cleanRequestedAt`，插件重载时 `apply` 重跑、发现新时间戳就清理。
    *
-   * 但更重要的是**把语义讲清楚**：两处清理都是移入系统回收站，不是永久删除。
-   * 用户点这个按钮时最该知道的就是这一点。
+   * 因此这里要做的只是**写一个数字**，真正的清理在宿主侧发生。
    */
   const runClean = useCallback(async (): Promise<void> => {
-    setMessage('清理会把过期条目移入系统回收站（不是永久删除）。执行：/safe-delete clean')
+    const activeRemote = currentRemote()
+    if (activeRemote?.mutate === undefined) {
+      setMessage('这个宿主没有暴露设置接口，无法触发清理。')
+      return
+    }
+    if (cleaning) return
+    setCleaning(true)
+    setMessage('')
     setSaved(false)
-  }, [])
+    try {
+      // 用时间戳而不是布尔：连续两次点也能区分（同一个值写两次不会触发变更）。
+      const stamp = Date.now()
+      const result = await activeRemote.mutate(
+        NAMESPACE,
+        [{ op: 'set', path: ['cleanRequestedAt'], value: stamp }],
+        revision,
+      )
+      const unwrapped = unwrapRemote(result)
+      if (!unwrapped.ok) {
+        setMessage(`清理请求失败：${unwrapped.error}`)
+        return
+      }
+      // 刷新 revision，避免下一次保存撞上冲突。
+      try {
+        const refreshed = activeRemote.describe === undefined ? undefined : await activeRemote.describe()
+        if (refreshed !== undefined) {
+          const unwrappedRefresh = unwrapRemote(refreshed)
+          const view = pickNamespace(unwrappedRefresh.ok ? unwrappedRefresh.value : undefined)
+          setRevision(view.revision)
+        }
+      } catch {
+        /* revision 刷新失败不影响清理已触发 */
+      }
+      setMessage('已提交清理请求：安全区条目正在移入系统回收站。插件会重载一次，稍后刷新即可看到结果。')
+      setSaved(true)
+    } catch (error) {
+      setMessage(`清理请求失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setCleaning(false)
+    }
+  }, [cleaning, revision])
 
   /**
    * 状态卡片：加载中/出错也用同一套容器，避免布局跳动。 */
@@ -937,27 +974,34 @@ export function SafeZoneSettings(): ReactElement {
           </button>
         ) : null}
         {/*
-          「清理」不是配置项，所以常驻；但它无法一键执行（宿主没给配置页开这个接口），
-          所以文案直接写命令，并说明清理的真实语义（进回收站，非永久删除）。
+          「立即清理」：把安全区里的条目全部移入系统回收站。
+
+          ## 它怎么真正执行
+
+          配置页拿不到"跑清理"的调用接口（`tools` 没有 remote，`commands/execute`
+          和 `terminal/*` 都要 agentId）。所以走宿主的**配置变更 → HMR 重载插件**
+          这条通道：把时间戳写进 `cleanRequestedAt`，插件重载时 `apply` 重跑并执行清理。
+
+          代价是点一次会让插件重载（工具短暂不可用），对手动清理这种低频操作可接受。
         */}
         <button
           type="button"
           onClick={() => void runClean()}
-          disabled={status !== 'ready'}
-          title="过期的安全区条目会被移入系统回收站，不是永久删除"
+          disabled={status !== 'ready' || cleaning}
+          title="把安全区里的条目全部移入系统回收站（可在清空回收站之前还原）"
           style={{
             padding: '6px 18px',
             borderRadius: 'var(--dsw-radius-md, 8px)',
             border: '1px solid var(--dsw-alias-border-l2, #c9d1e0)',
-            cursor: status !== 'ready' ? 'default' : 'pointer',
+            cursor: status !== 'ready' || cleaning ? 'default' : 'pointer',
             background: 'transparent',
             color: 'var(--dsw-alias-label-primary, inherit)',
             font: 'inherit',
             fontSize: '13px',
-            opacity: status !== 'ready' ? 0.55 : 1,
+            opacity: status !== 'ready' || cleaning ? 0.55 : 1,
           }}
         >
-          清理说明
+          {cleaning ? '清理中…' : '立即清理'}
         </button>
         {message !== '' ? (
           <span

@@ -162,6 +162,7 @@ dsh-safe-delete journal
 | `blockShellDeletes` | `true` | 拦车闸开关 |
 | `blockProtectedWrites` | `true` | 拦截对启动关键路径的写入 |
 | `crossVolumeCopy` | `false` | 安全区与目标不同卷时是否允许复制式移入 |
+| `cleanRequestedAt` | `0` | **「立即清理」按钮的触发戳**，不是给用户改的。客户端写入当前时间戳 → 配置变更触发 HMR 重载插件 → `apply` 重跑时发现新时间戳就把安全区条目移入回收站。配合 `last-clean-request.json` 记录已消费的时间戳，避免"改个容量也顺带清理" |
 
 标了界面可编辑的那几项在 `src/config.ts` 里声明为 `.volatile()` —— 宿主只认这样的字段。
 `schemastery` 因此是 peer 依赖（由宿主提供，构建时保持 external）。
