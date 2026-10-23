@@ -38,8 +38,8 @@ describe('every configurable field explains itself', () => {
   })
 
   it('renders the same explanations for a single field', () => {
-    const guide = guideOf('maxBytes')!
-    const text = renderConfigDetail(guide, { maxBytes: 30 * 1024 ** 3 })
+    const guide = guideOf('confirmBytes')!
+    const text = renderConfigDetail(guide, { confirmBytes: 30 * 1024 ** 3 })
     expect(text).toContain(guide.summary)
     expect(text).toContain(guide.effect)
     expect(text).toContain(guide.range)
@@ -49,33 +49,24 @@ describe('every configurable field explains itself', () => {
 
 describe('parsing values with units', () => {
   it('accepts byte units', () => {
-    const guide = guideOf('maxBytes')!
+    const guide = guideOf('confirmBytes')!
     expect(parseSetting(guide, '20GB')).toEqual({ ok: true, value: 20 * 1024 ** 3 })
     expect(parseSetting(guide, '512MB')).toEqual({ ok: true, value: 512 * 1024 ** 2 })
     expect(parseSetting(guide, '1.5GB')).toEqual({ ok: true, value: Math.round(1.5 * 1024 ** 3) })
   })
 
   it('rejects byte values below 1 MB and unknown units', () => {
-    const guide = guideOf('maxBytes')!
+    const guide = guideOf('confirmBytes')!
     expect(parseSetting(guide, '10B').ok).toBe(false)
     expect(parseSetting(guide, '20XB').ok).toBe(false)
   })
 
-  it('accepts duration units', () => {
-    const guide = guideOf('autoPruneIntervalMs')!
-    expect(parseSetting(guide, '2h')).toEqual({ ok: true, value: 2 * 3_600_000 })
-    expect(parseSetting(guide, '30min')).toEqual({ ok: true, value: 30 * 60_000 })
-    // 1 分钟是合法下限，必须接受。
-    expect(parseSetting(guide, '1min')).toEqual({ ok: true, value: 60_000 })
-    // 低于 1 分钟才拒绝。
-    expect(parseSetting(guide, '30s').ok).toBe(false)
-  })
-
-  it('accepts percentages inside 0..100 only', () => {
-    const guide = guideOf('pruneAtPercent')!
-    expect(parseSetting(guide, '80')).toEqual({ ok: true, value: 80 })
-    expect(parseSetting(guide, '101').ok).toBe(false)
-    expect(parseSetting(guide, '-1').ok).toBe(false)
+  it('accepts days for the retention window', () => {
+    // 定时清理间隔字段已移除，改为验证保留期（这是仍然存在的时长型配置）。
+    const guide = guideOf('retentionDays')!
+    expect(parseSetting(guide, '2d')).toEqual({ ok: true, value: 2 })
+    expect(parseSetting(guide, '1d')).toEqual({ ok: true, value: 1 })
+    expect(parseSetting(guide, '0d').ok, '至少 1 天').toBe(false)
   })
 
   it('accepts booleans in several spellings', () => {
@@ -94,9 +85,8 @@ describe('parsing values with units', () => {
 
 describe('formatSetting', () => {
   it('renders human units', () => {
-    expect(formatSetting(guideOf('maxBytes')!, 20 * 1024 ** 3)).toBe('20 GB')
-    expect(formatSetting(guideOf('autoPruneIntervalMs')!, 3_600_000)).toBe('1 小时')
-    expect(formatSetting(guideOf('pruneAtPercent')!, 90)).toBe('90%')
+    expect(formatSetting(guideOf('confirmBytes')!, 20 * 1024 ** 3)).toBe('20 GB')
+    expect(formatSetting(guideOf('retentionDays')!, 1)).toBe('1 天')
     expect(formatSetting(guideOf('retentionDays')!, 7)).toBe('7 天')
     expect(formatSetting(guideOf('autoPrune')!, true)).toBe('on')
   })
@@ -151,7 +141,7 @@ describe('runCommand', () => {
 
   it('shows one field without writing anything', async () => {
     let wrote = false
-    const reply = await runCommand('config maxBytes', deps({
+    const reply = await runCommand('config confirmBytes', deps({
       writeConfig: async () => {
         wrote = true
         return { ok: true }
@@ -163,25 +153,25 @@ describe('runCommand', () => {
 
   it('writes a field and reports the restart requirement', async () => {
     let written: { key: string; value: unknown } | undefined
-    const reply = await runCommand('config maxBytes 30GB', deps({
+    const reply = await runCommand('config confirmBytes 30GB', deps({
       writeConfig: async (key, value) => {
         written = { key, value }
         return { ok: true }
       },
     }))
     expect(reply.kind).toBe('success')
-    expect(written).toEqual({ key: 'maxBytes', value: 30 * 1024 ** 3 })
+    expect(written).toEqual({ key: 'confirmBytes', value: 30 * 1024 ** 3 })
     expect(reply.text).toContain('重启 DSH')
   })
 
   it('rejects an unknown key and lists the valid ones', async () => {
     const reply = await runCommand('config nope 1', deps())
     expect(reply.kind).toBe('error')
-    expect(reply.text).toContain('maxBytes')
+    expect(reply.text).toContain('confirmBytes')
   })
 
   it('surfaces a write failure without claiming success', async () => {
-    const reply = await runCommand('config maxBytes 30GB', deps({
+    const reply = await runCommand('config confirmBytes 30GB', deps({
       writeConfig: async () => ({ ok: false, error: '宿主拒绝了这次保存' }),
     }))
     expect(reply.kind).toBe('error')

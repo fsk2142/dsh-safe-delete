@@ -30,9 +30,8 @@ import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, humanBytes } from './delete-core'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
-import { selectForPrune } from './prune'
 import { destroyEntry, listSafeZone, restoreFromSafeZone } from './store'
-import { createTools, type ApprovalOutcome, type ToolDefinition } from './tools'
+import { createTools, normaliseDeleteTargets, type ApprovalOutcome, type ToolDefinition } from './tools'
 
 export const name = 'dsh-safe-delete'
 
@@ -68,27 +67,15 @@ const SHELL_TOOLS: Record<string, 'command' | 'code' | 'text'> = {
 export interface SafeDeleteConfig {
   /** 安全区状态目录；默认 `<DSH_HOME>/.dsh-safe-delete`。 */
   stateDir?: string
-  /** 保留天数；默认 7。 */
+  /**
+   * 保留天数；默认 1。
+   *
+   * 安全区只是「刚删就后悔」的短暂缓冲：到期后条目被移入**系统回收站**
+   * （不是永久删除），用户仍能在那里取回，直到自己清空。
+   */
   retentionDays?: number
-  /** 容量上限（字节）；默认 20 GB（`21474836480`）。 */
-  maxBytes?: number
-  /**
-   * 自动清理的检查间隔（毫秒）；默认 1 小时（`3600000`）。
-   *
-   * 每次工具调用都会看一眼距上次清理多久，超过这个间隔才真正跑一次。
-   * 设为 `0` 表示沿用默认值。
-   */
-  autoPruneIntervalMs?: number
-  /** 是否自动清理；默认 true。关掉后只剩手动清理。 */
+  /** 是否按保留期自动清理；默认 true。关掉后只剩手动清理。 */
   autoPrune?: boolean
-  /**
-   * 提前清理阈值（0-100）；默认 90。
-   *
-   * 占用达到 `maxBytes × percent%` 就开始清理最旧的条目，为下一次删除腾出空间。
-   * 例如上限 20 GB、阈值 90 → 用到 18 GB 就动手，而不是等撑满。
-   * 设为 `0` 或 `>= 100` 表示只在超过 `maxBytes` 本身时才清。
-   */
-  pruneAtPercent?: number
   /**
    * 单次删除的条目数阈值；超过就额外要一次人工确认。默认 `5000`。
    *
@@ -259,8 +246,8 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     ...resolveInstallDir(),
   }
 
-  const retentionDays = Math.max(1, numeric('retentionDays', 7))
-  const maxBytes = Math.max(1024, numeric('maxBytes', 20 * 1024 * 1024 * 1024))
+  // 保留期固定 1 天：安全区只是短暂缓冲，到期交给系统回收站。
+  const retentionDays = Math.max(1, numeric('retentionDays', 1))
 
   // 关于审批：本插件**不自己调用** `ctx.approval`。
   //
@@ -309,12 +296,9 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     env,
     requestApproval,
     retentionDays,
-    maxBytes,
     autoPrune: booleanOf('autoPrune', true),
-    autoPruneIntervalMs: numeric('autoPruneIntervalMs', 60 * 60 * 1000),
     confirmFileCount: numeric('confirmFileCount', 5000),
     confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
-    pruneAtPercent: numeric('pruneAtPercent', 90),
     crossVolumeCopy: booleanOf('crossVolumeCopy', false),
   })
 
@@ -384,42 +368,69 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
 
     // 自己的删除通道不拦，但危险路径与"太大量"要在这里升成 ask。
     if (toolName === 'safe_delete') {
-      const rawPath = exec.arguments?.['path']
       const preview = exec.arguments?.['preview'] === true
-      if (preview || typeof rawPath !== 'string' || rawPath === '') return next()
+      if (preview) return next()
 
-      const target = path.resolve(rawPath)
+      /*
+       * **单路径与批量必须走同一条判定。**
+       *
+       * 曾经的 P0：这里只读 `exec.arguments['path']`，`paths` 形态拿到 undefined
+       * 就直接 `next()` 放行 —— 批量删除家目录、profile 清单、node_modules 时
+       * 一次确认都不弹。工具内部那个 `requestApproval` 在生产接线里恒返回
+       * allowed-once（它的前提是"管线已经问过了"），前提只对单路径成立。
+       *
+       * 所以统一用 `normaliseDeleteTargets` 取出全部目标，对**整批**计算合并门禁。
+       */
+      const targets = normaliseDeleteTargets((exec.arguments ?? {}) as Record<string, unknown>)
+      if (targets.error !== undefined || targets.paths.length === 0) return next()
 
-      // 两个理由相互独立，任一命中都要问：
-      //   a) 路径危险（家目录、profile 清单、node_modules…）；
-      //   b) 这一单太大量（条目数或字节数超阈值）。
-      //
-      // b 必须在这里算。`deletePath` 内部虽然也有阈值判断，但它的
-      // `requestApproval` 在生产接线里恒返回 allowed-once —— 那条确认永远
-      // 不会真的问人。只在 deletePath 里判，等于这个功能完全不存在。
-      const gate = (() => {
+      const plan = (() => {
         try {
-          // 不要用 description.exists 做门控：路径危险度与目标存不存在无关。
-          // 删除一个不存在的家目录路径也该先问人（而且 deletePath 会在
-          // 存在性检查后直接报 not found，根本走不到审批）。
-          const description = describeTarget(target)
-          return {
-            decision: decideGate(target, description, {
+          let fileCount = 0
+          let bytes = 0
+          const dangerousPaths: string[] = []
+          const dangerousReasons: string[] = []
+          const resolved: string[] = []
+
+          for (const raw of targets.paths) {
+            const target = path.resolve(raw)
+            resolved.push(target)
+            // 不要用 description.exists 做门控：路径危险度与目标存不存在无关。
+            // 删除一个不存在的家目录路径也该先问人（而且 deletePath 会在
+            // 存在性检查后直接报 not found，根本走不到审批）。
+            const description = describeTarget(target)
+            fileCount += description.fileCount
+            bytes += description.bytes
+            const gate = decideGate(target, description, {
               env,
               confirmFileCount: numeric('confirmFileCount', 5000),
               confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
-            }),
-            // 留住描述，卡片文案直接复用 —— 大目录的 describeTarget 是全树遍历，
-            // 每次调用算两遍等于翻倍开销。
-            description,
+            })
+            if (gate.needsApproval) {
+              dangerousPaths.push(target)
+              dangerousReasons.push(...gate.reasons)
+            }
           }
+
+          // 合并阈值判定：整批的条目数与字节数（单条都在阈值内、合起来超了也要问）。
+          const countLimit = numeric('confirmFileCount', 5000)
+          const bytesLimit = numeric('confirmBytes', 2 * 1024 * 1024 * 1024)
+          const reasons = [...new Set(dangerousReasons)]
+          if (countLimit > 0 && fileCount > countLimit) {
+            reasons.push(`${fileCount} entries in this batch exceeds the limit of ${countLimit}`)
+          }
+          if (bytesLimit > 0 && bytes > bytesLimit) {
+            reasons.push(`${bytes} bytes in this batch exceeds the limit of ${bytesLimit}`)
+          }
+
+          return { resolved, fileCount, bytes, reasons, needsApproval: reasons.length > 0 }
         } catch {
           return undefined
         }
       })()
 
-      if (gate === undefined) return next()
-      if (!gate.decision.needsApproval) return next()
+      if (plan === undefined) return next()
+      if (!plan.needsApproval) return next()
 
       // 审批策略是 never 时不要返回 ask：管线会直接驳回，卡片不会出现，
       // 结果是"什么都不许删"。此时降级为放行到安全删除 —— 文件仍然进安全区、
@@ -430,20 +441,22 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       // 保留期配长一些，以及定期用 `safe_zone_list` 看一眼。
       if (approvalPolicy() === 'never') return next()
 
-      const { description } = gate
-      const sizeText = description.isDirectory
-        ? ` Directory, ${description.fileCount} entries, ${description.bytes} bytes.`
-        : ` File, ${description.bytes} bytes.`
+      const isBatch = plan.resolved.length > 1
+      const shown = plan.resolved.slice(0, 5)
+      const more = plan.resolved.length > shown.length ? ` (+${plan.resolved.length - shown.length} more)` : ''
+      const listText = shown.map((p) => `"${p}"`).join(', ') + more
+      const subject = isBatch ? `${plan.resolved.length} item(s): ${listText}` : `"${plan.resolved[0] as string}"`
+      const sizeText = ` Total ${plan.fileCount} entries, ${plan.bytes} bytes.`
 
       return {
         kind: 'ask',
         reason:
-          `Delete "${target}"?${sizeText} ` +
-          `Why this needs your OK: ${gate.decision.reasons.join('; ')}. ` +
+          `Delete ${subject}?${sizeText} ` +
+          `Why this needs your OK: ${plan.reasons.join('; ')}. ` +
           `It will be moved into the safe zone and can be restored for ${retentionDays} days.`,
         displayReason: {
-          en: `Delete "${target}"? ${gate.decision.reasons.join('; ')}. It moves into the safe zone and can be restored for ${retentionDays} days.`,
-          zh: `删除「${target}」？${gate.decision.reasons.join('；')}。它会移入安全区，${retentionDays} 天内可以取回。`,
+          en: `Delete ${subject}? ${plan.reasons.join('; ')}. Moves into the safe zone, restorable for ${retentionDays} days.`,
+          zh: `删除${isBatch ? `这 ${plan.resolved.length} 项` : ''}${subject}？${plan.reasons.join('；')}。会移入安全区，${retentionDays} 天内可以取回。`,
         },
       }
     }
@@ -635,11 +648,9 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     },
     clean: async (dryRun) => {
       const entries = await listSafeZone(stateDir)
-      const selected = selectForPrune(entries, {
-        now: Date.now(),
-        maxBytes,
-        pruneAtPercent: numeric('pruneAtPercent', 90),
-      })
+      // `/safe-delete clean` 的语义是**用户主动清空**：不看保留期，全部移入回收站。
+      // 而 `selectForPrune` 只看保留期 —— 所以这里不能用它。
+      const selected = [...entries].sort((a, b) => a.movedAt - b.movedAt)
       if (dryRun) {
         return {
           removed: selected.map((entry) => `${entry.originalPath} (${entry.id})`),
@@ -694,9 +705,9 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       return [
         `安全区目录：${stateDir}`,
         `条目数：${entries.length}`,
-        `占用：${humanBytes(total)} / 上限 ${humanBytes(maxBytes)}`,
-        `保留期：${retentionDays} 天`,
-        `自动清理：${booleanOf('autoPrune', true) ? '开' : '关'}`,
+        `占用：${humanBytes(total)}`,
+        `保留期：${retentionDays} 天（到期移入系统回收站，不是永久删除）`,
+        `自动清理：${booleanOf('autoPrune', true) ? '开（在调用工具时顺路检查一次）' : '关'}`,
       ].join('\n')
     },
   }
@@ -925,13 +936,9 @@ async function maybeRunRequestedClean(
 
     try {
       const entries = await listSafeZone(opts.stateDir)
-      const selected = selectForPrune(entries, {
-        now: Date.now(),
-        // 「立即清理」的语义是**清空安全区**：用户手动按下就是要腾空间，
-        // 不该再受保留期或容量阈值过滤。所以把两个门槛都放宽。
-        maxBytes: 0,
-        pruneAtPercent: 100,
-      })
+      // 「立即清理」的语义是**清空安全区**：用户手动按下就是要腾空间，
+      // 不该受保留期过滤。所以直接取全部（按移入时间升序，最旧优先）。
+      const selected = [...entries].sort((a, b) => a.movedAt - b.movedAt)
 
       let moved = 0
       for (const entry of selected) {

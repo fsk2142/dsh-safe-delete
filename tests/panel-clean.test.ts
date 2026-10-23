@@ -93,28 +93,32 @@ describe('panel clean selects everything', () => {
       env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
       requestApproval: async () => 'allowed-once',
       retentionDays: 7,
-      maxBytes: 20 * 1024 ** 3,
       ...over,
     }
   }
 
-  it('selects entries that are still inside the retention window', async () => {
-    // 「立即清理」的语义是**用户主动要腾空间**，所以不该被保留期挡住。
+  it('panel clean takes everything, regardless of retention', async () => {
+    /*
+     * 「立即清理」是**用户主动要腾空间**，所以它不看保留期 —— 取全集。
+     *
+     * 注意实现上**不能**再用 `selectForPrune`：那个函数现在只按保留期过滤
+     * （时间层），拿它做"清空"会一条都选不出来。`maybeRunRequestedClean` 里
+     * 已经改成直接取 `listSafeZone` 的全部条目。
+     */
     const d = deps()
     const file = join(d.env.workdir, 'fresh.txt')
     writeFileSync(file, 'x')
     await moveToSafeZone(d.stateDir, file, { retentionDays: 30 })
-    expect(await listSafeZone(d.stateDir)).toHaveLength(1)
+    const entries = await listSafeZone(d.stateDir)
+    expect(entries).toHaveLength(1)
 
     const { selectForPrune } = await import('../src/prune')
-    const entries = await listSafeZone(d.stateDir)
 
-    // 正常策略（保留 30 天）：不该被选中。
-    const normal = selectForPrune(entries, { now: Date.now(), maxBytes: 20 * 1024 ** 3, pruneAtPercent: 90 })
-    expect(normal, '正常策略下未过期条目不应被清理').toHaveLength(0)
+    // 自动清理（按保留期）：未过期，不选。
+    expect(selectForPrune(entries, { now: Date.now() }), '未过期不该被自动清理').toHaveLength(0)
 
-    // 面板清理放宽门槛：全选。
-    const panel = selectForPrune(entries, { now: Date.now(), maxBytes: 0, pruneAtPercent: 100 })
-    expect(panel, '面板清理应选中未过期条目').toHaveLength(1)
+    // 面板清理：不经 selectForPrune，直接取全集。
+    const panel = [...entries].sort((a, b) => a.movedAt - b.movedAt)
+    expect(panel, '面板清理应包含未过期条目').toHaveLength(1)
   })
 })

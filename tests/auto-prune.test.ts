@@ -17,7 +17,6 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
     requestApproval: async () => 'allowed-once',
     retentionDays: 7,
-    maxBytes: 20 * 1024 ** 3,
     // 替身：测试绝不能真的调系统回收站（慢，而且会往回收站里扔东西）。
     // 生产路径不传 recycler，默认走真实实现。
     recycler: fakeRecycler(),
@@ -46,7 +45,7 @@ function toolOf(list: ReturnType<typeof createTools>, name: string) {
 describe('scheduled auto-prune', () => {
   it('prunes expired entries when the interval has elapsed', async () => {
     let clock = 0
-    const d = deps({ now: () => clock, autoPruneIntervalMs: DAY })
+    const d = deps({ now: () => clock})
     const dir = join(d.env.workdir, 'old')
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'a.txt'), 'x')
@@ -63,28 +62,37 @@ describe('scheduled auto-prune', () => {
     expect(await listSafeZone(d.stateDir)).toHaveLength(0)
   })
 
-  it('does not prune before the interval elapses', async () => {
+  it('prunes as soon as an entry expires, with no interval gate', async () => {
+    /*
+     * 语义变更记录：旧实现在两次清理之间有一个「检查间隔」，未到间隔就不清。
+     * 那个间隔参数已移除 —— 现在每次工具调用只看"有没有过期条目"。
+     *
+     * 为什么去掉：容量层移除后，一次清理只是"读索引、挑过期项"，开销很小，
+     * 再为此维护计时器与它的持久化反而更复杂。
+     */
     let clock = 0
-    const d = deps({ now: () => clock, autoPruneIntervalMs: 10 * DAY })
+    const d = deps({ now: () => clock })
     const tools = createTools(d)
 
-    // 先跑一次建立基线：首次调用会清理一次，此时安全区里还没有东西。
+    // 先跑一次建立基线（此时安全区是空的）。
     await toolOf(tools, 'safe_zone_status').execute({})
 
     const dir = join(d.env.workdir, 'old')
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'a.txt'), 'x')
     await moveToSafeZone(d.stateDir, dir, { retentionDays: 1, now: 0 })
+    expect(await listSafeZone(d.stateDir)).toHaveLength(1)
 
-    clock = 2 * DAY // 已过期，但距上次清理只有 2 天，没到 10 天间隔
+    // 时间推过保留期：下一次工具调用就应清掉。
+    clock = 2 * DAY
     await toolOf(tools, 'safe_zone_status').execute({})
 
-    expect(await listSafeZone(d.stateDir)).toHaveLength(1)
+    expect(await listSafeZone(d.stateDir), '过期即清，没有间隔门槛').toHaveLength(0)
   })
 
   it('skips scheduling entirely when autoPrune is off', async () => {
     let clock = 0
-    const d = deps({ now: () => clock, autoPrune: false, autoPruneIntervalMs: 1 })
+    const d = deps({ now: () => clock, autoPrune: false})
     const dir = join(d.env.workdir, 'old')
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'a.txt'), 'x')
@@ -99,7 +107,7 @@ describe('scheduled auto-prune', () => {
 
   it('does not run twice within one interval', async () => {
     let clock = 0
-    const d = deps({ now: () => clock, autoPruneIntervalMs: DAY })
+    const d = deps({ now: () => clock})
     const tools = createTools(d)
     clock = 2 * DAY
     await toolOf(tools, 'safe_zone_status').execute({})

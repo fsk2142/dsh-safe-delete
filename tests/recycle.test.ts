@@ -133,7 +133,6 @@ describe('auto-prune keeps entries it cannot recycle', () => {
       env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
       requestApproval: async () => 'allowed-once',
       retentionDays: 7,
-      maxBytes: 20 * 1024 ** 3,
       ...over,
     }
   }
@@ -142,7 +141,6 @@ describe('auto-prune keeps entries it cannot recycle', () => {
     let clock = 0
     const d = deps({
       now: () => clock,
-      autoPruneIntervalMs: DAY,
       recycler: () => ({ ok: false, reason: 'recycle bin unavailable' }),
     })
     const dir = join(d.env.workdir, 'old')
@@ -162,7 +160,6 @@ describe('auto-prune keeps entries it cannot recycle', () => {
     let clock = 0
     const d = deps({
       now: () => clock,
-      autoPruneIntervalMs: DAY,
       recycler: () => ({ ok: true }),
     })
     const dir = join(d.env.workdir, 'old')

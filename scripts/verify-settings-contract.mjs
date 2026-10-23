@@ -111,9 +111,7 @@ stateQueue = [
     {
       ns: 'dsh-safe-delete',
       value: {
-        maxBytes: 21474836480,
-        pruneAtPercent: 90,
-        autoPruneIntervalMs: 3600000,
+        // 只剩两项：容量字段已从产品移除（见 src/config.ts 的说明）。
         confirmFileCount: 5000,
         confirmBytes: 2147483648,
       },
@@ -138,9 +136,6 @@ const describePayload = {
       ns: 'dsh-safe-delete',
       autoGenerate: true,
       value: {
-        maxBytes: 21474836480,
-        pruneAtPercent: 90,
-        autoPruneIntervalMs: 3600000,
         confirmFileCount: 5000,
         confirmBytes: 2147483648,
       },
@@ -156,9 +151,7 @@ const tree = Form({})
 const text = collectText(tree)
 
 for (const [label, needle] of [
-  ['最大安全区容量', '最大安全区容量'],
-  ['提前清理阈值', '提前清理阈值'],
-  ['定时清理间隔', '定时清理间隔'],
+  // 容量相关的三个字段已从产品移除，表单只剩这两项确认阈值。
   ['单次删除条目数确认', '单次删除条目数确认'],
   ['单次删除大小确认', '单次删除大小确认'],
 ]) {
@@ -168,10 +161,8 @@ for (const [label, needle] of [
 }
 
 console.log('\n=== 2. 显示值是否换算成人类单位 ===')
+// 只剩两项字段（容量相关的三个已从产品移除）。
 for (const [label, needle] of [
-  ['20 GB', '=20'],
-  ['90 %', '=90'],
-  ['1 小时', '=1'],
   ['5000 条', '=5000'],
   ['2 GB', '=2'],
 ]) {

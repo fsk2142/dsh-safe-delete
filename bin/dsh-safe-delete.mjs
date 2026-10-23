@@ -59,13 +59,12 @@ function stateDir() {
  * 配置真实存放位置：`<DSH_HOME>/profiles/<profile>/cordis.patch.yml` 里
  * 本插件那一行的 `config:`。
  *
- * @returns `{ maxBytes, retentionDays, pruneAtPercent, source, note }`
+ * @returns `{ retentionDays, confirmFileCount, confirmBytes, crossVolumeCopy, source, note }`
  */
 function readConfigDefaults() {
   const fallback = {
-    maxBytes: 20 * 1024 ** 3,
-    retentionDays: 7,
-    pruneAtPercent: 90,
+    // 保留期默认 1 天：安全区只是短暂缓冲，到期交给系统回收站。
+    retentionDays: 1,
     confirmFileCount: 5000,
     confirmBytes: 2 * 1024 ** 3,
     crossVolumeCopy: false,
@@ -104,9 +103,7 @@ function readConfigDefaults() {
     }
 
     return {
-      maxBytes: pick('maxBytes', fallback.maxBytes),
       retentionDays: pick('retentionDays', fallback.retentionDays),
-      pruneAtPercent: pick('pruneAtPercent', fallback.pruneAtPercent),
       confirmFileCount: pick('confirmFileCount', fallback.confirmFileCount),
       confirmBytes: pick('confirmBytes', fallback.confirmBytes),
       crossVolumeCopy: pickFlag('crossVolumeCopy', fallback.crossVolumeCopy),
@@ -206,13 +203,10 @@ async function main(argv) {
       const { selectForPrune, safeZoneBytes } = await import('../lib/prune.js')
       const cfg = readConfigDefaults()
       if (cfg.source !== 'file') process.stdout.write(`(${cfg.note})\n`)
-      const selected = selectForPrune(entries, {
-        now: Date.now(),
-        maxBytes: cfg.maxBytes,
-        ...(cfg.pruneAtPercent > 0 ? { pruneAtPercent: cfg.pruneAtPercent } : {}),
-      })
+      // 只按保留期挑选：没有容量层了。
+      const selected = selectForPrune(entries, { now: Date.now() })
       if (selected.length === 0) {
-        process.stdout.write('nothing to prune\n')
+        process.stdout.write('nothing to prune (no entry has passed its retention window)\n')
         return 0
       }
       const totalSelectedBytes = safeZoneBytes(selected)
@@ -264,8 +258,7 @@ async function main(argv) {
           `state dir: ${stateDir()}`,
           `entries: ${entries.length}`,
           `total size: ${humanBytes(total)}`,
-          `capacity cap: ${humanBytes(cfg.maxBytes)}${suffix}`,
-          `retention: ${cfg.retentionDays} days${suffix}`,
+          `retention: ${cfg.retentionDays} day(s), then moved to the system recycle bin${suffix}`,
           entries.length > 0 ? `oldest expires: ${new Date(entries[0].expiresAt).toISOString()}` : 'safe zone is empty',
         ].join('\n') + '\n',
       )

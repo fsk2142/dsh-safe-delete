@@ -47,7 +47,6 @@ function harness(over: Partial<ToolDeps> = {}): Harness {
       return 'allowed-once'
     },
     retentionDays: 7,
-    maxBytes: 20 * 1024 ** 3,
     // 替身：不碰真实回收站。
     recycler: (absPath: string) => {
       const { rmSync } = require('node:fs') as typeof import('node:fs')
