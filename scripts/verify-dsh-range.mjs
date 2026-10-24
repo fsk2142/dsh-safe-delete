@@ -1,23 +1,43 @@
 import { readFileSync } from 'node:fs'
 
 /**
- * 独立验证 `engines.dsh` 的范围对各个宿主版本的判定。
+ * 独立验证 `engines.dsh` 的范围对各个宿主版本的判定，并检查声明写法。
  *
- * 语义经真实 semver 库交叉核对过（2026-10-22）。
+ * ## 宿主怎么判（app-boot 源码已核实）
+ *
+ *     function satisfies(runtimeVersion, range) {
+ *       return range.trim() !== ''
+ *         && semver.satisfies(runtimeVersion, range, { includePrerelease: true })
+ *     }
+ *
+ * **`includePrerelease: true` 是决定性的。** 实测（semver 7.8.5）：
+ *
+ *     range = '>=0.2.0-rc.2'
+ *     0.2.1-rc.3   includePrerelease:true → true
+ *                  默认（不传）           → false   ← 结论完全相反
+ *
+ * 所以自己核对时**必须**带上这个选项，否则会把兼容的版本判成不兼容。
+ *
+ * ## 两个声明不是一回事
+ *
+ * `engines.dsh` 存在时，宿主**提前返回**，`peerDependencies` 里的 dsh 范围根本
+ * 不参与加载判定（只影响 pnpm 警告）。源码原话：
+ *
+ *     An own `engines.dsh` range decides alone and peerDependencies are ignored
+ *
+ * 但 peer 也不该写成 `*` —— 那会让"声明支持哪些版本"失去表达力。规范是：
+ * 所有 `@deepseek-ai/dsh*` 包写**与 engines.dsh 相同的那个 range**，不累加、
+ * 不枚举。因为 `includePrerelease` 下 `>=0.1.7-rc.2 || >=0.2.0-rc.1` 等价于
+ * `>=0.1.7-rc.2`，后面的段全被覆盖 —— 冗余却伪装成精确范围。
+ *
+ * 第三方库（`@deepseek-ai/cordis`、`@deepseek-ai/schemastery`、`react`）不跟
+ * DSH 版本走，保持各自独立约束。
  *
  * ## 为什么是无上界
  *
- * 团队技术栈评估 §2.4 的建议是 `>=0.2.0-rc.2`，理由是宿主目前按 0.2.x-rc 迭代，
- * `>=` 会自动覆盖后续所有 0.2.x，宿主升级时这里**不需要改**。等真正出现破坏性
- * 变更时再收紧成区间。
- *
- * ## 已知的代价（写清楚，不藏着）
- *
- * 无上界意味着将来的 0.3.0 也会被判为兼容。若那时有破坏性变更，本插件会被
- * 静默装上然后行为异常，而不是明确报「不兼容」。届时的动作是：确认插件在新版
- * 上可用，然后把范围收紧成 `>=0.2.0-rc.2 <0.4.0`（或按实际破坏点定）。
- *
- * 宿主判定带 `{ includePrerelease: true }`，所以 `>=0.2.0-rc.2` 能匹配 `0.2.1-rc.2`。
+ * 宿主按 0.2.x 迭代，`>=` 自动覆盖后续 0.2.x，升级时这里不用改。代价说清楚：
+ * 将来的 0.3.0 也会被判为兼容；若那时有破坏性变更，插件会被静默装上然后行为
+ * 异常。届时的动作是确认可用后收紧成 `>=0.2.0-rc.2 <0.4.0`（或按实际破坏点定）。
  */
 const parse = (v) => {
   const m = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(v)
@@ -81,33 +101,124 @@ for (const [v, expect, why] of cases) {
 }
 
 /*
- * 检查 `dsh.compatibility.dshReleases` 这份"已验证清单"。
+ * 检查 peerDependencies 的写法是否合规。
  *
- * ## 为什么单独查
+ * ## 规则（宿主源码 `unmetRequirements` 已核实）
  *
- * `engines.dsh` 是**准入范围**（能装），`compatibility` 是**实测记录**（装上去
- * 真的跑过）。两者不是一回事：无上界的准入范围会让未来的破坏性版本也"可装"，
- * 而兼容清单才是使用者能依赖的依据。
+ *   1. 包名是 `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-` 开头 → 跟随 DSH 版本，
+ *      range 统一写成与 `engines.dsh` 相同的那一个，不累加、不枚举。
+ *   2. 其余包（cordis / schemastery / react）→ 保持独立约束，不跟 DSH 版本走。
  *
- * 这个脚本以前只查范围，所以那份清单可以从 `package.json` 里消失而无人发现。
- * 下面的检查把它补上。
+ * ## 为什么要查
+ *
+ * 宿主源码里 `engines.dsh` 存在时会**提前返回**，peer 的 dsh 范围根本不参与
+ * 加载判定（只影响 pnpm 警告）。所以写错不会立刻炸，而是长期无人发现 ——
+ * 正好是最需要脚本兜住的那类问题。
+ *
+ * 另外：在 `includePrerelease: true` 下，`>=0.1.7-rc.2 || >=0.2.0-rc.1` 这类
+ * 累加式与 `>=0.1.7-rc.2` 等价（后段全被覆盖），既冗余又伪装成精确范围。
  */
-console.log('\n=== dsh.compatibility.dshReleases（已验证清单）===')
+console.log('\n=== peerDependencies 写法 ===')
 const pkgPath = new URL('../package.json', import.meta.url)
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
-const declared = pkg.dsh?.compatibility?.dshReleases
-if (declared === undefined || Object.keys(declared).length === 0) {
-  console.log('FAIL  package.json 缺少 dsh.compatibility.dshReleases')
-  console.log('      没有这份清单，使用者无法判断插件在哪个宿主版本上被实际验证过。')
+const enginesRange = pkg.engines?.dsh
+const peers = pkg.peerDependencies ?? {}
+
+if (typeof enginesRange !== 'string' || enginesRange.trim() === '') {
+  console.log('FAIL  package.json 缺少 engines.dsh')
   fail += 1
 } else {
-  for (const [version, status] of Object.entries(declared)) {
-    // 清单里的每个版本都必须落在准入范围内，否则是自相矛盾的声明。
-    const allowed = inRange(version)
-    const ok = allowed && status === 'compatible'
-    if (!ok) fail += 1
-    const note = allowed ? '' : ' ← 不在 engines.dsh 范围内，声明矛盾'
-    console.log(`${ok ? 'ok  ' : 'FAIL'}  ${version.padEnd(12)} -> ${status}${note}`)
+  console.log(`ok    engines.dsh = ${enginesRange}`)
+}
+
+for (const [name, range] of Object.entries(peers)) {
+  const isDsh = name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-')
+  if (isDsh) {
+    const same = range === enginesRange
+    if (!same) fail += 1
+    const note = same ? '' : ` ← 应与 engines.dsh 相同（${enginesRange}），不要单独写范围`
+    console.log(`${same ? 'ok  ' : 'FAIL'}  ${name.padEnd(40)} ${range}${note}`)
+  } else {
+    // 第三方库：允许各自独立约束，只提示不判错。
+    console.log(`ok    ${name.padEnd(40)} ${range}   (第三方库，独立约束)`)
+  }
+}
+
+/*
+ * 检查一个不该存在的字段：`dsh.engines` / `dsh.compatibility`。
+ *
+ * 宿主 `unmetRequirements` 读的是**顶层** `engines.dsh`，`dsh` 对象下的同名字段
+ * 不会被任何代码消费。曾经在 1.0.4 里往那儿加过，等于给自己看的假声明。
+ */
+const phantom = []
+if (pkg.dsh?.engines !== undefined) phantom.push('dsh.engines')
+if (pkg.dsh?.compatibility !== undefined) phantom.push('dsh.compatibility')
+if (phantom.length > 0) {
+  console.log(`\nFAIL  发现宿主不读取的字段: ${phantom.join(', ')}`)
+  console.log('      宿主只读顶层 engines.dsh；这些字段不会被任何代码消费。')
+  fail += 1
+}
+
+/*
+ * 与真实 semver 交叉核对。
+ *
+ * ## 为什么需要这一步
+ *
+ * 上面那套 `parse` / `cmp` / `cmpPre` 是自研的版本比较。自研实现最容易在
+ * **预发布标识**上出错：`0.2.1-rc.3` 与 `0.2.0-rc.2` 谁大、`rc.2` 与 `rc.10`
+ * 如何排序，手写比较稍不留神就写反 —— 而且写反了脚本自己还是绿的。
+ *
+ * 所以只要环境里能找到 semver，就用它复核同一个 range 的判定。
+ * 找不到时**明确标注跳过**，不假装验证过。
+ */
+console.log('\n=== 与真实 semver 交叉核对 ===')
+/*
+ * 只从**环境变量**与**项目自身**找 semver，不硬编码本机路径。
+ *
+ * 硬编码 `C:\Users\<name>\...` 有两个问题：一是把本机用户名写进公开仓库，
+ * 二是脚本在别人的机器上永远 SKIP（等于没有这道检查）。
+ */
+const SEMVER_CANDIDATES = []
+// 1) 项目自己的 node_modules（若装了 semver）
+SEMVER_CANDIDATES.push(new URL('../node_modules/semver', import.meta.url).pathname.replace(/^\//, ''))
+// 2) 宿主安装目录：由 DSH_HOME / LOCALAPPDATA 推导，不写死用户名
+const localAppData = process.env['LOCALAPPDATA']
+if (typeof localAppData === 'string' && localAppData !== '') {
+  SEMVER_CANDIDATES.push(
+    `${localAppData}\\Programs\\DeepSeek Harness\\resources\\runtime\\primary-runtime\\dependencies\\pnpm\\dist\\node_modules\\semver`,
+  )
+}
+let semverPath = null
+for (const p of SEMVER_CANDIDATES) {
+  try {
+    readFileSync(`${p}\\package.json`)
+    semverPath = p
+    break
+  } catch {
+    /* 换下一个 */
+  }
+}
+
+if (semverPath === null) {
+  console.log('SKIP  找不到 semver 库，未做交叉核对')
+  console.log('      （自研比较仍执行过，但没有独立第三方复核）')
+} else {
+  const { createRequire } = await import('node:module')
+  const req = createRequire(import.meta.url)
+  const semver = req(semverPath)
+  let mismatch = 0
+  for (const [v, expect] of cases) {
+    // 关键：必须带 includePrerelease，与宿主 app-boot 的判定一致。
+    const real = semver.satisfies(v, `>=${LO}`, { includePrerelease: true })
+    if (real !== expect) {
+      mismatch += 1
+      console.log(`FAIL  ${v.padEnd(12)} 自研=${String(expect).padEnd(5)} semver=${real}`)
+    }
+  }
+  if (mismatch === 0) {
+    console.log(`ok    全部 ${cases.length} 个版本与 semver(${semver.SEMVER_SPEC_VERSION ?? ''}) 判定一致`)
+  } else {
+    fail += mismatch
   }
 }
 

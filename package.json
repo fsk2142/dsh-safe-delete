@@ -1,6 +1,6 @@
 {
   "name": "dsh-safe-delete",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "author": "fsk2142",
   "private": true,
   "type": "module",
@@ -64,15 +64,6 @@
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-api-remotes"
       ]
-    },
-    "engines": {
-      "dsh": ">=0.2.0-rc.2"
-    },
-    "compatibility": {
-      "dshReleases": {
-        "0.2.1-rc.2": "compatible",
-        "0.2.1-rc.3": "compatible"
-      }
     }
   },
   "scripts": {
@@ -85,6 +76,9 @@
     "dead-code": "node scripts/find-dead-code.mjs ."
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-api-remotes": ">=0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-locale": ">=0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": ">=0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
   "devDependencies": {
