@@ -104,6 +104,23 @@ describe('runCommand', () => {
     expect(reply.text).toMatch(/config/)
   })
 
+  it('states the real retention window in help, not a stale one', async () => {
+    /*
+     * 帮助文本曾经写着「7 天内可取回」，而默认保留期早就是 1 天。
+     *
+     * 这种过期的危害不是「文案不美观」：用户会据此判断「我还有 7 天」，
+     * 实际只有 1 天。文案里的数字必须与 `config.ts` 的默认值一致。
+     *
+     * 同时钉住 `clean` 的语义：它是「立即清空、不看保留期」，
+     * 而不是曾经的「清理过期与超容量部分」（容量层已在 v0.3.0 移除）。
+     */
+    const reply = await runCommand('', deps())
+    expect(reply.text, '保留期应为默认的 1 天').toContain('1 天')
+    expect(reply.text, '不该再出现 7 天的旧说法').not.toContain('7 天')
+    expect(reply.text, 'clean 的描述不应再提容量').not.toContain('超容量')
+    expect(reply.text, 'clean 应立即清空').toContain('立即清空')
+  })
+
   it('deletes a path', async () => {
     let captured = ''
     const reply = await runCommand('C:\\Work\\junk', deps({
