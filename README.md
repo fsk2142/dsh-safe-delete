@@ -79,6 +79,14 @@ dsh plugin --profile <profile> add dsh-safe-delete
 **所有 `@deepseek-ai/dsh*` 包写同一个 range**，不累加、不枚举。第三方库
 （`schemastery`、`react`）保持各自独立约束，不跟 DSH 版本走。
 
+> **已知副作用**：声明这三个 dsh peer 后，pnpm 会把它们连同传递依赖
+> （`dsh-brand`、`dsh-session`、`dsh-llm` 等，共 13 个）解析进 `pnpm-lock.yaml`，
+> 并在 `node_modules/.pnpm` 下落盘。这**只影响本地开发依赖**，不影响插件发布产物
+> （`files` 只含 `lib/`、`bin/` 等），也不影响运行时 —— 宿主忽略 dsh peer。
+>
+> 如果不想让本地装这些包，可以给它们加 `peerDependenciesMeta` 的 `optional: true`；
+> 本仓库选择保持声明完整，不加 optional。
+
 三条容易踩的事实（都已在宿主源码核实）：
 
 1. **宿主判定带 `includePrerelease: true`**：
