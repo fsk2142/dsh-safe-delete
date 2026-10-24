@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+
 /**
  * 独立验证 `engines.dsh` 的范围对各个宿主版本的判定。
  *
@@ -76,6 +78,37 @@ for (const [v, expect, why] of cases) {
   const ok = got === expect
   if (!ok) fail += 1
   console.log(`${ok ? 'ok  ' : 'FAIL'}  ${v.padEnd(12)} -> ${String(got).padEnd(5)}  (${why})`)
+}
+
+/*
+ * 检查 `dsh.compatibility.dshReleases` 这份"已验证清单"。
+ *
+ * ## 为什么单独查
+ *
+ * `engines.dsh` 是**准入范围**（能装），`compatibility` 是**实测记录**（装上去
+ * 真的跑过）。两者不是一回事：无上界的准入范围会让未来的破坏性版本也"可装"，
+ * 而兼容清单才是使用者能依赖的依据。
+ *
+ * 这个脚本以前只查范围，所以那份清单可以从 `package.json` 里消失而无人发现。
+ * 下面的检查把它补上。
+ */
+console.log('\n=== dsh.compatibility.dshReleases（已验证清单）===')
+const pkgPath = new URL('../package.json', import.meta.url)
+const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+const declared = pkg.dsh?.compatibility?.dshReleases
+if (declared === undefined || Object.keys(declared).length === 0) {
+  console.log('FAIL  package.json 缺少 dsh.compatibility.dshReleases')
+  console.log('      没有这份清单，使用者无法判断插件在哪个宿主版本上被实际验证过。')
+  fail += 1
+} else {
+  for (const [version, status] of Object.entries(declared)) {
+    // 清单里的每个版本都必须落在准入范围内，否则是自相矛盾的声明。
+    const allowed = inRange(version)
+    const ok = allowed && status === 'compatible'
+    if (!ok) fail += 1
+    const note = allowed ? '' : ' ← 不在 engines.dsh 范围内，声明矛盾'
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  ${version.padEnd(12)} -> ${status}${note}`)
+  }
 }
 
 console.log(`\n不符预期: ${fail}`)

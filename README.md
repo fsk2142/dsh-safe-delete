@@ -58,6 +58,30 @@ dsh plugin --profile <profile> add dsh-safe-delete
 这意味着 `never` 策略下有一类删除**既不弹卡、也不进安全区**。如果你需要每一
 次删除都可恢复，请使用 `ask` 策略的权限预设。
 
+### 宿主版本兼容性
+
+| 项 | 值 |
+|---|---|
+| 准入范围（能装） | `dsh: >=0.2.0-rc.2`，无上界 |
+| 实测通过（真的跑过） | `0.2.1-rc.2`、`0.2.1-rc.3` |
+| Node 要求 | `>=22.19.0` |
+
+`engines.dsh` 与 `dsh.compatibility.dshReleases` 是**两回事**：前者是准入范围，
+后者是实测记录。无上界的范围会让未来的破坏性版本也"可装"，所以判断能不能用
+要看兼容清单，而不是只看范围。
+
+新增一个宿主版本的验证流程：
+
+```bash
+node scripts/verify-dsh-range.mjs    # 范围判定 + 兼容清单一致性
+pnpm vitest run                      # 421 项测试
+npx tsx scripts/verify-interception.ts   # 拦截链集成
+```
+
+三项都过，就把版本加进 `package.json` 的 `dsh.compatibility.dshReleases`。
+`verify-dsh-range.mjs` 会检查清单里的版本是否落在准入范围内 —— 两者矛盾
+（例如清单写了 `0.1.x` 而准入门槛是 `>=0.2.0-rc.2`）会直接报 FAIL。
+
 ## 用
 
 模型侧工具：
