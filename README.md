@@ -60,27 +60,62 @@ dsh plugin --profile <profile> add dsh-safe-delete
 
 ### 宿主版本兼容性
 
+```json
+"engines": { "dsh": ">=0.2.0-rc.2" },
+"peerDependencies": {
+  "@deepseek-ai/dsh-api-remotes": ">=0.2.0-rc.2",
+  "@deepseek-ai/dsh-client-locale": ">=0.2.0-rc.2",
+  "@deepseek-ai/dsh-client-ui-settings": ">=0.2.0-rc.2",
+  "@deepseek-ai/schemastery": "^3.18.2"
+}
+```
+
 | 项 | 值 |
 |---|---|
-| 准入范围（能装） | `dsh: >=0.2.0-rc.2`，无上界 |
-| 实测通过（真的跑过） | `0.2.1-rc.2`、`0.2.1-rc.3` |
+| 准入门槛 | `dsh: >=0.2.0-rc.2`（无上界） |
+| 实测通过 | `0.2.1-rc.2`、`0.2.1-rc.3` |
 | Node 要求 | `>=22.19.0` |
 
-`engines.dsh` 与 `dsh.compatibility.dshReleases` 是**两回事**：前者是准入范围，
-后者是实测记录。无上界的范围会让未来的破坏性版本也"可装"，所以判断能不能用
-要看兼容清单，而不是只看范围。
+**所有 `@deepseek-ai/dsh*` 包写同一个 range**，不累加、不枚举。第三方库
+（`schemastery`、`react`）保持各自独立约束，不跟 DSH 版本走。
 
-新增一个宿主版本的验证流程：
+三条容易踩的事实（都已在宿主源码核实）：
+
+1. **宿主判定带 `includePrerelease: true`**：
+   `semver.satisfies(v, range, { includePrerelease: true })`。
+   不带这个选项时，`>=0.2.0-rc.2` **匹配不到** `0.2.1-rc.3`，结论完全相反。
+   自己核对时务必带上。
+2. **`engines.dsh` 存在时 `peerDependencies` 被完全忽略**。源码原话：
+   *"An own `engines.dsh` range decides alone and peerDependencies are ignored"*。
+   所以 peer 的范围只影响 pnpm 警告，不影响加载 —— 但也别写 `*`，那会让
+   "声明支持哪些版本"失去表达力。
+3. **累加式是冗余的**。`includePrerelease` 下
+   `>=0.1.7-rc.2 || >=0.2.0-rc.1 || >=0.2.1-rc.2` 等价于 `>=0.1.7-rc.2`，
+   后面的段全被覆盖，却伪装成精确范围。
+
+### 升级 DSH 后按这个顺序查
+
+不要一上来改版本号，先确认到底要不要改：
+
+| 顺序 | 查什么 | 不改的条件 |
+|---|---|---|
+| 1 | `engines.dsh` 是否需要动 | 新版本仍 `>=0.2.0-rc.2` → 不用改 |
+| 2 | 运行时依赖是否都在 | 读新 `app.asar` 确认插件 import 的包存在 |
+| 3 | 关键 API 是否变 | `LlmAdapter` / `registerAdapter` / `TypertRemoteService` / `registerSearchProvider` |
+| 4 | 数据形状是否变 | 例如 `web_search` 返回的 `truncated` 是否仍必填 |
+| 5 | `pnpm test` 全绿 | 绿了才算兼容 |
+
+本插件的自动化检查：
 
 ```bash
-node scripts/verify-dsh-range.mjs    # 范围判定 + 兼容清单一致性
-pnpm vitest run                      # 421 项测试
+node scripts/verify-dsh-range.mjs        # 范围判定 + peer 写法 + semver 交叉核对
+pnpm vitest run                          # 421 项测试
 npx tsx scripts/verify-interception.ts   # 拦截链集成
 ```
 
-三项都过，就把版本加进 `package.json` 的 `dsh.compatibility.dshReleases`。
-`verify-dsh-range.mjs` 会检查清单里的版本是否落在准入范围内 —— 两者矛盾
-（例如清单写了 `0.1.x` 而准入门槛是 `>=0.2.0-rc.2`）会直接报 FAIL。
+`verify-dsh-range.mjs` 会检查：所有 `@deepseek-ai/dsh*` peer 是否与 `engines.dsh`
+同范围、是否混入了宿主不读的字段（如 `dsh.engines`）、以及自研版本比较与真实
+`semver` 的判定是否一致（找不到 semver 库时会**明确标 SKIP**，不假装验证过）。
 
 ## 用
 
