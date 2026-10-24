@@ -145,18 +145,42 @@ for (const [name, range] of Object.entries(peers)) {
 }
 
 /*
- * 检查一个不该存在的字段：`dsh.engines` / `dsh.compatibility`。
+ * 两个 `dsh.*` 子字段：一个该报错，一个只是可选记录 —— 不能一视同仁。
  *
- * 宿主 `unmetRequirements` 读的是**顶层** `engines.dsh`，`dsh` 对象下的同名字段
- * 不会被任何代码消费。曾经在 1.0.4 里往那儿加过，等于给自己看的假声明。
+ * ## `dsh.engines` → FAIL
+ *
+ * 宿主 `unmetRequirements` 读的是**顶层** `engines.dsh`。`dsh.engines` 这个名字
+ * 已经用于**声明的语义位**（顶层那个才是判据），在 `dsh` 对象下再写一份只会让人
+ * 以为改它能生效。曾经在 1.0.4 里犯过这个错。
+ *
+ * ## `dsh.compatibility.dshReleases` → 允许，但要查一致性
+ *
+ * 按团队规范（`DSH-VERSION-RANGE.md` 第七条），它是**给人看的验证记录**，不参与
+ * 宿主判定。所以不能因为"宿主不读"就报错 —— 那会把一个合法的可选字段判成缺陷。
+ *
+ * 该查的是它内部的自洽：若 `engines.dsh` 声明 `>=0.2.0-rc.2`，清单里就不该出现
+ * `0.1.7-rc.2`，否则读者会以为那个老版本仍被支持。
  */
-const phantom = []
-if (pkg.dsh?.engines !== undefined) phantom.push('dsh.engines')
-if (pkg.dsh?.compatibility !== undefined) phantom.push('dsh.compatibility')
-if (phantom.length > 0) {
-  console.log(`\nFAIL  发现宿主不读取的字段: ${phantom.join(', ')}`)
-  console.log('      宿主只读顶层 engines.dsh；这些字段不会被任何代码消费。')
+if (pkg.dsh?.engines !== undefined) {
+  console.log('\nFAIL  发现 dsh.engines（宿主不读，判据只在顶层 engines.dsh）')
   fail += 1
+}
+
+const releases = pkg.dsh?.compatibility?.dshReleases
+if (releases !== undefined) {
+  console.log('\n=== dsh.compatibility.dshReleases（可选的人工记录）===')
+  if (typeof releases !== 'object' || releases === null) {
+    console.log('FAIL  dshReleases 不是对象')
+    fail += 1
+  } else {
+    for (const [version, status] of Object.entries(releases)) {
+      // 清单里的版本必须落在 engines.dsh 范围内，否则两种声明自相矛盾。
+      const allowed = inRange(version)
+      if (!allowed) fail += 1
+      const note = allowed ? '' : ` ← 不在 engines.dsh（${enginesRange}）范围内，与声明矛盾`
+      console.log(`${allowed ? 'ok  ' : 'FAIL'}  ${version.padEnd(12)} ${status}${note}`)
+    }
+  }
 }
 
 /*

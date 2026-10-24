@@ -87,6 +87,28 @@ dsh plugin --profile <profile> add dsh-safe-delete
 > 如果不想让本地装这些包，可以给它们加 `peerDependenciesMeta` 的 `optional: true`；
 > 本仓库选择保持声明完整，不加 optional。
 
+### 体积：不要靠 external 优化，也不要删 `.d.ts`
+
+两条都是实测踩出来的，与直觉相反：
+
+| 直觉 | 实测 |
+|---|---|
+| external 更省体积 | **inline 反而更省**。参考项目实测：inline 一个 1.44 MB 的包，external 却要装 3.9 MB / 832 个文件 |
+| 删 `.d.ts` 能瘦身 | **会让 `package.json` 指向不存在的文件**。`exports` 里声明了 `types` 字段 |
+
+本插件的现状：
+
+| 项 | 值 |
+|---|---|
+| `lib/` 产物体积 | 196 KB / 18 个文件 |
+| 运行时 `dependencies` | `{}`（无第三方运行时依赖） |
+| `external` 的对象 | 只有宿主提供的包（`schemastery`、`react`、`dsh-client-*`） |
+| 4 个 `types` 字段指向的文件 | 全部存在（脚本会校验） |
+
+`external` 在这里不是为了瘦身，是因为**实例身份**：inline 一份 `schemastery`
+进去，`.volatile()` 的引用语义就和宿主那份不是同一个实现，
+`instanceof` 与服务注册会认不出来。这个理由写在 `tsdown.config.ts` 里。
+
 三条容易踩的事实（都已在宿主源码核实）：
 
 1. **宿主判定带 `includePrerelease: true`**：
