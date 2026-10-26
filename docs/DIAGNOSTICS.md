@@ -1,130 +1,86 @@
-# 配置页诊断手册
+# 配置页诊断
 
-这份文档解释插件客户端在宿主里的**启动链**：每一步在做什么、失败时意味着什么、该怎么查。
+配置页不显示、显示但保存无效时，按下面的顺序查。
 
-**诊断记录不再显示在界面上。** 早期版本在表单顶部有一个折叠面板，已移除——日常使用
-不需要看到它。现在记录在两个地方：
+## 读取诊断记录
 
-| 位置 | 怎么读 |
+| 位置 | 读法 |
 |---|---|
-| `globalThis.__dshSafeDeleteDiag` | 浏览器控制台输入这个名字，得到完整数组 |
-| 页面标题后缀 | 形如 `… · dsh-safe-delete ✓11 ✗1`，不开控制台也知道有没有失败 |
+| 浏览器控制台 | 输入 `globalThis.__dshSafeDeleteDiag` |
+| 页面标题 | 形如 `… · dsh-safe-delete ✓11 ✗1`，`✗` 的个数即失败步骤数 |
 
-每条记录的形状是 `{ at, step, ok, detail? }`。
+记录形状：`{ at, step, ok, detail? }`
 
-## 为什么需要它
+## 症状对照
 
-配置页连续多轮不显示、显示但不生效、输入写不进去——这三种故障在界面上长得不一样，
-但**原因往往同源**：客户端插件在宿主里的启动链有若干必须依次成立的环节，任何一环断掉，
-界面只会呈现一个"空"，不会告诉你断在哪。
+| 症状 | 查哪一步 | 处理 |
+|---|---|---|
+| 配置页完全不出现 | 1、4 | 见下方步骤 1 与 4 |
+| 标题显示空白 | 2 | 检查 `locale` 是否在顶层 `inject` |
+| 配置页出现但表单为空 | 3、8 | 检查 `remote` / `remote.settings` 成对声明 |
+| 显示默认值，保存后变回原样 | 9、10 | 看原始形状（第 11 步） |
+| 保存提示冲突 | 12 | 检查 revision 是否随请求发送 |
 
-下面这 12 步逐一记下来，就是为了让"空"变成一个具体的失败点。
+## 步骤
 
-## 步骤说明
+### 1 `apply() entered — inject=[...]`
 
-### 1. `apply() entered — inject=[...]`
+**✗ 时**：客户端 `apply` 未执行。检查顶层 `inject` 声明的服务是否都能解析。
 
-宿主真的调用了客户端的 `apply`，并给出顶层 `inject` 声明。
+### 2 `register locale dictionaries`
 
-**✗ 时**：说明 `apply` 从未执行。最常见原因是顶层 `inject` 里有服务解析不出来 ——
-cordis 会让 fiber 停在 `FIBER_PENDING`，`apply` 永不运行。
-本插件顶层只声明 `['slots','locale']`，就是为了缩小这个风险面。
+**✗ 时**：`ctx.locale` 不可用。确认 `locale` 在顶层 `inject` 里。
 
-### 2. `register locale dictionaries`
+### 3 `capture the settings remote for the form`
 
-注册本命名空间的中英文案字典。
+**✗ 时**：`ctx.inject(['remote','remote.settings'])` 取不到服务。两者必须都声明。
 
-**✗ 时**：`ctx.locale` 不可用。槽位标签会解析成空字符串，配置页标题可能显示为空白。
-检查 `locale` 是否在顶层 `inject` 里。
+### 4 `register the config page on the plugin page`
 
-### 3. `capture the settings remote for the form`
+**✗ 时**：未注册 `configForms` 服务，或槽位名/key 写错。槽位名写错不报错，只是不显示。
 
-在 `apply` 阶段把 `remote.settings` 取出来存进模块变量，供组件读取。
+### 5 / 6 `publish diagnostics`
 
-**关键**：组件渲染期**不能**直接访问 `ctx.remote` —— 那会被 cordis 的服务守卫拦下，
-抛出 `cannot get property "remote" without inject`，而 React 错误边界会让整块界面变空白。
-所以必须在 `apply` 里取好。
+把诊断挂到 `globalThis` 与 `document.title`。
 
-**✗ 时**：`ctx.inject(['remote','remote.settings'])` 拿不到服务。
-注意 `ctx.remote.settings` 是**两步属性求值**，`remote` 与 `remote.settings` 都必须声明。
+### 7 `capture settings remote — ok`
 
-### 4. `register the config page on the plugin page`
+`apply` 已取到 remote。
 
-把表单注册到 `plugins.bundle.config` 槽位，key 是**包名**。
+### 8 `configForms service`
 
-**✗ 时**：通常是没有注册 `configForms` 服务，或槽位名/key 写错。
-槽位名写错**不会报错**，只会永远不显示。
+**✗ 时**：宿主未提供配置表单服务，表单不会出现。
 
-### 5/6. `publish diagnostics`
+### 9 `describe() envelope — unwrapped`
 
-把诊断数组挂到 `globalThis`（控制台可查）并写进 `document.title`。
+**✗ 时**：`describe()` 返回 `{ ok: false, error }`，按 error 内容处理。
 
-**用途**：当槽位没渲染时，插件自己的 UI 根本不存在，标题栏是唯一还能传达信息的地方。
-
-### 7. `capture settings remote — ok`
-
-`apply` 确实拿到了 remote。
-
-### 8. `configForms service`
-
-`configForms.get()` / `whileServed()` 可用。
-
-**✗ 时**：宿主没提供配置表单服务，表单不会出现。
-
-### 9. `describe() envelope — unwrapped`
-
-**这一条曾经是 bug 的藏身处。**
-
-宿主 `describe()` 返回的是信封：
+返回形状：
 
 ```json
 { "ok": true, "value": { "writable": true, "namespaces": [...] } }
 ```
 
-真实数据在 `value.namespaces`。如果按 `payload.namespaces` 读，永远拿到 `undefined`，
-于是界面**永远显示 schema 默认值**，而保存其实成功了 —— 表现为"改完保存又变回原样"。
+数据在 `value.namespaces`。
 
-**✗ 时**：`describe()` 返回 `{ ok: false, error }`，看 error 内容。
+### 10 `host namespaces — ...`
 
-### 10. `host namespaces — ...`
+输出形如 `dsh-safe-delete(7 keys), agent-default-model(3 keys), ...`
 
-宿主返回的命名空间列表，形如 `dsh-safe-delete(7 keys), agent-default-model(3 keys), ...`
-
-**怎么读**：
-
-| 现象 | 含义 | 处理 |
-|---|---|---|
-| 列表里**没有** `dsh-safe-delete` | 命名空间名不匹配，或插件未装进该 profile | 检查包名与 `NAMESPACE` |
-| 有，但括号是 `(0 keys)` | 命名空间存在但值是空的 | 尚未保存过配置，显示默认值是正常的 |
-| 有，且 `(N keys)` | 正常，已读到配置 | — |
-
-### 11. `describe() raw — ...`
-
-原始 JSON（截断 400 字符）。这是**排查时最有用的一条**：当上面的解析结果看起来不对，
-直接看原始形状就能判断是字段名不同、还是值被投影剥离了。
-
-### 12. `picked namespace value — N keys, revision=M`
-
-最终选中的那个命名空间有几个键、修订号是多少。
-
-**revision 的用途**：保存时要把 revision 一起发给宿主，否则连续两次保存会撞上自己上一次
-产生的修订号，第二次被当作冲突拒绝。
-
-## 常见组合
-
-| 组合 | 结论 |
+| 现象 | 处理 |
 |---|---|
-| 第 1 步就 ✗ | `apply` 没跑，查顶层 `inject` 是否可满足 |
-| 1–8 全 ✓，第 10 步 `empty list` | 命名空间对不上或插件未生效 |
-| 第 10 步有 N keys，但界面仍是默认值 | 解析层级错了（即第 9 步那个信封问题） |
-| 全 ✓，界面正常，但保存后回退 | 不要覆盖界面：宿主回读可能仍是旧快照 |
-| 全 ✓，但提示"回读到的仍是旧值" | 写入已提交，宿主视图未刷新，重启后可确认 |
+| 列表里没有 `dsh-safe-delete` | 检查包名与 `NAMESPACE` 是否一致，确认插件已装进该 profile |
+| 有，括号是 `(0 keys)` | 尚未保存过配置，显示默认值属正常 |
+| 有，`(N keys)` | 已读到配置 |
 
-## 与测试的关系
+### 11 `describe() raw — ...`
 
-这些步骤里，第 9 步（信封）和第 12 步（revision）都曾经在**测试全绿**的情况下出错。
-原因见 `tests/client-interaction.test.ts` 的注释：假 remote 如果返回的形状与真实宿主不同，
-测试就会自洽地通过，而真实环境失败。
+原始 JSON，截断 400 字符。字段名不符或被投影剥离时，看这里。
 
-**推论**：测试替身的形状必须与外部系统的真实契约一致；fixture 也不能用默认值，
-否则"读到了"和"回落到默认值"在界面上无法区分。
+### 12 `picked namespace value — N keys, revision=M`
+
+保存时必须把 revision 一起发给宿主，否则连续两次保存会被判为冲突。
+
+## 参考
+
+`tests/client-interaction.test.ts` 的假 remote 需与宿主真实契约同形，fixture 不能用默认值 —— 否则「读到了」与「回落到默认值」在界面上无法区分。
