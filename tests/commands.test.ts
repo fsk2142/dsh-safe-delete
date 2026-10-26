@@ -67,6 +67,9 @@ describe('parsing values with units', () => {
     expect(parseSetting(guide, '2d')).toEqual({ ok: true, value: 2 })
     expect(parseSetting(guide, '1d')).toEqual({ ok: true, value: 1 })
     expect(parseSetting(guide, '0d').ok, '至少 1 天').toBe(false)
+    expect(parseSetting(guide, '365d'), '上限本身应接受').toEqual({ ok: true, value: 365 })
+    expect(parseSetting(guide, '366d').ok, '超过 365 天应拒绝').toBe(false)
+    expect(parseSetting(guide, '1000d').ok, '明显超限应拒绝').toBe(false)
   })
 
   it('accepts booleans in several spellings', () => {

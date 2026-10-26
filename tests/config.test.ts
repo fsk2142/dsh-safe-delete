@@ -44,6 +44,21 @@ describe('config schema', () => {
     expect((unwrapConfig(parsed) as Record<string, unknown>)['confirmBytes']).toBe(1234)
   })
 
+  it('declares retentionDays as volatile so the settings form can edit it', () => {
+    /*
+     * 宿主只在 settings 表单里暴露 `.volatile()` 字段。`retentionDays` 是从
+     * 「固定 1 天」改成可编辑的，如果漏了 `.volatile()`，界面会**不显示**这个
+     * 输入框 —— 而且不报错。
+     *
+     * 这条只看声明形态（是引用而不是裸数字），不看值。
+     */
+    const parsed = Config({ retentionDays: 5 })
+    const raw = (parsed as unknown as Record<string, unknown>)['retentionDays']
+    expect(typeof raw, 'retentionDays 必须是引用（.volatile()），否则界面改不了').not.toBe('number')
+    expect((raw as { get: () => unknown }).get()).toBe(5)
+    expect((unwrapConfig(parsed) as Record<string, unknown>)['retentionDays']).toBe(5)
+  })
+
   it('keeps non-volatile fields as plain values', () => {
     const parsed = Config({})
     const rawValue = (parsed as unknown as Record<string, unknown>)['crossVolumeCopy']

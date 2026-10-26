@@ -38,7 +38,7 @@ export const SETTING_GUIDES: readonly SettingGuide[] = [
     unit: 'days',
     summary: '删掉的东西在安全区里放多少天。到期后移入系统回收站，不是永久删除。',
     effect: '调大：安全区停留更久，占用磁盘更久。调小：更早交给回收站。',
-    range: '至少 1 天；默认 1 天',
+    range: '1 到 365 天；默认 1 天',
     defaultValue: 1,
   },
   {
@@ -200,6 +200,13 @@ export function parseSetting(guide: SettingGuide, raw: string): ParseSetting {
   if (guide.unit === 'days') {
     const days = Math.round(amount)
     if (days < 1) return { ok: false, error: `至少 1 天。范围：${guide.range}` }
+    /*
+     * 上限与界面保持一致（界面表单是 min:1 max:365）。
+     *
+     * 两处不一致的后果是静默的：`/safe-delete config retentionDays 9999` 会成功，
+     * 而界面上根本填不进去。同一个参数不该有两个有效范围。
+     */
+    if (days > 365) return { ok: false, error: `最多 365 天。范围：${guide.range}` }
     return { ok: true, value: days }
   }
 

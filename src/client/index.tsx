@@ -63,17 +63,33 @@ const GIGABYTE = 1024 * 1024 * 1024
 /**
  * 表单字段。
  *
- * ## 只剩两项：都是「单次删除要不要额外确认」的阈值
+ * ## 三项
+ *
+ * 1. 保留天数（整数天）
+ * 2. 单次删除条目数确认
+ * 3. 单次删除大小确认
  *
  * 容量相关的三个参数（`maxBytes` / `pruneAtPercent` / `autoPruneIntervalMs`）
- * 已经**从产品和配置里移除**：安全区只按保留期（固定 1 天）清理，到点把条目交给
- * 系统回收站。不留容量管理，语义才可预测——删进去的东西不会因为"超上限"被立刻
- * 推走，而界面却还说能恢复。
+ * 已经从产品和配置里移除：安全区只按保留期清理，到点把条目交给系统回收站。
  *
  * `stateDir`、`blockShellDeletes` 这类也不放表单：前者改动风险高（换目录等于让
  * 现有安全区「消失」），后者属于核心安全语义（关掉拦截）。
  */
 const FIELDS: FieldSpec[] = [
+  {
+    key: 'retentionDays',
+    label: '安全区保留天数',
+    hint: '删除的条目在安全区停留多少天，到期移入系统回收站。填整数，至少 1 天。',
+    /*
+     * 用 `number` 而不是新的 `'days'` 类型：天数本身就是整数、没有单位换算，
+     * `number` 分支的渲染（`String(current)`）和写回（原值）正好合适。
+     * 新加一种 kind 要改 9 处分支，没有必要。
+     */
+    kind: 'number',
+    min: 1,
+    max: 365,
+    fallback: 1,
+  },
   {
     key: 'confirmFileCount',
     label: '单次删除条目数确认',
@@ -484,7 +500,14 @@ export function SafeZoneSettings(): ReactElement {
               : 60 * 60 * 1000
       value = Math.round(amount * unit)
     } else {
-      value = amount
+      /*
+       * 纯数字字段（天数、条目数）一律取整。
+       *
+       * 天数的语义是整数天：写入 2.5 会让 `expiresAt` 落在半天后，而界面上
+       * 显示的是「2.5 天」—— 用户以为设了 2 天半，实际行为也没错，但配置里
+       * 存个小数的意义是零，不如在入口就取整。
+       */
+      value = Math.round(amount)
     }
 
     // 第二步：拿**换算后**的值和边界比较。

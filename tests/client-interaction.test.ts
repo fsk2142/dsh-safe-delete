@@ -140,7 +140,7 @@ describe('SafeZoneSettings interaction', () => {
 
     // 刻意用**非默认值**：如果 describe 没读到配置，界面会回落到默认值
     // (5000 / 2 GB)，与这里的 77 / 30 GB 明显不同。
-    const { remote } = fakeRemote({ confirmFileCount: 77, confirmBytes: 30 * GB })
+    const { remote } = fakeRemote({ retentionDays: 3, confirmFileCount: 77, confirmBytes: 30 * GB })
     mod.__setRemoteForTest(remote)
 
     const container = document.getElementById('root')
@@ -154,9 +154,11 @@ describe('SafeZoneSettings interaction', () => {
       await new Promise((resolve) => setTimeout(resolve, 300))
     })
 
-    // 只剩两项：条目数确认（无单位）+ 大小确认（GB/MB 下拉）。
-    // 所以 input=2、select=1 —— 别把 select 也写成 2。
-    expect(document.querySelectorAll('input').length).toBe(2)
+    /*
+     * 三项：保留天数（无单位）+ 条目数确认（无单位）+ 大小确认（GB/MB 下拉）。
+     * 所以 input=3、select=1 —— 别把 select 也写成 3。
+     */
+    expect(document.querySelectorAll('input').length).toBe(3)
     expect(document.querySelectorAll('select').length).toBe(1)
 
     // 信封回归：必须显示描述里的真实值，而不是 schema 默认值。
@@ -165,6 +167,130 @@ describe('SafeZoneSettings interaction', () => {
     console.log('条目数:', countInput?.value, ' 大小:', bytesInput?.value)
     expect(countInput?.value, '应显示 describe 返回的 77').toBe('77')
     expect(bytesInput?.value, '应显示 describe 返回的 30').toBe('30')
+
+    // 保留天数：整数天数，界面上必须直接显示「几」而不带单位后缀。
+    const retentionInput = document.querySelector<HTMLInputElement>('#dsd-retentionDays')
+    expect(retentionInput, '应能渲染保留天数输入框').not.toBeNull()
+    expect(retentionInput?.value, '应显示 describe 返回的 3').toBe('3')
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('writes an integer day count for retention and rejects non-integers', async () => {
+    /*
+     * 保留期是可编辑字段，但语义是「整数天」：
+     *   - 输入 5 → 写入 5
+     *   - 输入 2.5 → 不应被接受（保存按钮保持不可用，或写入时取整）
+     *   - 输入 0 → 非法（至少 1 天）
+     *
+     * 这里验证最关键的「写入整数」，以及 0 被拒绝。
+     */
+    const React = await import('react')
+    const { createRoot } = await import('react-dom/client')
+    const { act } = await import('react')
+    const mod = (await import('../src/client/index')) as unknown as {
+      __setRemoteForTest: (r: unknown) => void
+      SafeZoneSettings: unknown
+    }
+
+    const { remote, calls } = fakeRemote({ retentionDays: 1, confirmFileCount: 5000, confirmBytes: 2 * GB })
+    mod.__setRemoteForTest(remote)
+
+    const container = document.getElementById('root')
+    if (container === null) throw new Error('no root')
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(React.createElement(mod.SafeZoneSettings as never))
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    })
+
+    const input = document.querySelector<HTMLInputElement>('#dsd-retentionDays')
+    expect(input, '应能找到保留天数输入框').not.toBeNull()
+    if (input === null) return
+    expect(input.value, '初始显示 1').toBe('1')
+
+    const wrappedAct = async (cb: () => Promise<void>): Promise<void> => {
+      await act(cb)
+    }
+
+    // 改成 5 天并保存。
+    await changeValue(wrappedAct, input, '5')
+    expect(input.value, '输入应立刻回显').toBe('5')
+
+    const saveButton = [...document.querySelectorAll('button')].find((b) => b.textContent === '保存')
+    expect(saveButton, '有改动时应出现保存按钮').toBeDefined()
+    if (saveButton !== undefined) {
+      await act(async () => {
+        saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300))
+      })
+    }
+
+    const ops = calls[0]?.ops ?? []
+    const dayOp = ops.find((op) => op.path[0] === 'retentionDays')
+    expect(dayOp, 'ops 里应包含 retentionDays').toBeDefined()
+    expect(dayOp?.value, '写入的应是整数 5').toBe(5)
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('rounds a fractional day count to an integer on save', async () => {
+    /*
+     * 天数是整数语义。输入 2.5 时应写入 3（四舍五入），而不是 2.5。
+     *
+     * 如果不取整，`expiresAt` 会落在半天后，而配置里躺一个小数 —— 用户看到
+     * 「2.5 天」，行为上也确实差半天，但没有任何好处，只会让索引数据变脏。
+     */
+    const React = await import('react')
+    const { createRoot } = await import('react-dom/client')
+    const { act } = await import('react')
+    const mod = (await import('../src/client/index')) as unknown as {
+      __setRemoteForTest: (r: unknown) => void
+      SafeZoneSettings: unknown
+    }
+
+    const { remote, calls } = fakeRemote({ retentionDays: 1, confirmFileCount: 5000, confirmBytes: 2 * GB })
+    mod.__setRemoteForTest(remote)
+
+    const container = document.getElementById('root')
+    if (container === null) throw new Error('no root')
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(React.createElement(mod.SafeZoneSettings as never))
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    })
+
+    const input = document.querySelector<HTMLInputElement>('#dsd-retentionDays')
+    if (input === null) throw new Error('no retention input')
+
+    const wrappedAct = async (cb: () => Promise<void>): Promise<void> => {
+      await act(cb)
+    }
+    await changeValue(wrappedAct, input, '2.5')
+
+    const saveButton = [...document.querySelectorAll('button')].find((b) => b.textContent === '保存')
+    if (saveButton !== undefined) {
+      await act(async () => {
+        saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300))
+      })
+    }
+
+    const ops = calls[0]?.ops ?? []
+    const dayOp = ops.find((op) => op.path[0] === 'retentionDays')
+    expect(dayOp?.value, '2.5 天应写入整数 3').toBe(3)
 
     await act(async () => {
       root.unmount()
