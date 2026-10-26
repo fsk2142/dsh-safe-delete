@@ -35,6 +35,39 @@ export interface MoveOptions {
 const INDEX_FILE = 'index.json'
 const ITEMS_DIR = 'items'
 
+/** 保留天数的硬边界。与表单、斜杠命令的取值范围保持一致。 */
+const RETENTION_MIN_DAYS = 1
+const RETENTION_MAX_DAYS = 365
+
+/**
+ * 把保留天数收进安全区间。
+ *
+ * ## 为什么在消费处也要钳
+ *
+ * 表单（`client/index.tsx`）和斜杠命令（`settings-guide.ts`）都限制 1–365 天，
+ * 但**配置文件可以手改**。上游的校验不是数据完整性的最后一道关口。
+ *
+ * 不钳的后果有两级，都不是「保留更久」那么轻：
+ *
+ * 1. **`retentionDays: 0` 或负数** → `expiresAt` 落在过去 → 条目刚删进去就被判定
+ *    过期，下一轮清理直接进回收站。用户以为有保留期，实际没有。
+ * 2. **极大值** → `Date.now() + 1e8 * 86400000` 超出 Date 可表示范围，得到
+ *    `Invalid Date`。而 `expiresAt <= now` 对 `NaN` 恒为 false，于是该条目
+ *    **永远不会被清理**，且不报任何错。
+ *
+ * 两种情况都是静默的。所以钳制放在真正写 `expiresAt` 的地方，而不是只放在入口。
+ *
+ * @param days 上游给的天数（可能非法）。
+ * @returns 落在 `[1, 365]` 内的整数天数。
+ */
+function clampRetentionDays(days: number): number {
+  if (!Number.isFinite(days)) return RETENTION_MIN_DAYS
+  const whole = Math.round(days)
+  if (whole < RETENTION_MIN_DAYS) return RETENTION_MIN_DAYS
+  if (whole > RETENTION_MAX_DAYS) return RETENTION_MAX_DAYS
+  return whole
+}
+
 /** 索引路径。 */
 function indexPath(stateDir: string): string {
   return path.join(stateDir, INDEX_FILE)
@@ -225,7 +258,8 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
     id,
     originalPath: target,
     movedAt: now,
-    expiresAt: now + opts.retentionDays * 24 * 60 * 60 * 1000,
+    // 保留天数在**消费处**再钳一次，不信上游。
+    expiresAt: now + clampRetentionDays(opts.retentionDays) * 24 * 60 * 60 * 1000,
     bytes: description.bytes,
     fileCount: description.fileCount,
     isDirectory: description.isDirectory,

@@ -246,8 +246,17 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     ...resolveInstallDir(),
   }
 
-  // 保留期固定 1 天：安全区只是短暂缓冲，到期交给系统回收站。
-  const retentionDays = Math.max(1, numeric('retentionDays', 1))
+  /*
+   * 保留天数：钳到 [1, 365]，与表单、斜杠命令同一区间。
+   *
+   * 这里读到的值有两个用途：**显示给用户的文案**（"可恢复 N 天"）和写进
+   * `expiresAt`（`store.ts` 里还会再钳一次）。两处必须一致 —— 否则配置写了
+   * `9999` 时，卡片会说「可恢复 9999 天」而实际只保留 365 天。
+   *
+   * `store.ts` 的钳制是数据完整性的最后一道关口（防手改配置），这里是显示与
+   * 语义的统一。同一套边界，写两遍是刻意的：显示层不能依赖存储层的返回值。
+   */
+  const retentionDays = Math.min(365, Math.max(1, numeric('retentionDays', 1)))
 
   // 关于审批：本插件**不自己调用** `ctx.approval`。
   //
