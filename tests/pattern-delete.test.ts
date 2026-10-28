@@ -146,6 +146,36 @@ describe('safe_delete: pattern form', () => {
     expect(r.error ?? '').toContain('need `root`')
   })
 
+  it('rejects a non-array exclude instead of silently ignoring it', async () => {
+    /*
+     * 静默忽略的后果是**删得比用户预期多**：他写了排除规则，以为某些目录会被
+     * 保留，实际全部命中、全部移走。
+     *
+     * 这类「参数写错但操作照常执行」比直接报错危险得多。
+     */
+    const root = scratchDir('dsd-pat-badexclude-')
+    const base = join(root, 'work', 'logs')
+    make(base, ['a.log', 'keep/k.log'])
+    const { tool } = setup(root)
+
+    const r = await tool.execute({ root: base, match: '*.log', exclude: 'keep/**' })
+    expect(r.ok, '传字符串应报错').toBe(false)
+    expect(r.error ?? '').toContain('must be an array')
+    // 关键：报错时不能已经删了东西。
+    expect(await listSafeZone(join(root, 'state')), '报错时不该删任何东西').toHaveLength(0)
+  })
+
+  it('rejects a non-string entry inside exclude', async () => {
+    const root = scratchDir('dsd-pat-badexclude2-')
+    const base = join(root, 'work', 'logs')
+    make(base, ['a.log'])
+    const { tool } = setup(root)
+
+    const r = await tool.execute({ root: base, match: '*.log', exclude: [123] })
+    expect(r.ok).toBe(false)
+    expect(r.error ?? '').toContain('must be non-empty glob strings')
+  })
+
   it('rejects an unparseable olderThan', async () => {
     const root = scratchDir('dsd-pat-badtime-')
     const base = join(root, 'work', 'logs')

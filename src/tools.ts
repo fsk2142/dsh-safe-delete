@@ -220,9 +220,23 @@ export function normaliseDeleteTargets(
   const root = typeof args.root === 'string' && args.root.trim() !== '' ? args.root.trim() : undefined
   const pattern = typeof args.match === 'string' && args.match.trim() !== '' ? args.match.trim() : undefined
   const olderThanRaw = typeof args.olderThan === 'string' && args.olderThan.trim() !== '' ? args.olderThan.trim() : undefined
+
+  /*
+   * `exclude` 必须是字符串数组；**传了非数组要报错，不能静默当空**。
+   *
+   * 静默忽略的后果是删得比用户预期多：他写了排除规则，以为某些目录会被保留，
+   * 实际全部命中、全部移走。宁可让他重传一次。
+   */
+  if (args.exclude !== undefined && !Array.isArray(args.exclude)) {
+    return { error: '`exclude` must be an array of glob strings, e.g. ["keep/**"]' }
+  }
   const excludeRaw = Array.isArray(args.exclude)
     ? args.exclude.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
     : []
+  // 数组里混了非字符串（数字、null）同样报错，别静默丢掉。
+  if (Array.isArray(args.exclude) && excludeRaw.length !== args.exclude.length) {
+    return { error: '`exclude` entries must be non-empty glob strings' }
+  }
 
   const usesPatternForm = root !== undefined || pattern !== undefined || olderThanRaw !== undefined || excludeRaw.length > 0
 
