@@ -97,6 +97,33 @@ function scanRoots() {
 }
 
 /**
+ * 需要往里"看一层"的用户目录。
+ *
+ * ## 为什么单独处理
+ *
+ * 有些位置本身是**用户的目录**（不能整体判断、更不能删），但我的探针曾经往
+ * 里面写过子目录。`C:\Work\_fpga_tmp` 就是这样：它是 FPGA 综合产物目录，
+ * 里面有 `opt/`、`ctl/`、`dsc/` 这些真实数据，同时也混进了我 6 个
+ * `dsh-*` 测试残留子目录（home/、state/、探针脚本）。
+ *
+ * 所以这里只枚举**下一层**，且只匹配 `dsh-*` 前缀 —— `opt`、`ctl` 这些
+ * 用户目录一律不碰。
+ *
+ * @returns 需要检查子项的目录列表。
+ */
+function nestedRoots() {
+  return [
+    resolve('C:\\Work\\_fpga_tmp'),
+  ].filter((r) => {
+    try {
+      return statSync(r).isDirectory()
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
  * 收集两处待清理项。
  *
  * @returns 条目列表（绝对路径 + 大小 + 来源）。
@@ -109,6 +136,22 @@ function collect() {
       if (!e.isDirectory() || !PROBE_PATTERN.test(e.name)) continue
       const full = join(root, e.name)
       items.push({ path: full, label: full, where: 'probe', bytes: sizeOf(full) })
+    }
+  }
+
+  /*
+   * 用户目录里的探针子目录。
+   *
+   * `_fpga_tmp` 是用户的 FPGA 产物目录，只清其中 `dsh-*` 前缀的子目录
+   * （我的测试残留），同级的 `opt/`、`ctl/`、`dsc/` 一律不碰。
+   */
+  for (const parent of nestedRoots()) {
+    for (const e of readdirSync(parent, { withFileTypes: true })) {
+      // 注意：有 dsh- 也有 dsh_（历史的 dsh_verify），两种都要认。
+
+      if (!e.isDirectory() || !/^dsh[-_]/.test(e.name)) continue
+      const full = join(parent, e.name)
+      items.push({ path: full, label: full, where: 'nested', bytes: sizeOf(full) })
     }
   }
 
@@ -136,11 +179,18 @@ if (items.length === 0) {
 }
 
 const probes = items.filter((i) => i.where === 'probe')
+const nested = items.filter((i) => i.where === 'nested')
 const wsItems = items.filter((i) => i.where === 'workspace')
 
 if (probes.length > 0) {
   console.log(`探针残留目录：${probes.length} 个`)
   for (const i of probes) console.log(`  ${i.label.padEnd(56)} ${(i.bytes / 1024).toFixed(1)} KB`)
+}
+
+if (nested.length > 0) {
+  console.log('')
+  console.log(`用户目录里的探针子目录：${nested.length} 个（同级用户数据不受影响）`)
+  for (const i of nested) console.log(`  ${i.label.padEnd(56)} ${(i.bytes / 1024).toFixed(1)} KB`)
 }
 
 if (wsItems.length > 0) {
@@ -165,11 +215,23 @@ if (!apply) {
  * （不含分隔符），仍然做边界检查，因为这个脚本本身就在删东西。
  */
 const roots = scanRoots()
+const nestedParents = nestedRoots()
 let removed = 0
 let failed = 0
 for (const i of items) {
   const full = resolve(i.path)
-  const ok = i.where === 'workspace' ? full.startsWith(resolve(process.cwd())) : roots.some((r) => full.startsWith(r))
+  let ok
+  if (i.where === 'workspace') {
+    ok = full.startsWith(resolve(process.cwd()))
+  } else if (i.where === 'nested') {
+    // 必须在某个用户目录的**下一层**，且名字是 dsh-*。
+    ok = nestedParents.some((p) => {
+      const parent = resolve(p)
+      return full.startsWith(parent + '\\') && /^dsh[-_]/.test(full.slice(parent.length + 1).split('\\')[0] ?? '')
+    })
+  } else {
+    ok = roots.some((r) => full.startsWith(r))
+  }
   if (!ok) {
     console.error(`  跳过越界路径：${full}`)
     failed += 1
