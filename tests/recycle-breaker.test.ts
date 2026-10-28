@@ -31,8 +31,21 @@ import { scratchDir } from './support/tmpdir'
  *
  * 现在用 `recordRecycleFailure()` 驱动：它是生产代码走的那同一个函数，
  * 所以测的是真逻辑，不是影子实现。
+ *
+ * ## 为什么显式给 30 秒超时
+ *
+ * 其中两条测试（`resets the count automatically after a SUCCESSFUL recycle`、
+ * `does not count a missing path as a failure`）会**真的调用系统回收站**，而
+ * `moveToSystemRecycleBin` 内部是 `execFileSync`、超时设的是 20 秒。
+ *
+ * vitest 默认 `testTimeout` 只有 5 秒。隔离运行约 900 ms 能过，但全量并行
+ * 套件下（CPU 饱和）实测 5717 ms 超时失败 —— 失败形态是**框架超时**而不是
+ * 断言失败，很容易被当成抖动忽略。
+ *
+ * 20 秒的下限决定了这里的超时必须大于它，否则一旦回收站真的变慢，测试超时
+ * 会比产品行为先到，测出来的就不是产品问题。
  */
-describe('recycle breaker', () => {
+describe('recycle breaker', { timeout: 30_000 }, () => {
   beforeEach(() => {
     resetRecycleBreaker()
   })

@@ -119,7 +119,17 @@ function fixturesOnce(): { dangerous: string[]; ordinary: string; cleanup: () =>
   }
 }
 
-describe('pre-execute wiring: safe_delete approval', () => {
+/**
+ * ## 为什么显式给 30 秒超时
+ *
+ * `fixtures()` 会在**真实家目录**下建探针目录（接线层的 home 就是
+ * `os.homedir()`，无法伪造），并走完整的 `classifyPath` 判定。
+ *
+ * 隔离运行约 500 ms，但全量并行套件下实测 3350 ms；更早一次直接越过 vitest
+ * 默认的 5 秒而超时失败。那种失败是**框架超时**，不是断言失败 —— 曾被我
+ * 当成"未复现的抖动"记了一轮，实际就是超时参数没设。
+ */
+describe('pre-execute wiring: safe_delete approval', { timeout: 30_000 }, () => {
   const fixtures = fixturesOnce
 
   it('asks for a dangerous single path', async () => {

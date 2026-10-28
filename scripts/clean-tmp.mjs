@@ -39,7 +39,14 @@ import { join, resolve } from 'node:path'
 const PROBE_PATTERN = /^\.?dsd-/
 
 /** 工作区里的探针与草稿。 */
-const WS_PATTERN = /^(zz-|\.tmp-|\.msg|\.rel)/
+/*
+ * 工作区里的探针与草稿。
+ *
+ * `.commitmsg*` 是补上的：我一度把提交信息写成 `.commitmsg127`，以 `.commitmsg`
+ * 开头，而原来的模式只认 `.msg` 前缀 —— 于是那个文件留在了工作区，脚本报"干净"。
+ * 现在把常见变体都覆盖：`.commitmsg` / `.tagmsg` / `.cm`。
+ */
+const WS_PATTERN = /^(zz-|\.tmp-|\.msg|\.rel|\.commitmsg|\.tagmsg|\.cm)/
 
 /** 是否真的要删。 */
 const apply = process.argv.includes('--apply')
