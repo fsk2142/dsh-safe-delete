@@ -1,5 +1,5 @@
 import { t as ClassifyEnv } from "./classify-DBIbYKr1.js";
-import { a as listSafeZone, c as restoreFromSafeZone, i as isEmptySafeZone, n as destroyEntry, s as moveToSafeZone, u as Recycler } from "./store-Bl4vOiLF.js";
+import { a as listSafeZone, c as restoreFromSafeZone, d as moveToSystemRecycleBin, i as isEmptySafeZone, n as destroyEntry, s as moveToSafeZone, u as Recycler } from "./store-DeJ3g1qH.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
@@ -136,4 +136,4 @@ export declare function createTools(deps: ToolDeps): ToolDefinition[];
  */
 export declare function checkComposition(env: ClassifyEnv): string;
 //#endregion
-export { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone };
+export { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, moveToSystemRecycleBin, restoreFromSafeZone };

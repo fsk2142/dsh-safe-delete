@@ -27,7 +27,7 @@ import { describeTarget } from './describe'
 import { matchInTree, parseDuration } from './match'
 import { selectForPrune, safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
-import { canRecycle } from './recycle'
+import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { discardEntryContent, destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone, writeIndexFiltered } from './store'
 import type { TrashEntry } from './types'
 
@@ -923,4 +923,17 @@ export function checkComposition(env: ClassifyEnv): string {
   return lines.join('\n')
 }
 
-export { moveToSafeZone, restoreFromSafeZone, listSafeZone, destroyEntry, isEmptySafeZone }
+/*
+ * 转导出这些给脚本用。
+ *
+ * `moveToSystemRecycleBin` 额外导出：`scripts/sync-install.mjs` 需要把陈旧的
+ * 构建产物移进回收站而不是硬删 —— 与本插件「删除可撤回」的理念保持一致。
+ */
+export {
+  moveToSafeZone,
+  restoreFromSafeZone,
+  listSafeZone,
+  destroyEntry,
+  isEmptySafeZone,
+  moveToSystemRecycleBin,
+}

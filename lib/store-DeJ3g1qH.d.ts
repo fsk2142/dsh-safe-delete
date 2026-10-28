@@ -42,6 +42,13 @@ type RecycleOutcome = {
  * 生产路径永远用 `moveToSystemRecycleBin`。
  */
 type Recycler = (absPath: string) => RecycleOutcome;
+/**
+ * 把一个路径移入系统回收站。
+ *
+ * @param absPath 要移入的绝对路径（文件或目录）。
+ * @returns 结果；失败时带原因，调用方**不可**据此永久删除。
+ */
+declare function moveToSystemRecycleBin(absPath: string): RecycleOutcome;
 //#endregion
 //#region src/store.d.ts
 /** 移入选项。 */
@@ -200,4 +207,4 @@ declare function destroyEntry(stateDir: string, id: string, options?: {
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 declare function isEmptySafeZone(stateDir: string): Promise<boolean>;
 //#endregion
-export { listSafeZone as a, restoreFromSafeZone as c, isEmptySafeZone as i, writeIndexFiltered as l, destroyEntry as n, moveManyToSafeZone as o, discardEntryContent as r, moveToSafeZone as s, MoveOptions as t, Recycler as u };
+export { listSafeZone as a, restoreFromSafeZone as c, moveToSystemRecycleBin as d, isEmptySafeZone as i, writeIndexFiltered as l, destroyEntry as n, moveManyToSafeZone as o, discardEntryContent as r, moveToSafeZone as s, MoveOptions as t, Recycler as u };
