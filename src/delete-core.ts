@@ -333,18 +333,23 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
   }
 
   // 7. 移入安全区。
+  /*
+   * 理由先收进安全长度再落盘 —— 它会进索引与审计各一份，而索引每次读写都是
+   * 全量的（见 `boundReason` 的注释）。
+   */
+  const reason = boundReason(request.reason)
   const entry = await moveToSafeZone(ctx.stateDir, target, {
     retentionDays: ctx.retentionDays,
     now: ctx.now(),
     ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
-    ...(request.reason !== undefined && request.reason !== '' ? { reason: request.reason } : {}),
+    ...(reason === undefined ? {} : { reason }),
   })
 
   appendAudit(ctx.stateDir, {
     event: 'delete',
     target,
     tool: 'safe_delete',
-    detail: `id=${entry.id} cls=${gate.classification}${request.reason === undefined || request.reason === '' ? '' : ` reason=${request.reason}`}`,
+    detail: `id=${entry.id} cls=${gate.classification}${reason === undefined ? '' : ` reason=${reason}`}`,
   })
 
   // 7. 顺带清理（时间 + 容量）。
@@ -387,6 +392,35 @@ export function approvalFailureText(outcome: ApprovalOutcome, target: string): s
     case 'allowed-once':
       return ''
   }
+}
+
+/** `reason` 的最大长度。 */
+const MAX_REASON_CHARS = 200
+
+/**
+ * 把删除理由收进安全长度。
+ *
+ * ## 为什么要截
+ *
+ * `reason` 是模型或用户给的**自由文本**，会被写进索引与审计日志**各一份**。
+ * 没有上限时：
+ *
+ *   - 模型把一段文件内容贴进来当理由 → 索引膨胀，而索引每次删除/清理都要全量
+ *     读写（1000 条时 268 KB、5000 条时 1.3 MB），等于把整个插件的 I/O 成本推高；
+ *   - 那段文本可能含敏感信息（密钥、私信），于是长期留在磁盘上。
+ *
+ * 实测：传 10000 字符，索引与审计里各存了 10000 字符。
+ *
+ * ## 为什么保留开头
+ *
+ * 理由的前半段通常更有信息量（"清理构建产物…"），截尾比截头损失小。
+ *
+ * @param reason 原始理由（可能为空或超长）。
+ * @returns 长度不超过 `MAX_REASON_CHARS` 的理由；空输入返回 undefined。
+ */
+export function boundReason(reason: string | undefined): string | undefined {
+  if (reason === undefined || reason === '') return undefined
+  return reason.length <= MAX_REASON_CHARS ? reason : `${reason.slice(0, MAX_REASON_CHARS - 1)}…`
 }
 
 /** 人类可读的体积。 */

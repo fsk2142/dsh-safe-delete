@@ -144,6 +144,28 @@ export declare function deletePath(request: DeleteRequest, ctx: DeleteContext): 
 export declare function describeApprovalRequest(target: string, description: TargetDescription, gate: GateDecision, retentionDays: number): string;
 /** 把审批结果翻译成可区分的错误文本。 */
 export declare function approvalFailureText(outcome: ApprovalOutcome, target: string): string;
+/**
+ * 把删除理由收进安全长度。
+ *
+ * ## 为什么要截
+ *
+ * `reason` 是模型或用户给的**自由文本**，会被写进索引与审计日志**各一份**。
+ * 没有上限时：
+ *
+ *   - 模型把一段文件内容贴进来当理由 → 索引膨胀，而索引每次删除/清理都要全量
+ *     读写（1000 条时 268 KB、5000 条时 1.3 MB），等于把整个插件的 I/O 成本推高；
+ *   - 那段文本可能含敏感信息（密钥、私信），于是长期留在磁盘上。
+ *
+ * 实测：传 10000 字符，索引与审计里各存了 10000 字符。
+ *
+ * ## 为什么保留开头
+ *
+ * 理由的前半段通常更有信息量（"清理构建产物…"），截尾比截头损失小。
+ *
+ * @param reason 原始理由（可能为空或超长）。
+ * @returns 长度不超过 `MAX_REASON_CHARS` 的理由；空输入返回 undefined。
+ */
+export declare function boundReason(reason: string | undefined): string | undefined;
 /** 人类可读的体积。 */
 export declare function humanBytes(bytes: number): string;
 /** 把预览结论拼成人看的文本。 */

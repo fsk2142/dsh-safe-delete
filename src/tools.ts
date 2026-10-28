@@ -14,6 +14,7 @@ import path from 'node:path'
 import { appendAudit, appendAuditBatch, readAudit, type AuditRecord } from './audit'
 import type { ClassifyEnv } from './classify'
 import {
+  boundReason,
   decideGate,
   deletePath,
   describeMoved,
@@ -413,6 +414,13 @@ async function deleteMany(
   const moved: string[] = []
   const failed: Array<{ target: string; error: string }> = [...immediatelyRejected]
 
+  /*
+   * 理由先收进安全长度 —— 与 `deletePath` 同一个约束。
+   *
+   * 批量路径原先直接传 `base.reason`，漏掉了截断：一条超长 reason 会被复制到
+   * **每一个**条目上，索引膨胀是单条路径的 N 倍。
+   */
+  const boundedReason = boundReason(base.reason)
   const batch = await moveManyToSafeZone(
     ctx.stateDir,
     plans.map((p) => p.target),
@@ -420,7 +428,7 @@ async function deleteMany(
       retentionDays: ctx.retentionDays,
       now: ctx.now(),
       ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
-      ...(base.reason !== undefined && base.reason !== '' ? { reason: base.reason } : {}),
+      ...(boundedReason === undefined ? {} : { reason: boundedReason }),
     },
   )
 
