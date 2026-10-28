@@ -31,6 +31,30 @@ export declare function appendAudit(stateDir: string, record: Omit<AuditRecord, 
   at?: string;
 }): void;
 /**
+ * 追加一批审计记录：**一次文件操作写多行**。
+ *
+ * ## 为什么需要它
+ *
+ * 批量删除 1000 个文件时，`appendAudit` 逐条调用要 728 ms —— 占总耗时的一半以上，
+ * 比实际移动（347 ms）还贵。原因是单条实现为了处理「上次写入留下半行」这个边界，
+ * 每条都做 `existsSync + statSync + openSync + readSync + closeSync + appendFileSync`
+ * 六次系统调用。
+ *
+ * 那个边界**每批只需要检查一次**：批量内部不会产生半行。所以这里先修一次，再把
+ * 所有行拼成一个字符串一次写入。
+ *
+ * ## 与单条版本的关系
+ *
+ * 输出格式完全一致（每行一个 JSON）。`appendAudit` 仍保留，用于零散的单条写入
+ * （拦截、取回、清理等，一次只有一条）。
+ *
+ * @param stateDir 安全区目录。
+ * @param records 要写入的记录（可含 `at`，否则用当前时间）。
+ */
+export declare function appendAuditBatch(stateDir: string, records: Array<Omit<AuditRecord, 'at'> & {
+  at?: string;
+}>): void;
+/**
  * 读取最近的审计记录。
  *
  * @param stateDir 安全区目录。

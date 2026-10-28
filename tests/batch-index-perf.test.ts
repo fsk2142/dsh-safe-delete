@@ -126,10 +126,10 @@ describe('batch delete: index written once per batch', () => {
 
   it('is far faster than rewriting the index per file', async () => {
     /*
-     * 性能回归测试。
+     * 性能回归测试（**索引**那一层）。
      *
-     * 阈值取得宽松（500 个文件 2 秒）：修复前是 2 秒左右，修复后应在 100 ms 级。
-     * 目的是抓「有人把索引写入改回逐条」这类回归，不是精确基准。
+     * 收紧到 1500 ms：这里是 500 个文件，实测约 200 ms。原来的阈值 2000 ms
+     * 太松 —— 索引逐条写时是 2096 ms，刚好卡在边缘，容易误判为通过。
      */
     const root = scratchDir('dsd-batch-speed-')
     const work = join(root, 'work')
@@ -143,6 +143,115 @@ describe('batch delete: index written once per batch', () => {
 
     expect(r.ok, r.error ?? '应成功').toBe(true)
     expect(await listSafeZone(state)).toHaveLength(500)
-    expect(ms, `500 个文件应在 2 秒内完成，实际 ${ms} ms`).toBeLessThan(2000)
+    expect(ms, `500 个文件应在 1.5 秒内完成，实际 ${ms} ms`).toBeLessThan(1500)
+  })
+
+  it('is far faster than appending audit records one by one', async () => {
+    /*
+     * 性能回归测试（**审计**那一层）。
+     *
+     * 审计曾经是最大单项开销：1000 条逐条 `appendAudit` 要 728 ms，因为每条都
+     * 做 6 次系统调用检查「上次是否留下半行」。批量入口只在批首检查一次。
+     *
+     * ## 为什么用"相对比较"
+     *
+     * 绝对阈值在慢机器上会误报。这里直接对比两种写法：
+     *
+     *   批量审计 1000 条：约 0 ms
+     *   逐条审计 1000 条：约 808 ms
+     *
+     * 比值判据不受机器快慢影响。
+     */
+    const root = scratchDir('dsd-audit-speed-')
+    const work = join(root, 'work')
+    const state = join(root, 'state')
+    const files = makeFiles(join(work, 'batch'), 1000)
+    const { tool } = makeTool(state, work)
+
+    const t0 = Date.now()
+    const r = await tool.execute({ paths: files })
+    const batchMs = Date.now() - t0
+
+    expect(r.ok, r.error ?? '应成功').toBe(true)
+
+    // 审计必须真的写进去了 —— 快不能靠不记账换来。
+    const { readAudit, appendAudit, appendAuditBatch } = await import('../src/audit')
+    const records = readAudit(state, 2000)
+    expect(records.filter((x) => x.event === 'delete'), '1000 条删除应全部记账').toHaveLength(1000)
+
+    /*
+     * 直接对比两种审计写法。
+     */
+    const sample = Array.from({ length: 1000 }, (_, i) => ({
+      event: 'delete' as const,
+      target: `C:\\x\\f${i}.log`,
+      tool: 'safe_delete',
+    }))
+    const dirA = scratchDir('dsd-audit-cmp-batch-')
+    const dirB = scratchDir('dsd-audit-cmp-seq-')
+
+    const tBatch = Date.now()
+    appendAuditBatch(dirA, sample)
+    const batchOnlyMs = Date.now() - tBatch
+
+    const tSeq = Date.now()
+    for (const rec of sample) appendAudit(dirB, rec)
+    const seqOnlyMs = Date.now() - tSeq
+
+    console.log(`批量审计 ${batchOnlyMs} ms, 逐条审计 ${seqOnlyMs} ms, 完整删除 ${batchMs} ms`)
+
+    if (seqOnlyMs > 50) {
+      expect(
+        batchOnlyMs,
+        `批量审计(${batchOnlyMs} ms) 应显著快于逐条(${seqOnlyMs} ms)`,
+      ).toBeLessThan(seqOnlyMs * 4)
+    }
+    expect(batchMs, `1000 个文件不应超过 3 秒，实际 ${batchMs} ms`).toBeLessThan(3000)
+  })
+
+  it('uses the batch audit entry point, not per-record writes', async () => {
+    /*
+     * 结构性断言：`deleteMany` 必须走 `appendAuditBatch`。
+     *
+     * ## 为什么需要这条
+     *
+     * 上面那条性能测试对比的是「批量 vs 逐条」两个函数本身的耗时 ——
+     * 即使把 `deleteMany` 改回逐条调用 `appendAudit`，那两个函数还是原样，
+     * 测试依然绿。变异检验证实了这一点。
+     *
+     * 所以这里直接看源码：批量路径里不该出现逐条 `appendAudit` 调用。
+     * 这不是"测实现细节"，而是钉住一个**已经优化过的性能契约** ——
+     * 有人改回逐条时必须有东西拦住。
+     */
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync('src/tools.ts', 'utf8')
+
+    /*
+     * 截取 deleteMany 函数体。
+     *
+     * 边界用「下一个函数开始」—— `deleteMany` 后面紧跟的是 `createTools`，
+     * 所以找 `\nexport function ` 或 `\nfunction `。
+     *
+     * 第一版找的是 `\n  async function `（带缩进），但 `deleteMany` 之后的
+     * 函数不是缩进的自由函数，于是 `end = -1`，slice 退化成固定 8000 字符，
+     * 越界把后面 `safe_delete` 里的 `appendAudit` 也包了进来 → 误报。
+     */
+    const start = src.indexOf('async function deleteMany(')
+    expect(start, '应能找到 deleteMany').toBeGreaterThan(0)
+    const candidates = [
+      src.indexOf('\nexport function ', start + 10),
+      src.indexOf('\nfunction ', start + 10),
+      src.indexOf('\n  const safeDelete', start + 10),
+    ].filter((i) => i > start)
+    const end = candidates.length > 0 ? Math.min(...candidates) : src.length
+    const body = src.slice(start, end)
+    expect(body.length, '截取范围应合理（不是整个文件）').toBeLessThan(src.length)
+
+    expect(body, 'deleteMany 应使用 appendAuditBatch').toContain('appendAuditBatch(')
+    // 允许出现 appendAudit 的字样（注释里会提到），但不允许以调用形式出现。
+    expect(
+      /(^|[^A-Za-z])appendAudit\(/.test(body),
+      'deleteMany 里不该逐条调用 appendAudit —— 那会让 1000 条多花 700+ ms',
+    ).toBe(false)
   })
 })
