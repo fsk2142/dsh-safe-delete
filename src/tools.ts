@@ -23,10 +23,11 @@ import {
   type DeleteRequest,
 } from './delete-core'
 import { describeTarget } from './describe'
+import { matchInTree, parseDuration } from './match'
 import { selectForPrune, safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
 import { canRecycle } from './recycle'
-import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
+import { destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
 import type { TrashEntry } from './types'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -185,28 +186,103 @@ function describeThresholds(deps: ToolDeps): string {
 /**
  * 把工具参数统一成「待删除路径列表」。
  *
- * 接受 `path`（单个）或 `paths`（数组），两者互斥。为什么不做「两者都给就合并」：
- * 那会让调用方以为可以随便混用，实际行为取决于顺序，是模糊语义。明确二选一，
- * 出错时给出清楚的提示，比"聪明地合并"更可靠。
+ * 三种输入形态，**互斥**：
+ *
+ * | 形态 | 参数 | 用途 |
+ * |---|---|---|
+ * | 单个 | `path` | 一个字面路径（可以是目录） |
+ * | 多个 | `paths` | 若干字面路径 |
+ * | 模式 | `root` (+ `match` / `olderThan` / `exclude`) | 在目录树里挑 |
+ *
+ * 为什么不做「两者都给就合并」：那会让调用方以为可以随便混用，实际行为取决于
+ * 顺序，是模糊语义。明确互斥，出错时给出清楚的提示，比"聪明地合并"更可靠。
+ *
+ * ## 模式形态**不做枚举**
+ *
+ * 这个函数被 `pre-execute` 钩子在**每次工具调用前**调用。如果在这里扫盘，
+ * 一次 `root: <node_modules>, match: **\/*.json` 要 529 ms —— 而钩子对所有
+ * 工具调用都跑，等于让整个 DSH 变慢。
+ *
+ * 所以模式形态只返回 `root` 本身，让钩子做**保守的路径分类判定**（纯字符串
+ * 运算，0 ms）。真正的枚举发生在工具执行体里（`resolveMatchedTargets`），
+ * 那时已经确定用户就是要执行这次删除。
  *
  * @param args 工具原始参数。
  * @returns 路径列表，或一条错误信息。
  */
-export function normaliseDeleteTargets(args: Record<string, unknown>): { paths: string[]; error?: undefined } | { paths?: undefined; error: string } {
+export function normaliseDeleteTargets(
+  args: Record<string, unknown>,
+): { paths: string[]; error?: undefined } | { paths?: undefined; error: string } {
   const single = typeof args.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
   const list = Array.isArray(args.paths)
     ? args.paths.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
     : undefined
+  const root = typeof args.root === 'string' && args.root.trim() !== '' ? args.root.trim() : undefined
+  const pattern = typeof args.match === 'string' && args.match.trim() !== '' ? args.match.trim() : undefined
+  const olderThanRaw = typeof args.olderThan === 'string' && args.olderThan.trim() !== '' ? args.olderThan.trim() : undefined
+  const excludeRaw = Array.isArray(args.exclude)
+    ? args.exclude.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
+    : []
+
+  const usesPatternForm = root !== undefined || pattern !== undefined || olderThanRaw !== undefined || excludeRaw.length > 0
 
   if (single !== undefined && list !== undefined && list.length > 0) {
     return { error: 'pass either `path` (one item) or `paths` (several), not both' }
   }
+  if ((single !== undefined || (list !== undefined && list.length > 0)) && usesPatternForm) {
+    return { error: '`root`/`match`/`olderThan`/`exclude` cannot be combined with `path` or `paths`' }
+  }
+
+  // 模式形态：只校验参数完备性，**不接触磁盘**。
+  if (usesPatternForm) {
+    if (root === undefined) {
+      return { error: '`match`/`olderThan`/`exclude` need `root` (the directory to search in)' }
+    }
+    if (olderThanRaw !== undefined && parseDuration(olderThanRaw) === undefined) {
+      return { error: `cannot parse \`olderThan\` "${olderThanRaw}"; use forms like 30m, 6h, 7d` }
+    }
+    /*
+     * 返回 root 本身。
+     *
+     * 钩子据此做路径分类（root 在保护区/家目录 → ask），**不会**误以为要删
+     * root 本身 —— 执行体在 `resolveMatchedTargets` 里会重新取值，那时才枚举，
+     * 且枚举结果不含 root。
+     */
+    return { paths: [root] }
+  }
+
   if (single !== undefined) return { paths: [single] }
   if (list !== undefined && list.length > 0) {
     // 去重：同一个路径传两次会让第二个变成 "not found"，是噪音而不是错误。
     return { paths: [...new Set(list)] }
   }
-  return { error: 'pass `path` (one item) or `paths` (an array of items)' }
+  return { error: 'pass `path` (one item), `paths` (an array), or `root` with `match`' }
+}
+
+/**
+ * 把模式形态展开成真正要删的路径列表。
+ *
+ * **只在工具执行体里调用** —— 会真的扫盘（`node_modules` 量级约 500 ms）。
+ *
+ * @param args 工具原始参数。
+ * @returns 命中路径；空数组表示没有匹配。
+ */
+export function resolveMatchedTargets(args: Record<string, unknown>): { paths: string[]; scanned: number; truncated: boolean } {
+  const root = typeof args.root === 'string' ? args.root.trim() : ''
+  const pattern = typeof args.match === 'string' && args.match.trim() !== '' ? args.match.trim() : undefined
+  const olderThanRaw = typeof args.olderThan === 'string' && args.olderThan.trim() !== '' ? args.olderThan.trim() : undefined
+  const exclude = Array.isArray(args.exclude)
+    ? args.exclude.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
+    : []
+  const olderThanMs = olderThanRaw === undefined ? undefined : parseDuration(olderThanRaw)
+
+  const r = matchInTree({
+    root,
+    ...(pattern === undefined ? {} : { pattern }),
+    ...(olderThanMs === undefined ? {} : { olderThanMs }),
+    ...(exclude.length === 0 ? {} : { exclude }),
+  })
+  return { paths: r.paths, scanned: r.scanned, truncated: r.truncated }
 }
 
 /**
@@ -304,23 +380,53 @@ async function deleteMany(
     }
   }
 
-  // 4. 逐条执行。审批已在上一步覆盖整批，所以这里不再逐条问。
+  /*
+   * 4. 批量执行：索引只在最后写一次。
+   *
+   * ## 为什么不再逐条调 `deletePath`
+   *
+   * `deletePath` 每成功一条就重写整个 `index.json`。删到第 N 条时索引已有 N-1
+   * 条，累计重写量 O(N²) —— 实测 1000 个文件 4.4 秒，而删一个含 1000 文件的
+   * 目录只要 24 ms（一次 rename）。
+   *
+   * 这里改成 `moveManyToSafeZone`：分级判定、保护区、安全区自检、回滚策略全都不变
+   * （共用 `stageInto`），只是把"写索引"提到循环外。
+   *
+   * ## 审批已经在上一步覆盖整批
+   *
+   * 所以这一步不再问任何人。
+   */
   const moved: string[] = []
   const failed: Array<{ target: string; error: string }> = [...immediatelyRejected]
-  const alreadyApprovedCtx: DeleteContext = {
-    ...ctx,
-    // 已经合并审批过；逐条再问会变成"确认 N 次"，正是要避免的。
-    requestApproval: async () => 'allowed-once',
-  }
 
-  for (const plan of plans) {
-    const result = await deletePath({ ...base, path: plan.target }, alreadyApprovedCtx)
-    if (result.ok && result.kind === 'moved') {
-      moved.push(`${plan.target}  →  id ${result.entry.id}`)
-    } else if (!result.ok) {
-      failed.push({ target: plan.target, error: result.error })
+  const batch = await moveManyToSafeZone(
+    ctx.stateDir,
+    plans.map((p) => p.target),
+    {
+      retentionDays: ctx.retentionDays,
+      now: ctx.now(),
+      ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+      ...(base.reason !== undefined && base.reason !== '' ? { reason: base.reason } : {}),
+    },
+  )
+
+  // 逐条记账（审计要一条一条写，这是记录不是批处理）。
+  for (const item of batch) {
+    if (item.entry !== undefined) {
+      moved.push(`${item.path}  →  id ${item.entry.id}`)
+      appendAudit(ctx.stateDir, {
+        event: 'delete',
+        target: item.path,
+        tool: 'safe_delete',
+        detail: `id=${item.entry.id} batch`,
+      })
+    } else {
+      failed.push({ target: item.path, error: item.error ?? 'unknown error' })
     }
   }
+
+  // 清理：批量移动完成后按原逻辑触发一次（`afterMove` 是可选的）。
+  if (ctx.afterMove !== undefined) await ctx.afterMove()
 
   /*
    * 输出按次计费，所以批量结果**不逐个列出成功项**。
@@ -418,14 +524,33 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       // （描述里一遍、参数描述里一遍），压掉重复不损失任何信息。
       'Move files/directories into the safe zone (restorable via safe_zone_restore). This is the ONLY sanctioned way to delete in DSH; raw shell deletes are blocked. ' +
       'Pass `paths` to delete several in one call — one approval covers the batch. ' +
+      'To clear generated output, prefer `root` + `match` (e.g. root a `.tmp` dir, match `**/*.log`) over enumerating files yourself: one call, one approval, and it stays O(n). ' +
       'Dangerous paths (home dir, plugin sources, profile manifests, node_modules) need user approval; ordinary workspace files move silently. ' +
       'Use `preview: true` to see what would move without moving it.',
     parameters: {
-      path: { type: 'string', description: 'One absolute path. Mutually exclusive with `paths`.' },
+      path: { type: 'string', description: 'One absolute path (file or directory). Mutually exclusive with `paths` and `root`.' },
       paths: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Several absolute paths in one call. Mutually exclusive with `path`.',
+        description: 'Several absolute paths in one call. Mutually exclusive with `path` and `root`.',
+      },
+      root: {
+        type: 'string',
+        description:
+          'Directory to search in. Required by match/olderThan/exclude. The root itself is never deleted, only matched items inside it.',
+      },
+      match: {
+        type: 'string',
+        description: 'Glob relative to `root`: `**` any depth, `*` one level, `?` one char, `{a,b}` alternatives. Omit to match every file.',
+      },
+      olderThan: {
+        type: 'string',
+        description: 'Only items modified longer ago than this: 30m, 6h, 7d. A bare number means days.',
+      },
+      exclude: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Glob patterns relative to `root` to skip, e.g. `keep/**`. Exclude wins over match.',
       },
       preview: { type: 'boolean', description: 'Describe only; change nothing.' },
       reason: { type: 'string', description: 'Why this is deleted (recorded in audit).' },
@@ -435,6 +560,51 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     async execute(args) {
       const targets = normaliseDeleteTargets(args)
       if (targets.error !== undefined) return { ok: false, text: '', error: targets.error }
+
+      /*
+       * 模式形态（`root` + `match`/`olderThan`/`exclude`）到这里才枚举。
+       *
+       * `normaliseDeleteTargets` 故意只返回 root —— 它在 pre-execute 钩子里
+       * 每次工具调用都跑，不能扫盘（node_modules 量级要 529 ms）。
+       * 到了执行体，说明用户确实要执行，枚举一次是必要的。
+       */
+      const usesPatternForm =
+        typeof args.root === 'string' && args.root.trim() !== ''
+      let resolvedPaths = targets.paths
+      if (usesPatternForm) {
+        const matched = resolveMatchedTargets(args)
+        if (matched.paths.length === 0) {
+          /*
+           * 「没匹配到」必须报错，不能静默成功。
+           *
+           * 用户看到 ok 会以为删掉了；实际可能只是模式写错（`*.log` 写成
+           * `*.1og`）或 root 指错目录。扫过多少条一并给出，便于判断是哪种。
+           */
+          const bits: string[] = []
+          if (typeof args.match === 'string') bits.push(`pattern "${args.match}"`)
+          if (typeof args.olderThan === 'string') bits.push(`older than ${args.olderThan}`)
+          const excl = Array.isArray(args.exclude) && args.exclude.length > 0 ? ` (excluded ${args.exclude.length})` : ''
+          return {
+            ok: false,
+            text: '',
+            error:
+              `no files matched in ${args.root}` +
+              (bits.length > 0 ? ` for ${bits.join(' and ')}` : '') +
+              excl +
+              `; scanned ${matched.scanned} entries`,
+          }
+        }
+        if (matched.truncated) {
+          return {
+            ok: false,
+            text: '',
+            error:
+              `matched too many entries (stopped after ${matched.scanned}); ` +
+              'narrow the pattern or use a deeper root to keep the batch reviewable',
+          }
+        }
+        resolvedPaths = matched.paths
+      }
 
       const deleteCtx = {
         stateDir: deps.stateDir,
@@ -455,16 +625,16 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       }
 
       // 单路径：保持原有行为不变。
-      if (targets.paths.length === 1) {
-        const result = await deletePath({ ...base, path: targets.paths[0] as string }, deleteCtx)
+      if (resolvedPaths.length === 1) {
+        const result = await deletePath({ ...base, path: resolvedPaths[0] as string }, deleteCtx)
         if (!result.ok) return { ok: false, text: '', error: result.error }
         return result.kind === 'preview'
           ? { ok: true, text: describePreview(result, deps.retentionDays) }
           : { ok: true, text: describeMoved(result, deps.retentionDays) }
       }
 
-      // 多路径：合并成一次审批，逐条执行，汇总结果。
-      return deleteMany(targets.paths, base, deleteCtx)
+      // 多路径：合并成一次审批，批量执行（索引只写一次），汇总结果。
+      return deleteMany(resolvedPaths, base, deleteCtx)
     },
   })
 

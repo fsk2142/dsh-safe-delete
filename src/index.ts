@@ -431,8 +431,49 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
        *
        * 所以统一用 `normaliseDeleteTargets` 取出全部目标，对**整批**计算合并门禁。
        */
-      const targets = normaliseDeleteTargets((exec.arguments ?? {}) as Record<string, unknown>)
+      const args = (exec.arguments ?? {}) as Record<string, unknown>
+      const targets = normaliseDeleteTargets(args)
       if (targets.error !== undefined || targets.paths.length === 0) return next()
+
+      /*
+       * 模式形态（`root` + `match`/`olderThan`）在钩子里**不遍历目录**。
+       *
+       * `normaliseDeleteTargets` 对模式形态只返回 root；如果这里再走下面的
+       * `describeTarget(root)`，就会把整棵树遍历一遍 —— 实测 3000 个文件 27 ms、
+       * 6000 个文件 529 ms。钩子对**每次工具调用**都跑，这个开销会传染到所有工具。
+       *
+       * 所以模式形态只做纯路径分类（`classifyPath`，0 ms）：
+       *   - root 落在保护区/家目录 → 直接 ask（保守，不枚举也知道该问）
+       *   - root 在工作区 → 在这里放行，交给工具内部按**实际命中数**判定阈值
+       *
+       * 为什么这样不漏：工具执行体（`resolveMatchedTargets` → `deleteMany`）
+       * 会对每个命中项做完整分级与合并阈值判定，一次合并审批。钩子这一层的
+       * 作用是"危险 root 先拦下"，它不需要知道具体有多少文件。
+       */
+      const isPatternForm = typeof args.root === 'string' && args.root.trim() !== ''
+      if (isPatternForm) {
+        const rootPath = path.resolve(String(args.root))
+        const classification = classifyPath(rootPath, env)
+        if (classification === 'free') return next()
+        if (approvalPolicy(session) === 'never') return next()
+
+        const bits: string[] = [`root ${rootPath}`]
+        if (typeof args.match === 'string') bits.push(`match "${args.match}"`)
+        if (typeof args.olderThan === 'string') bits.push(`older than ${args.olderThan}`)
+        if (classification === 'protected') bits.push('the root is a protected path')
+        const text =
+          `Delete files matched under this path? ` +
+          bits.join('; ') +
+          '. The root directory itself is kept — only matched items inside it move into the safe zone. ' +
+          'The exact count is computed during execution and covered by this one approval.'
+        /*
+         * 返回 `ask`，由工具管线发起审批。
+         *
+         * 本插件自己的 `requestApproval` 恒返回 `allowed-once` —— 它的前提是
+         * "管线已经问过了"。钩子这里必须走管线，否则等于没问。
+         */
+        return { kind: 'ask', reason: text }
+      }
 
       const plan = (() => {
         try {

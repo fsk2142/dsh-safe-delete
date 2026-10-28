@@ -1,5 +1,5 @@
 import { t as ClassifyEnv } from "./classify-DBIbYKr1.js";
-import { a as moveToSafeZone, i as listSafeZone, n as destroyEntry, o as restoreFromSafeZone, r as isEmptySafeZone, s as Recycler } from "./store-C-E-czbV.js";
+import { c as Recycler, i as listSafeZone, n as destroyEntry, o as moveToSafeZone, r as isEmptySafeZone, s as restoreFromSafeZone } from "./store-RcfK_ax-.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
@@ -82,9 +82,26 @@ export interface ToolDeps {
 /**
  * 把工具参数统一成「待删除路径列表」。
  *
- * 接受 `path`（单个）或 `paths`（数组），两者互斥。为什么不做「两者都给就合并」：
- * 那会让调用方以为可以随便混用，实际行为取决于顺序，是模糊语义。明确二选一，
- * 出错时给出清楚的提示，比"聪明地合并"更可靠。
+ * 三种输入形态，**互斥**：
+ *
+ * | 形态 | 参数 | 用途 |
+ * |---|---|---|
+ * | 单个 | `path` | 一个字面路径（可以是目录） |
+ * | 多个 | `paths` | 若干字面路径 |
+ * | 模式 | `root` (+ `match` / `olderThan` / `exclude`) | 在目录树里挑 |
+ *
+ * 为什么不做「两者都给就合并」：那会让调用方以为可以随便混用，实际行为取决于
+ * 顺序，是模糊语义。明确互斥，出错时给出清楚的提示，比"聪明地合并"更可靠。
+ *
+ * ## 模式形态**不做枚举**
+ *
+ * 这个函数被 `pre-execute` 钩子在**每次工具调用前**调用。如果在这里扫盘，
+ * 一次 `root: <node_modules>, match: **\/*.json` 要 529 ms —— 而钩子对所有
+ * 工具调用都跑，等于让整个 DSH 变慢。
+ *
+ * 所以模式形态只返回 `root` 本身，让钩子做**保守的路径分类判定**（纯字符串
+ * 运算，0 ms）。真正的枚举发生在工具执行体里（`resolveMatchedTargets`），
+ * 那时已经确定用户就是要执行这次删除。
  *
  * @param args 工具原始参数。
  * @returns 路径列表，或一条错误信息。
@@ -95,6 +112,19 @@ export declare function normaliseDeleteTargets(args: Record<string, unknown>): {
 } | {
   paths?: undefined;
   error: string;
+};
+/**
+ * 把模式形态展开成真正要删的路径列表。
+ *
+ * **只在工具执行体里调用** —— 会真的扫盘（`node_modules` 量级约 500 ms）。
+ *
+ * @param args 工具原始参数。
+ * @returns 命中路径；空数组表示没有匹配。
+ */
+export declare function resolveMatchedTargets(args: Record<string, unknown>): {
+  paths: string[];
+  scanned: number;
+  truncated: boolean;
 };
 /** 创建全部工具。 */
 export declare function createTools(deps: ToolDeps): ToolDefinition[];

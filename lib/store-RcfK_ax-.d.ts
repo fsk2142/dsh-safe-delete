@@ -64,6 +64,35 @@ interface MoveOptions {
  * @returns 新条目。
  */
 declare function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry>;
+/**
+ * 批量移入：所有成功项**只在最后写一次索引**。
+ *
+ * ## 为什么
+ *
+ * `moveToSafeZone` 每调用一次就重写整个 `index.json`。删 1000 个文件时索引会
+ * 从 0 涨到 1000 条，累计重写量是 O(N²)，实测 4.4 秒。这里改成一次。
+ *
+ * ## 失败语义没变
+ *
+ * - 单条失败只影响那一条，其余照常；
+ * - 有失败时仍然把**成功的那些**写进索引（否则它们的磁盘内容就成了孤儿）；
+ * - 一条都没成功就不写索引（避免无意义的空写）。
+ *
+ * ## 与 `moveToSafeZone` 的关系
+ *
+ * 两者共用 `stageInto`，所以分级判定、回滚、跨卷策略完全一致 —— 这里只是把
+ * 「写索引」这一步提到了循环外面。
+ *
+ * @param stateDir 安全区根目录。
+ * @param absPaths 要移入的路径列表。
+ * @param opts 保留期与跨卷策略。
+ * @returns 每条的结果（成功带条目，失败带原因）。
+ */
+declare function moveManyToSafeZone(stateDir: string, absPaths: string[], opts: MoveOptions): Promise<Array<{
+  path: string;
+  entry?: TrashEntry;
+  error?: string;
+}>>;
 /** 列出安全区条目（按移入时间升序）。 */
 declare function listSafeZone(stateDir: string): Promise<TrashEntry[]>;
 /**
@@ -112,4 +141,4 @@ declare function destroyEntry(stateDir: string, id: string, options?: {
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 declare function isEmptySafeZone(stateDir: string): Promise<boolean>;
 //#endregion
-export { moveToSafeZone as a, listSafeZone as i, destroyEntry as n, restoreFromSafeZone as o, isEmptySafeZone as r, Recycler as s, MoveOptions as t };
+export { moveManyToSafeZone as a, Recycler as c, listSafeZone as i, destroyEntry as n, moveToSafeZone as o, isEmptySafeZone as r, restoreFromSafeZone as s, MoveOptions as t };

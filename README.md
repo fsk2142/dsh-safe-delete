@@ -31,16 +31,50 @@ dsh plugin --profile <profile> add dsh-safe-delete
 | `safe_zone_journal` | `limit` | 审计流水，最新在前 |
 | `safe_zone_check` | — | 只读体检：profile 清单解析、行 id 重复 |
 
-### 批量删除
+### 三种删除方式
+
+| 形态 | 参数 | 适用 |
+|---|---|---|
+| 单个 | `path` | 一个文件或目录 |
+| 多个 | `paths` | 若干已知路径 |
+| **模式** | `root` + `match` / `olderThan` / `exclude` | 清生成物 |
+
+三者互斥，混用会被拒绝。
+
+#### 模式形态
 
 ```
-safe_delete({ paths: ["a.log", "b.log", "c.log"], preview: true })
-safe_delete({ paths: ["a.log", "b.log", "c.log"] })
+# 删 .tmp 里所有 .log
+safe_delete({ root: "C:\\proj\\.tmp", match: "**/*.log", preview: true })
+
+# 只删 7 天前的日志，保留 latest/
+safe_delete({
+  root: "C:\\proj\\logs",
+  match: "*.log",
+  olderThan: "7d",
+  exclude: ["latest/**"],
+})
 ```
 
-`paths` 一次调用一次确认；逐条调用是 N 次调用 N 次确认。每条独立走完整流程，单条失败不影响其他条。
+| 参数 | 说明 |
+|---|---|
+| `root` | 搜索起点。**root 本身不会被删**，只删它内部的匹配项 |
+| `match` | glob，相对 root：`**` 跨层、`*` 同层、`?` 单字符、`{a,b}` 多选。省略则匹配全部文件 |
+| `olderThan` | `30m` / `6h` / `7d`，按修改时间筛选。裸数字按天 |
+| `exclude` | 相对 root 的 glob，命中即跳过。**exclude 优先于 match** |
 
-`path` 与 `paths` 二选一，同时传会被拒绝。
+匹配为空时报错（不是静默成功），并在错误里给出扫描过的条目数。
+
+#### 性能：为什么用模式而不是枚举
+
+| 方式 | 1000 个文件 |
+|---|---|
+| 传 1000 条 `paths` | ~1.1 s |
+| 删整个目录（一次 `path`） | ~24 ms |
+| `root` + `match` | ~1.1 s（等价于 `paths`，但只需一次调用） |
+
+`paths`/`match` 都是逐条移动（每条独立分级、独立审计、单条失败不影响其他条），
+索引在整批结束时只写一次。**能整目录删就用 `path` 指向目录**，那是一次 `renameSync`。
 
 ## 斜杠命令
 

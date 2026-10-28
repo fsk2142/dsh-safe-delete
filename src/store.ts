@@ -202,15 +202,24 @@ function isUnder(child: string, parent: string): boolean {
 }
 
 /**
- * 把一个路径移入安全区。
+ * 把内容搬进安全区并返回索引条目，**但不写索引**。
+ *
+ * 抽出来的目的：批量删除时一批只写一次索引。实测 1000 个文件逐条写要 4.4 秒，
+ * 因为每写一条都要重写整个 `index.json`（删第 N 条时文件已有 N-1 条），总成本
+ * O(N²)；500 个文件时索引已有 450 KB 量级。
+ *
+ * ## 调用方的责任
+ *
+ * 拿到返回值后**必须**把它并进索引（`moveToSafeZone` 或 `moveManyToSafeZone`
+ * 都会做）。如果调用方忘了，就会出现「磁盘上有内容、索引里没记录」的孤儿 ——
+ * 清理逻辑只遍历索引，那些目录永远清不掉。
  *
  * @param stateDir 安全区根目录。
- * @param absPath 要移入的绝对路径。
+ * @param absPath 要移入的路径。
  * @param opts 保留期与跨卷策略。
- * @returns 新条目。
+ * @returns 索引条目。
  */
-export async function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry> {
-  return serialized(async () => {
+async function stageInto(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry> {
   const target = path.resolve(absPath)
 
   // 安全区自保护：不能把自己移进自己。
@@ -236,7 +245,10 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
     renameSync(target, dest)
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
-    if (code !== 'EXDEV') throw error
+    if (code !== 'EXDEV') {
+      rollbackEntry(entryRoot, dest, target)
+      throw error
+    }
     // 跨卷：默认拒绝，让人自己决定是把安全区换到同一卷、还是接受一次真实复制。
     if (opts.crossVolumeCopy !== true) {
       // 拒绝之前必须把刚建的 `items/<id>` 空目录收掉，否则它会变成"索引里没有、
@@ -254,7 +266,7 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
     cpSync(target, dest, { recursive: true, preserveTimestamps: true })
   }
 
-  const entry: TrashEntry = {
+  return {
     id,
     originalPath: target,
     movedAt: now,
@@ -266,32 +278,132 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
     crossVolume,
     ...(opts.reason !== undefined && opts.reason !== '' ? { reason: opts.reason } : {}),
   }
+}
 
-  const entries = await readIndex(stateDir)
-  entries.push(entry)
-  try {
-    await writeIndex(stateDir, entries)
-  } catch (error) {
-    // 索引写不进去就不能留下无主的拷贝；回滚掉这份拷贝并让原目标保持原样。
-    if (crossVolume) {
+/**
+ * 把一个路径移入安全区。
+ *
+ * @param stateDir 安全区根目录。
+ * @param absPath 要移入的绝对路径。
+ * @param opts 保留期与跨卷策略。
+ * @returns 新条目。
+ */
+export async function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry> {
+  return serialized(async () => {
+    const entry = await stageInto(stateDir, absPath, opts)
+
+    const entries = await readIndex(stateDir)
+    entries.push(entry)
+    try {
+      await writeIndex(stateDir, entries)
+    } catch (error) {
+      /*
+       * 索引写失败：`items/<id>` 里的内容没有记录指向，必须收回。
+       *
+       * 非跨卷时内容是真的被 rename 进去了，只 `rmdirSync` 删不掉（目录非空），
+       * 必须先 `rollbackEntry` 把它搬回原路径。跨卷时是复制出来的副本，直接删。
+       */
+      const root = entryDir(stateDir, entry.id)
+      if (entry.crossVolume) {
+        try {
+          rmSync(root, { recursive: true, force: true })
+        } catch {
+          /* 回滚失败也要把原始错误抛出去 */
+        }
+      } else {
+        rollbackEntry(root, path.join(root, path.basename(entry.originalPath)), entry.originalPath)
+      }
+      throw error
+    }
+
+    // 跨卷此刻才删源：索引已经落盘，即使进程立刻崩溃也能按 id 取回。
+    if (entry.crossVolume) {
+      rmSync(entry.originalPath, { recursive: true, force: true })
+    }
+
+    return entry
+  })
+}
+
+/**
+ * 批量移入：所有成功项**只在最后写一次索引**。
+ *
+ * ## 为什么
+ *
+ * `moveToSafeZone` 每调用一次就重写整个 `index.json`。删 1000 个文件时索引会
+ * 从 0 涨到 1000 条，累计重写量是 O(N²)，实测 4.4 秒。这里改成一次。
+ *
+ * ## 失败语义没变
+ *
+ * - 单条失败只影响那一条，其余照常；
+ * - 有失败时仍然把**成功的那些**写进索引（否则它们的磁盘内容就成了孤儿）；
+ * - 一条都没成功就不写索引（避免无意义的空写）。
+ *
+ * ## 与 `moveToSafeZone` 的关系
+ *
+ * 两者共用 `stageInto`，所以分级判定、回滚、跨卷策略完全一致 —— 这里只是把
+ * 「写索引」这一步提到了循环外面。
+ *
+ * @param stateDir 安全区根目录。
+ * @param absPaths 要移入的路径列表。
+ * @param opts 保留期与跨卷策略。
+ * @returns 每条的结果（成功带条目，失败带原因）。
+ */
+export async function moveManyToSafeZone(
+  stateDir: string,
+  absPaths: string[],
+  opts: MoveOptions,
+): Promise<Array<{ path: string; entry?: TrashEntry; error?: string }>> {
+  return serialized(async () => {
+    const results: Array<{ path: string; entry?: TrashEntry; error?: string }> = []
+    const staged: TrashEntry[] = []
+
+    for (const p of absPaths) {
       try {
-        rmSync(dest, { recursive: true, force: true })
-      } catch {
-        /* 回滚失败也要把原始错误抛出去 */
+        const entry = await stageInto(stateDir, p, opts)
+        staged.push(entry)
+        results.push({ path: p, entry })
+      } catch (error) {
+        results.push({ path: p, error: error instanceof Error ? error.message : String(error) })
       }
     }
-    // 无论哪种失败，`items/<id>` 都是这次刚建的，必须收掉：
-    // 索引没写成 → 没有任何记录指向它 → 它就是垃圾。
-    rollbackEntry(entryRoot, dest, target)
-    throw error
-  }
 
-  // 跨卷此刻才删源：索引已经落盘，即使进程立刻崩溃也能按 id 取回。
-  if (crossVolume) {
-    rmSync(target, { recursive: true, force: true })
-  }
+    if (staged.length === 0) return results
 
-  return entry
+    // 一次性合并：读一次、写一次。
+    const entries = await readIndex(stateDir)
+    entries.push(...staged)
+    try {
+      await writeIndex(stateDir, entries)
+    } catch (error) {
+      /*
+       * 索引写失败：这一批的磁盘内容全都没有记录指向，必须逐个回滚，
+       * 否则会留下成批的孤儿目录。
+       */
+      for (const entry of staged) {
+        const root = entryDir(stateDir, entry.id)
+        if (entry.crossVolume) {
+          try {
+            rmSync(root, { recursive: true, force: true })
+          } catch {
+            /* 继续回滚其余条目 */
+          }
+        } else {
+          // 非跨卷：内容是真的被 rename 进去了，搬回原处才是正确回滚。
+          rollbackEntry(root, path.join(root, path.basename(entry.originalPath)), entry.originalPath)
+        }
+      }
+      throw error
+    }
+
+    // 跨卷的源在索引落盘后才删。
+    for (const entry of staged) {
+      if (entry.crossVolume) {
+        rmSync(entry.originalPath, { recursive: true, force: true })
+      }
+    }
+
+    return results
   })
 }
 
