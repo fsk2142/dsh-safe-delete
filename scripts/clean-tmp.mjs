@@ -5,32 +5,39 @@
  * ## 为什么需要
  *
  * 全量测试走后 `tests/support/tmpdir.ts` 的 `scratchDir()`，它在 `afterEach`
- * 里自己收尾。但**一次性探针脚本**（为测量某件事临时写的 `zz-*.ts`）常常直接
- * 用 `mkdtempSync`，跑完源码删了，临时目录却留在系统 temp 里。
+ * 里自己收尾 —— 全套跑完不留垃圾。
  *
- * 实测累积到 59 个目录、6.5 MB。
+ * 但**一次性探针脚本**（为测量某件事临时写的 `zz-*.ts`）是我自己写的，
+ * 常常直接 `mkdtempSync` 或 `join('C:\\Work', ...)`，跑完源码 `safe_delete`
+ * 掉了，目录却留在原地。
  *
- * ## 两处都要查
+ * 实际发生过的泄漏点（累计 75+ 个目录、2 万多项）：
  *
- * 1. **系统临时目录**里的 `dsd-*` / `.dsd-*` 残留；
- * 2. **工作区**里的探针脚本（`zz-*`）、输出清单（`.tmp-*`）、草稿（`.msg*` / `.rel*`）。
+ * | 位置 | 为什么在那儿 |
+ * |---|---|
+ * | 系统 temp | `mkdtempSync(tmpdir(), 'dsd-...')` |
+ * | `C:\Work` 根 | 探针里写死 `join('C:\\Work', ...)` 图省事 |
+ * | 用户家目录根 | 需要"看起来像家目录"的路径来做分级测试 |
+ * | 工作区 | `zz-*.ts` 源码、`.msg*` 草稿、`.tmp-*` 清单 |
  *
- * 第二类已被 `.gitignore` 覆盖（不会误提交），但留在工作树里仍然碍事。
+ * ## 设计取舍
+ *
+ * 扫描范围**刻意包含 C:\Work 根与家目录根**，因为那正是我实际泄漏过的地方。
+ * 前缀严格限定 `.dsd-*` / `dsd-*`，不匹配任何用户自己的目录。
  *
  * ## 用法
  *
  *   pnpm clean:tmp          只列出会清什么（dry run）
  *   pnpm clean:tmp --apply  真的清理
- *
- * 默认 dry run 是刻意的：这是删文件，`--apply` 是明确的选择。
  */
 
 import { readdirSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-/** 系统临时目录里的本项目残留前缀。 */
-const TEMP_PATTERN = /^\.?dsd[-_]|^safe-delete/
+/** 探针残留的目录名前缀。**只匹配这些，不碰用户目录。** */
+const PROBE_PATTERN = /^\.?dsd-/
+
 /** 工作区里的探针与草稿。 */
 const WS_PATTERN = /^(zz-|\.tmp-|\.msg|\.rel)/
 
@@ -64,18 +71,45 @@ function sizeOf(dir) {
 }
 
 /**
+ * 要扫描的根目录（去重）。
+ *
+ * `C:\Work` 与家目录根是我实际泄漏过的位置，所以必须查 —— 只查系统 temp
+ * 会漏掉它们。
+ *
+ * @returns 根目录列表。
+ */
+function scanRoots() {
+  const roots = new Set()
+  roots.add(resolve(tmpdir()))
+  roots.add(resolve(homedir()))
+  roots.add(resolve(process.cwd()))
+  // 父级工作区（dsh-plug-in）也查一层：探针有时把输出放那里。
+  roots.add(resolve(process.cwd(), '..'))
+  // 历史泄漏位置：C:\Work 根。
+  roots.add(resolve('C:\\Work'))
+  return [...roots].filter((r) => {
+    try {
+      return statSync(r).isDirectory()
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
  * 收集两处待清理项。
  *
- * @returns 条目列表（绝对路径 + 大小）。
+ * @returns 条目列表（绝对路径 + 大小 + 来源）。
  */
 function collect() {
   const items = []
 
-  const tempRoot = resolve(tmpdir())
-  for (const e of readdirSync(tempRoot, { withFileTypes: true })) {
-    if (!e.isDirectory() || !TEMP_PATTERN.test(e.name)) continue
-    const full = join(tempRoot, e.name)
-    items.push({ path: full, label: e.name, where: 'temp', bytes: sizeOf(full) })
+  for (const root of scanRoots()) {
+    for (const e of readdirSync(root, { withFileTypes: true })) {
+      if (!e.isDirectory() || !PROBE_PATTERN.test(e.name)) continue
+      const full = join(root, e.name)
+      items.push({ path: full, label: full, where: 'probe', bytes: sizeOf(full) })
+    }
   }
 
   const workspace = resolve(process.cwd())
@@ -91,28 +125,28 @@ function collect() {
     items.push({ path: full, label: e.name, where: 'workspace', bytes })
   }
 
-  return { items, tempRoot, workspace }
+  return items
 }
 
-const { items, tempRoot, workspace } = collect()
+const items = collect()
 
 if (items.length === 0) {
-  console.log('没有测试残留：系统临时目录与工作区都干净。')
+  console.log('没有测试残留：探针目录与工作区都干净。')
   process.exit(0)
 }
 
-const tempItems = items.filter((i) => i.where === 'temp')
+const probes = items.filter((i) => i.where === 'probe')
 const wsItems = items.filter((i) => i.where === 'workspace')
 
-if (tempItems.length > 0) {
-  console.log(`系统临时目录 ${tempRoot}：${tempItems.length} 个`)
-  for (const i of tempItems) console.log(`  ${i.label.padEnd(46)} ${(i.bytes / 1024).toFixed(1)} KB`)
+if (probes.length > 0) {
+  console.log(`探针残留目录：${probes.length} 个`)
+  for (const i of probes) console.log(`  ${i.label.padEnd(56)} ${(i.bytes / 1024).toFixed(1)} KB`)
 }
 
 if (wsItems.length > 0) {
   console.log('')
-  console.log(`工作区 ${workspace}：${wsItems.length} 个（已被 .gitignore 覆盖，仍建议删）`)
-  for (const i of wsItems) console.log(`  ${i.label.padEnd(46)} ${(i.bytes / 1024).toFixed(1)} KB`)
+  console.log(`工作区残留：${wsItems.length} 个（已被 .gitignore 覆盖，仍建议删）`)
+  for (const i of wsItems) console.log(`  ${i.label.padEnd(56)} ${(i.bytes / 1024).toFixed(1)} KB`)
 }
 
 const totalBytes = items.reduce((s, i) => s + i.bytes, 0)
@@ -127,15 +161,16 @@ if (!apply) {
 }
 
 /*
- * 真删。逐个确认路径在各自的根之下 —— 名字来自 readdirSync（不含分隔符），
- * 仍然做边界检查，因为这个脚本本身就在删东西。
+ * 真删。逐个确认路径在它所来自的扫描根之下 —— 名字来自 readdirSync
+ * （不含分隔符），仍然做边界检查，因为这个脚本本身就在删东西。
  */
+const roots = scanRoots()
 let removed = 0
 let failed = 0
 for (const i of items) {
-  const root = i.where === 'temp' ? tempRoot : workspace
   const full = resolve(i.path)
-  if (!full.startsWith(root)) {
+  const ok = i.where === 'workspace' ? full.startsWith(resolve(process.cwd())) : roots.some((r) => full.startsWith(r))
+  if (!ok) {
     console.error(`  跳过越界路径：${full}`)
     failed += 1
     continue
