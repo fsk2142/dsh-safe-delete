@@ -104,7 +104,17 @@ function globToRegExp(glob: string): RegExp {
     out += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     i += 1
   }
-  return new RegExp(`^${out}$`)
+  /*
+   * Windows 上加 `i` 标志：文件系统本身大小写不敏感，`**\/*.tmp` 应该命中 `A.TMP`。
+   *
+   * 不加的后果是"莫名 no-match"：用户在资源管理器里明明看到 `.TMP` 文件，
+   * 传 `**\/*.tmp` 却报「没有匹配」。实测 2000 个 `.tmp` 文件、模式 `**\/*.TMP`
+   * 命中 0 条。
+   *
+   * POSIX 上保持大小写敏感 —— 那里 `a.txt` 与 `A.TXT` 是两个不同文件，
+   * 放宽会误删。
+   */
+  return new RegExp(`^${out}$`, process.platform === 'win32' ? 'i' : '')
 }
 
 /**

@@ -49,6 +49,30 @@ describe('matchInTree: pattern', () => {
     expect(r.paths.map((p) => p.split(/[\\/]/).pop()).sort()).toEqual(['a.log', 'b.log'])
   })
 
+  it('is case-insensitive on Windows, case-sensitive elsewhere', () => {
+    /*
+     * Windows 文件系统本身大小写不敏感：`A.TMP` 与 `a.tmp` 是同一个文件。
+     * 模式也必须跟着不敏感，否则用户会撞上"文件明明在那儿，却说没匹配"。
+     *
+     * POSIX 上必须保持敏感 —— 那里 `a.txt` 与 `A.TXT` 是两个不同文件，
+     * 放宽会导致误删。
+     */
+    const root = scratchDir('dsd-match-case-')
+    writeFileSync(join(root, 'a.tmp'), 'x')
+    writeFileSync(join(root, 'B.TMP'), 'x')
+
+    const lower = matchInTree({ root, pattern: '*.tmp' })
+    const upper = matchInTree({ root, pattern: '*.TMP' })
+
+    if (process.platform === 'win32') {
+      expect(lower.paths, 'Windows：小写模式应同时命中 .tmp 与 .TMP').toHaveLength(2)
+      expect(upper.paths, 'Windows：大写模式也应命中两者').toHaveLength(2)
+    } else {
+      expect(lower.paths, 'POSIX：只命中 a.tmp').toHaveLength(1)
+      expect(upper.paths, 'POSIX：只命中 B.TMP').toHaveLength(1)
+    }
+  })
+
   it('matches recursively with ** slash prefix', () => {
     const { root } = tree()
     const r = matchInTree({ root, pattern: '**/*.log' })

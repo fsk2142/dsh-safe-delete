@@ -1,2 +1,2 @@
-import { a as moveManyToSafeZone, i as listSafeZone, n as destroyEntry, o as moveToSafeZone, r as isEmptySafeZone, s as restoreFromSafeZone, t as MoveOptions } from "./store-vyWF6Y6Z.js";
-export { MoveOptions, destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone };
+import { a as listSafeZone, c as restoreFromSafeZone, i as isEmptySafeZone, l as writeIndexFiltered, n as destroyEntry, o as moveManyToSafeZone, r as discardEntryContent, s as moveToSafeZone, t as MoveOptions } from "./store-Bc2JeArD.js";
+export { MoveOptions, destroyEntry, discardEntryContent, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone, writeIndexFiltered };

@@ -182,6 +182,85 @@ async function writeIndex(stateDir: string, entries: TrashEntry[]): Promise<void
   renameSync(tmp, file)
 }
 
+/**
+ * 按条件筛选后写索引：**调用方已经持有索引内容**，这里不重新读。
+ *
+ * ## 为什么单独暴露
+ *
+ * 批量清理（`pruneNow`）需要"读一次索引、处理 N 条内容、写一次索引"。如果每条
+ * 都走 `destroyEntry`，就会变成 N 次全量读 + N 次全量写（O(N²)，实测 3000 条
+ * 要 12.9 秒）。这个函数让调用方自己控制读写的次数。
+ *
+ * 与 `writeIndex` 的唯一区别是它在串行队列里执行 —— 批量路径必须和单条路径
+ * 共享同一把锁，否则两边同时写会把索引写坏。
+ *
+ * @param stateDir 安全区根目录。
+ * @param current 调用方已读到的索引快照。
+ * @param keep 保留谓词；返回 false 的条目会被移除。
+ */
+export async function writeIndexFiltered(
+  stateDir: string,
+  current: TrashEntry[],
+  keep: (entry: TrashEntry) => boolean,
+): Promise<void> {
+  return serialized(async () => {
+    await writeIndex(stateDir, current.filter(keep))
+  })
+}
+
+/**
+ * 只处理一个条目的**内容**（回收站或丢弃），不碰索引。
+ *
+ * 与 `destroyEntry` 的区别：那个连索引一起改，所以每条都要读全量 + 写全量。
+ * 批量清理只在这一步逐条调用，索引由调用方最后写一次。
+ *
+ * ## 安全约束照旧
+ *
+ * 路径必须落在 `items/` 之下（双保险，即使索引被篡改也不越界）；
+ * 内容已经不存在时视为成功（只差清索引）；
+ * recycler 抛错或失败时**保留内容**并返回原因 —— 绝不因为回收站坏了就永久删。
+ *
+ * @param stateDir 安全区根目录。
+ * @param id 条目 id。
+ * @param options 是否永久删除、替换的回收实现。
+ * @returns 成功时给出方式；失败时给出原因（内容仍在磁盘上）。
+ */
+export async function discardEntryContent(
+  stateDir: string,
+  id: string,
+  options: { permanent?: boolean; recycler?: Recycler } = {},
+): Promise<{ ok: true; via: 'recycle' | 'permanent' } | { ok: false; reason: string }> {
+  const dir = entryDir(stateDir, id)
+  // 双保险：即使索引被篡改，也绝不删到安全区之外的路径。
+  if (!isUnder(dir, path.join(stateDir, ITEMS_DIR))) {
+    throw new Error(`refusing to destroy a path outside the safe zone: ${dir}`)
+  }
+  if (!existsSync(dir)) {
+    // 磁盘上已经没有了：没有内容要处理，索引由调用方清理。
+    return { ok: true, via: 'permanent' }
+  }
+
+  if (options.permanent === true) {
+    rmSync(dir, { recursive: true, force: true })
+    return { ok: true, via: 'permanent' }
+  }
+
+  const recycler = options.recycler ?? moveToSystemRecycleBin
+  // 包一层 try：recycler 自身抛错（假实现、平台 API 异常）也必须降级成
+  // 「跳过这一条」，不能让异常冒出去中断整轮清理。
+  let outcome: RecycleOutcome
+  try {
+    outcome = recycler(dir)
+  } catch (error) {
+    outcome = { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+  if (!outcome.ok) {
+    // 关键：不删除，把原因带回去。
+    return { ok: false, reason: outcome.reason }
+  }
+  return { ok: true, via: 'recycle' }
+}
+
 /** 生成一个可读且不冲突的 id。 */
 function makeId(now: number): string {
   const d = new Date(now)

@@ -27,7 +27,7 @@ import { matchInTree, parseDuration } from './match'
 import { selectForPrune, safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
 import { canRecycle } from './recycle'
-import { destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
+import { discardEntryContent, destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone, writeIndexFiltered } from './store'
 import type { TrashEntry } from './types'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -483,21 +483,48 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   /** 上次真正跑清理的时间；`null` 表示本进程还没跑过。 */
   let lastPruneAt: number | null = null
 
-  /** 按策略清理安全区；返回**真正移入回收站**的条目。 */
+  /**
+   * 按策略清理安全区；返回**真正移入回收站**的条目。
+   *
+   * ## 为什么不再逐条调 `destroyEntry`
+   *
+   * `destroyEntry` 每次**读全量索引 + 写全量索引**。N 条过期 → N 次全量读写，
+   * 总成本 O(N²)。实测：
+   *
+   *     600 条   → 1.26 s  (2.1 ms/条)
+   *     3000 条  → 12.93 s (4.3 ms/条)   ← 每条耗时翻倍，超线性
+   *
+   * 真实触发场景：用户外出数日、保留期 1 天，回来后索引里积累数千条过期条目；
+   * 此后**每次**工具调用都会重跑这个循环，而它在串行队列里，会阻塞其他调用。
+   *
+   * ## 改法
+   *
+   * 读一次索引 → 逐条处理内容 → 收集幸存条目 → 写一次。与 `moveManyToSafeZone`
+   * 同款模式。审计改为一次批量写（`appendAuditBatch`）。
+   *
+   * ## 行为不变
+   *
+   * - 回收失败的条目**留在安全区**（宁可占盘，也不能因为回收站不可用就永久删）
+   * - 每条一条审计记录
+   * - 返回值仍是"真正移入回收站"的那些
+   */
   const pruneNow = async (): Promise<TrashEntry[]> => {
     if (deps.autoPrune === false) return []
     const entries = await listSafeZone(deps.stateDir)
     // 只看保留期：没有容量层，没有百分比阈值。
     const selected = selectForPrune(entries, { now: now() })
+    if (selected.length === 0) return []
+
     const removed: TrashEntry[] = []
+    const auditRecords: Array<Omit<AuditRecord, 'at'>> = []
+
+    // 逐条**只处理内容**（回收站 / 丢弃），不碰索引。
     for (const entry of selected) {
-      // 移入系统回收站；失败则**保留**该条目并记录原因。
-      // 宁可占磁盘，也不能因为回收站不可用就永久删掉。
-      const result = await destroyEntry(deps.stateDir, entry.id, {
+      const result = await discardEntryContent(deps.stateDir, entry.id, {
         ...(deps.recycler === undefined ? {} : { recycler: deps.recycler }),
       })
       if (!result.ok) {
-        appendAudit(deps.stateDir, {
+        auditRecords.push({
           event: 'prune',
           target: entry.originalPath,
           detail: `id=${entry.id} skipped: ${result.reason}`,
@@ -505,12 +532,24 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         continue
       }
       removed.push(entry)
-      appendAudit(deps.stateDir, {
+      auditRecords.push({
         event: 'prune',
         target: entry.originalPath,
         detail: `id=${entry.id} bytes=${entry.bytes} via=${result.via}`,
       })
     }
+
+    /*
+     * 索引只写一次：把成功清掉的那些移除。
+     *
+     * 失败的条目留在索引里 —— 下轮 prune 会再试（届时回收站若恢复就能清掉）。
+     */
+    if (removed.length > 0) {
+      const gone = new Set(removed.map((e) => e.id))
+      await writeIndexFiltered(deps.stateDir, entries, (e) => !gone.has(e.id))
+    }
+
+    appendAuditBatch(deps.stateDir, auditRecords)
     return removed
   }
 

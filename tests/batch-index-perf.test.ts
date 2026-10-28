@@ -124,7 +124,19 @@ describe('batch delete: index written once per batch', () => {
     expect(r.text + (r.error ?? ''), '应提到失败的那条').toContain('ghost')
   })
 
-  it('is far faster than rewriting the index per file', async () => {
+  /**
+   * 两个基准测试的显式超时。
+   *
+   * vitest 默认 `testTimeout` 是 5 秒，而这两个测试做的是**多秒级真实文件系统
+   * 操作**（1000 个文件的写入 + 移动 + 审计）。本机实测 435 ms 与 1604 ms，
+   * 但在慢机或高负载下会超过 5 秒而**整体超时**——那时断言本身没问题，红的是
+   * 测试框架的超时，而不是真的性能回归。
+   *
+   * 后果比"偶尔红一次"更糟：真实的性能回归也会被当成抖动忽略。
+   */
+  const PERF_TIMEOUT = 30_000
+
+  it('is far faster than rewriting the index per file', { timeout: PERF_TIMEOUT }, async () => {
     /*
      * 性能回归测试（**索引**那一层）。
      *
@@ -146,7 +158,7 @@ describe('batch delete: index written once per batch', () => {
     expect(ms, `500 个文件应在 1.5 秒内完成，实际 ${ms} ms`).toBeLessThan(1500)
   })
 
-  it('is far faster than appending audit records one by one', async () => {
+  it('is far faster than appending audit records one by one', { timeout: PERF_TIMEOUT }, async () => {
     /*
      * 性能回归测试（**审计**那一层）。
      *
