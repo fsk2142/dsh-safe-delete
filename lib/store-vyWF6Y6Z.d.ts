@@ -70,7 +70,7 @@ declare function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOpt
  * ## 为什么
  *
  * `moveToSafeZone` 每调用一次就重写整个 `index.json`。删 1000 个文件时索引会
- * 从 0 涨到 1000 条，累计重写量是 O(N²)，实测 4.4 秒。这里改成一次。
+ * 从 0 涨到 1000 条，累计重写量是 O(N²)，实测在数秒级（4–6 秒）。这里改成一次。
  *
  * ## 失败语义没变
  *

@@ -24,7 +24,7 @@ dsh plugin --profile <profile> add dsh-safe-delete
 
 | 工具 | 参数 | 作用 |
 |---|---|---|
-| `safe_delete` | `path` 或 `paths`，`preview`，`reason` | 删除文件或目录，移入安全区 |
+| `safe_delete` | `path` / `paths` / `root`+`match`+`olderThan`+`exclude`，`preview`，`reason`，`force`（忽略） | 删除文件或目录，移入安全区。详见下节 |
 | `safe_zone_list` | — | 列出安全区条目 |
 | `safe_zone_restore` | `id` | 取回条目。原路径被占用时落到 `<原路径>.restored-<时间戳>` |
 | `safe_zone_status` | — | 条目数、占用大小、保留期、确认阈值、清理去向 |

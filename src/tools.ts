@@ -386,8 +386,8 @@ async function deleteMany(
    * ## 为什么不再逐条调 `deletePath`
    *
    * `deletePath` 每成功一条就重写整个 `index.json`。删到第 N 条时索引已有 N-1
-   * 条，累计重写量 O(N²) —— 实测 1000 个文件 4.4 秒，而删一个含 1000 文件的
-   * 目录只要 24 ms（一次 rename）。
+   * 条，累计重写量 O(N²) —— 1000 个文件实测在数秒级（4–6 秒），而删一个含 1000
+   * 文件的目录只要 24 ms（一次 rename）。
    *
    * 这里改成 `moveManyToSafeZone`：分级判定、保护区、安全区自检、回滚策略全都不变
    * （共用 `stageInto`），只是把"写索引"提到循环外。

@@ -92,6 +92,53 @@ for (const sub of ['list', 'restore', 'clean', 'config', 'status']) {
   if (!exists) mismatches.push(`slash:${sub}: 未实现`)
 }
 
+/*
+ * `safe_delete` 的参数：README 那一行必须列出 schema 里的全部参数。
+ *
+ * 为什么值得单独查：v1.1.0 给 safe_delete 加了 root / match / olderThan /
+ * exclude，README 的「模型侧工具」表那一行**没跟着改**，仍然是旧的
+ * 「path 或 paths，preview，reason」。使用者照着那行调用会漏掉新能力，
+ * 而所有测试仍然全绿 —— 文档脱节是静默的。
+ */
+console.log('\n=== safe_delete 的参数是否都在 README 里 ===')
+{
+  const idx = toolsSrc.indexOf("name: 'safe_delete'")
+  const paramStart = idx < 0 ? -1 : toolsSrc.indexOf('parameters: {', idx)
+  if (paramStart < 0) {
+    mismatches.push('safe_delete: 找不到 parameters 定义')
+    console.log('MISSING  safe_delete 的 parameters 定义')
+  } else {
+    // 括号配对，取出 parameters 块。
+    let depth = 0
+    let end = paramStart
+    for (let i = paramStart + 'parameters: '.length; i < toolsSrc.length; i += 1) {
+      const c = toolsSrc[i]
+      if (c === '{') depth += 1
+      else if (c === '}') {
+        depth -= 1
+        if (depth === 0) {
+          end = i
+          break
+        }
+      }
+    }
+    const block = toolsSrc.slice(paramStart, end + 1)
+    const schemaKeys = [...block.matchAll(/^\s{6}([A-Za-z_]\w*):/gm)].map((m) => m[1])
+    const docLine = readme.split('\n').find((l) => l.includes('`safe_delete` | `'))
+    if (docLine === undefined) {
+      mismatches.push('safe_delete: README 里没有参数说明那行')
+      console.log('MISSING  README 那行')
+    } else {
+      const docKeys = [...docLine.matchAll(/`([a-zA-Z_]\w*)`/g)].map((m) => m[1]).filter((k) => k !== 'safe_delete')
+      for (const key of schemaKeys) {
+        const documented = docKeys.includes(key)
+        console.log(`${documented ? 'ok  ' : 'MISSING'}  ${key}`)
+        if (!documented) mismatches.push(`safe_delete 参数 ${key}: README 未列出`)
+      }
+    }
+  }
+}
+
 console.log('')
 if (mismatches.length === 0) {
   console.log('文档与实现一致。')
