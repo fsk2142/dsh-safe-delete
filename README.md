@@ -224,3 +224,4 @@ node scripts/clean-test-tmp.mjs   # 清测试遗留临时目录
 - [`docs/VERIFY.md`](docs/VERIFY.md) —— 手工验收清单
 - [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) —— 配置页排查
 - [`docs/STARTUP-SAFETY.md`](docs/STARTUP-SAFETY.md) —— 启动安全性
+- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) —— 与其他插件的共存检查
