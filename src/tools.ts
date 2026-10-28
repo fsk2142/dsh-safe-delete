@@ -542,11 +542,14 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     /*
      * 索引只写一次：把成功清掉的那些移除。
      *
+     * **不传 `entries`（那份快照）** —— `writeIndexFiltered` 会在锁内重读最新
+     * 索引再过滤。传快照会让窗口期内并发移入的条目被整个覆盖掉（实测 4 个孤儿）。
+     *
      * 失败的条目留在索引里 —— 下轮 prune 会再试（届时回收站若恢复就能清掉）。
      */
     if (removed.length > 0) {
       const gone = new Set(removed.map((e) => e.id))
-      await writeIndexFiltered(deps.stateDir, entries, (e) => !gone.has(e.id))
+      await writeIndexFiltered(deps.stateDir, (e) => !gone.has(e.id))
     }
 
     appendAuditBatch(deps.stateDir, auditRecords)

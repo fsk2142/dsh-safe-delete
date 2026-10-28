@@ -183,28 +183,44 @@ async function writeIndex(stateDir: string, entries: TrashEntry[]): Promise<void
 }
 
 /**
- * 按条件筛选后写索引：**调用方已经持有索引内容**，这里不重新读。
+ * 按谓词过滤索引并写回，**过滤的是锁内重读到的最新索引**。
  *
- * ## 为什么单独暴露
+ * ## 为什么不接受调用方的快照
  *
- * 批量清理（`pruneNow`）需要"读一次索引、处理 N 条内容、写一次索引"。如果每条
- * 都走 `destroyEntry`，就会变成 N 次全量读 + N 次全量写（O(N²)，实测 3000 条
- * 要 12.9 秒）。这个函数让调用方自己控制读写的次数。
+ * 第一版签名是 `writeIndexFiltered(stateDir, current, keep)` —— 写调用方传入的
+ * 快照。那会引入一个「丢失更新」竞态：
  *
- * 与 `writeIndex` 的唯一区别是它在串行队列里执行 —— 批量路径必须和单条路径
- * 共享同一把锁，否则两边同时写会把索引写坏。
+ *   ```
+ *   1. pruneNow 读快照 [A,B,C]        ← 不在锁内
+ *   2. 逐条处理内容（回收站调用可达秒级）
+ *      ← 窗口期：并发 moveToSafeZone 写入了 D
+ *   3. 持锁写回 snapshot.filter(...)  ← D 被整个覆盖掉
+ *   ```
+ *
+ * 结果：D 的内容留在 `items/` 里、索引里没有记录 —— 列表、还原、清理全都看不见
+ * 它。实测复现：3 条过期 + 1 条并发移入 → prune 后索引 0 条、磁盘 4 个目录，
+ * **4 个孤儿**。
+ *
+ * 旧的逐条 `destroyEntry` 实现每条都在锁内重读索引、只按 id 删自己，天然没有
+ * 这个窗口 —— 批量重构把那条安全性丢了。
+ *
+ * ## 现在的做法
+ *
+ * 在串行块内 `readIndex()` 拿**当前**索引，再按谓词过滤。谓词是「这些 id 该消失」，
+ * 对任何时刻的索引都成立，所以不受交错影响。代价是多一次读（5000 条约 7 ms），
+ * 换来的是不可能丢更新。
  *
  * @param stateDir 安全区根目录。
- * @param current 调用方已读到的索引快照。
- * @param keep 保留谓词；返回 false 的条目会被移除。
+ * @param keep 保留谓词；返回 false 的条目会被移除。对**最新**索引求值。
  */
 export async function writeIndexFiltered(
   stateDir: string,
-  current: TrashEntry[],
   keep: (entry: TrashEntry) => boolean,
 ): Promise<void> {
   return serialized(async () => {
-    await writeIndex(stateDir, current.filter(keep))
+    // 关键：在锁内重读，而不是用调用方的快照。
+    const fresh = await readIndex(stateDir)
+    await writeIndex(stateDir, fresh.filter(keep))
   })
 }
 

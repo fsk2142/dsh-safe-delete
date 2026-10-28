@@ -15,14 +15,25 @@ import { scratchDir } from './support/tmpdir'
  * 24 ms —— 差 185 倍。原因不是枚举慢（预览只要 42 ms），而是**每删一条都重写
  * 整个 `index.json`**：删第 N 条时索引已有 N-1 条，总成本 O(N²)。
  *
- * 索引在 1660 条时是 450 KB；重写 1000 次就是几十 MB 的写放大。
+ * ## 判据为什么是结构性的，不是计时的
  *
- * ## 修复原则
+ * 前两版性能断言都失败过：
  *
- * 一批只在**最后写一次**索引。语义完全不变：每条仍独立走完整流程、独立审计、
- * 单条失败不影响其他条。变的只是"什么时候落盘"。
+ *   1. **绝对阈值**（500 文件 < 1500 ms）：隔离跑 450 ms 通过，全量并行套件下
+ *      实测 4843 ms 失败 —— CPU 饱和时单测试膨胀 3–7 倍。
+ *   2. **相对比较**（批量应快于逐条 3 倍）：隔离时 201 vs 909 ms（4.5 倍）通过，
+ *      全量并行下 1311 vs 1714 ms（**1.3 倍**）失败 —— 争抢把两种方式的差异抹平了。
+ *
+ * 结论：**任何基于时间的判据在饱和的机器上都不可靠**，而误报的代价是真实的性能
+ * 回归被当成抖动忽略。
+ *
+ * 所以这里改为验证**调用结构**：批量路径必须走 `moveManyToSafeZone` /
+ * `appendAuditBatch`，而不是逐条调用。这是"索引只写一次"的**充要条件**，
+ * 且不受负载影响。
+ *
+ * 耗时仍会被打印出来供人参考，但不作为断言。
  */
-describe('batch delete: index written once per batch', () => {
+describe('batch delete: one index write per batch', () => {
   /**
    * 建工具集。
    *
@@ -30,10 +41,10 @@ describe('batch delete: index written once per batch', () => {
    * @param work 工作目录。
    * @returns 工具与审批计数。
    */
-  function makeTool(stateDir: string, work: string): {
-    tool: ReturnType<typeof createTools>[number]
-    approvals: () => number
-  } {
+  function makeTool(
+    stateDir: string,
+    work: string,
+  ): { tool: ReturnType<typeof createTools>[number]; approvals: () => number } {
     let approvals = 0
     const deps: ToolDeps = {
       stateDir,
@@ -124,57 +135,14 @@ describe('batch delete: index written once per batch', () => {
     expect(r.text + (r.error ?? ''), '应提到失败的那条').toContain('ghost')
   })
 
-  /**
-   * 两个基准测试的显式超时。
-   *
-   * vitest 默认 `testTimeout` 是 5 秒，而这两个测试做的是**多秒级真实文件系统
-   * 操作**（1000 个文件的写入 + 移动 + 审计）。本机实测 435 ms 与 1604 ms，
-   * 但在慢机或高负载下会超过 5 秒而**整体超时**——那时断言本身没问题，红的是
-   * 测试框架的超时，而不是真的性能回归。
-   *
-   * 后果比"偶尔红一次"更糟：真实的性能回归也会被当成抖动忽略。
-   */
-  const PERF_TIMEOUT = 30_000
-
-  it('is far faster than rewriting the index per file', { timeout: PERF_TIMEOUT }, async () => {
+  it('handles 1000 files without exhausting anything', { timeout: 60_000 }, async () => {
     /*
-     * 性能回归测试（**索引**那一层）。
+     * 规模冒烟：1000 条能跑通、全部登记、审计齐全。
      *
-     * 收紧到 1500 ms：这里是 500 个文件，实测约 200 ms。原来的阈值 2000 ms
-     * 太松 —— 索引逐条写时是 2096 ms，刚好卡在边缘，容易误判为通过。
+     * 不断言耗时（见文件头的理由）。这一条只保证规模上不出错 —— 内存、句柄、
+     * 索引大小都不至于把进程搞挂。
      */
-    const root = scratchDir('dsd-batch-speed-')
-    const work = join(root, 'work')
-    const state = join(root, 'state')
-    const files = makeFiles(join(work, 'batch'), 500)
-    const { tool } = makeTool(state, work)
-
-    const t0 = Date.now()
-    const r = await tool.execute({ paths: files })
-    const ms = Date.now() - t0
-
-    expect(r.ok, r.error ?? '应成功').toBe(true)
-    expect(await listSafeZone(state)).toHaveLength(500)
-    expect(ms, `500 个文件应在 1.5 秒内完成，实际 ${ms} ms`).toBeLessThan(1500)
-  })
-
-  it('is far faster than appending audit records one by one', { timeout: PERF_TIMEOUT }, async () => {
-    /*
-     * 性能回归测试（**审计**那一层）。
-     *
-     * 审计曾经是最大单项开销：1000 条逐条 `appendAudit` 要 728 ms，因为每条都
-     * 做 6 次系统调用检查「上次是否留下半行」。批量入口只在批首检查一次。
-     *
-     * ## 为什么用"相对比较"
-     *
-     * 绝对阈值在慢机器上会误报。这里直接对比两种写法：
-     *
-     *   批量审计 1000 条：约 0 ms
-     *   逐条审计 1000 条：约 808 ms
-     *
-     * 比值判据不受机器快慢影响。
-     */
-    const root = scratchDir('dsd-audit-speed-')
+    const root = scratchDir('dsd-batch-1000-')
     const work = join(root, 'work')
     const state = join(root, 'state')
     const files = makeFiles(join(work, 'batch'), 1000)
@@ -182,72 +150,31 @@ describe('batch delete: index written once per batch', () => {
 
     const t0 = Date.now()
     const r = await tool.execute({ paths: files })
-    const batchMs = Date.now() - t0
+    const ms = Date.now() - t0
+    console.log(`1000 个文件耗时 ${ms} ms（仅供参考，不作断言）`)
 
     expect(r.ok, r.error ?? '应成功').toBe(true)
+    expect(await listSafeZone(state), '1000 条应全部登记').toHaveLength(1000)
 
-    // 审计必须真的写进去了 —— 快不能靠不记账换来。
-    const { readAudit, appendAudit, appendAuditBatch } = await import('../src/audit')
+    // 审计必须齐全 —— 快不能靠不记账换来。
+    const { readAudit } = await import('../src/audit')
     const records = readAudit(state, 2000)
     expect(records.filter((x) => x.event === 'delete'), '1000 条删除应全部记账').toHaveLength(1000)
-
-    /*
-     * 直接对比两种审计写法。
-     */
-    const sample = Array.from({ length: 1000 }, (_, i) => ({
-      event: 'delete' as const,
-      target: `C:\\x\\f${i}.log`,
-      tool: 'safe_delete',
-    }))
-    const dirA = scratchDir('dsd-audit-cmp-batch-')
-    const dirB = scratchDir('dsd-audit-cmp-seq-')
-
-    const tBatch = Date.now()
-    appendAuditBatch(dirA, sample)
-    const batchOnlyMs = Date.now() - tBatch
-
-    const tSeq = Date.now()
-    for (const rec of sample) appendAudit(dirB, rec)
-    const seqOnlyMs = Date.now() - tSeq
-
-    console.log(`批量审计 ${batchOnlyMs} ms, 逐条审计 ${seqOnlyMs} ms, 完整删除 ${batchMs} ms`)
-
-    if (seqOnlyMs > 50) {
-      expect(
-        batchOnlyMs,
-        `批量审计(${batchOnlyMs} ms) 应显著快于逐条(${seqOnlyMs} ms)`,
-      ).toBeLessThan(seqOnlyMs * 4)
-    }
-    expect(batchMs, `1000 个文件不应超过 3 秒，实际 ${batchMs} ms`).toBeLessThan(3000)
   })
 
-  it('uses the batch audit entry point, not per-record writes', async () => {
+  it('uses the batch entry points, not per-item writes', async () => {
     /*
-     * 结构性断言：`deleteMany` 必须走 `appendAuditBatch`。
+     * **结构性断言**：这才是"索引只写一次"的充要条件。
      *
-     * ## 为什么需要这条
+     * 时间判据在饱和的机器上不可靠（见文件头）。而调用结构是确定的：
+     *   - 索引：`deleteMany` 必须调 `moveManyToSafeZone`
+     *   - 审计：`deleteMany` 必须调 `appendAuditBatch`
      *
-     * 上面那条性能测试对比的是「批量 vs 逐条」两个函数本身的耗时 ——
-     * 即使把 `deleteMany` 改回逐条调用 `appendAudit`，那两个函数还是原样，
-     * 测试依然绿。变异检验证实了这一点。
-     *
-     * 所以这里直接看源码：批量路径里不该出现逐条 `appendAudit` 调用。
-     * 这不是"测实现细节"，而是钉住一个**已经优化过的性能契约** ——
-     * 有人改回逐条时必须有东西拦住。
+     * 任一处退回逐条，性能就回到 O(N²)，而这里会立刻变红。
      */
     const { readFileSync } = await import('node:fs')
     const src = readFileSync('src/tools.ts', 'utf8')
 
-    /*
-     * 截取 deleteMany 函数体。
-     *
-     * 边界用「下一个函数开始」—— `deleteMany` 后面紧跟的是 `createTools`，
-     * 所以找 `\nexport function ` 或 `\nfunction `。
-     *
-     * 第一版找的是 `\n  async function `（带缩进），但 `deleteMany` 之后的
-     * 函数不是缩进的自由函数，于是 `end = -1`，slice 退化成固定 8000 字符，
-     * 越界把后面 `safe_delete` 里的 `appendAudit` 也包了进来 → 误报。
-     */
     const start = src.indexOf('async function deleteMany(')
     expect(start, '应能找到 deleteMany').toBeGreaterThan(0)
     const candidates = [
@@ -259,8 +186,15 @@ describe('batch delete: index written once per batch', () => {
     const body = src.slice(start, end)
     expect(body.length, '截取范围应合理（不是整个文件）').toBeLessThan(src.length)
 
+    // 索引：必须用批量入口，且不能逐条 moveToSafeZone。
+    expect(body, 'deleteMany 应使用 moveManyToSafeZone').toContain('moveManyToSafeZone(')
+    expect(
+      /(^|[^A-Za-z])moveToSafeZone\(/.test(body),
+      'deleteMany 里不该逐条调用 moveToSafeZone —— 那会让索引重写 N 次',
+    ).toBe(false)
+
+    // 审计：必须用批量入口，且不能逐条 appendAudit。
     expect(body, 'deleteMany 应使用 appendAuditBatch').toContain('appendAuditBatch(')
-    // 允许出现 appendAudit 的字样（注释里会提到），但不允许以调用形式出现。
     expect(
       /(^|[^A-Za-z])appendAudit\(/.test(body),
       'deleteMany 里不该逐条调用 appendAudit —— 那会让 1000 条多花 700+ ms',
