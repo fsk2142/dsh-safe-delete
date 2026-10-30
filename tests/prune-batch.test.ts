@@ -20,8 +20,14 @@ import { scratchDir } from './support/tmpdir'
  *
  * 这组测试因此用一个 `fakeBin` 目录：recycler 把批次内容 rename 进去，
  * 再返回成功。这样"是否真的回收"和"是否误删"都能被断言。
+ *
+ * ## 为什么显式给 30 秒超时
+ *
+ * 有一条测试造 100 条条目并跑完整清理（写 manifest、聚合、回收、写索引、
+ * 写审计）。隔离运行约 1 秒，但全量并行套件下会超过默认的 5 秒 ——
+ * 失败形态是框架超时，不是断言失败，容易被误读成逻辑回归。
  */
-describe('batch recycle (worker execution body)', () => {
+describe('batch recycle (worker execution body)', { timeout: 30_000 }, () => {
   /**
    * 造 N 条已过期条目。
    *

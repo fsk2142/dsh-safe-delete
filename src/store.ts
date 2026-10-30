@@ -486,7 +486,7 @@ const ENTRY_ID = /^\d{8}-\d{6}-[a-z0-9][a-z0-9_-]{2,30}$/i
  * @param id 待校验的 ID。
  * @returns 合法返回 true。
  */
-function isValidEntryId(id: string): boolean {
+export function isValidEntryId(id: string): boolean {
   if (!ENTRY_ID.test(id)) return false
   // 正则已排除，但显式再挡一次：任何空白或路径分隔符都不该出现。
   if (/[\s/\\]/.test(id)) return false

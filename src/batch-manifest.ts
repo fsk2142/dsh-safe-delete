@@ -45,6 +45,8 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { isValidEntryId } from './store'
+
 /** 批次里一条条目的记录。 */
 export interface BatchManifestEntry {
   /** 安全区条目 id。 */
@@ -120,9 +122,61 @@ export function readManifest(stateDir: string, batchId: string): BatchManifest |
   const file = join(batchDirOf(stateDir, batchId), MANIFEST)
   if (!existsSync(file)) return null
   try {
-    const parsed = JSON.parse(readFileSync(file, 'utf8')) as BatchManifest
-    if (typeof parsed.batchId !== 'string' || !Array.isArray(parsed.entries)) return null
-    return parsed
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<BatchManifest> | null
+
+    /*
+     * ## 严格校验（2026-10-30 复审 SD-N06）
+     *
+     * 第一版只检查 `batchId` 是字符串、`entries` 是数组，然后直接当成
+     * `BatchManifest` 返回。而 `recoverBatch` 会拿 `entry.id` 拼路径：
+     *
+     * ```
+     * join(staged, entry.id)        // entry 是 null → TypeError，整个 Worker 中止
+     * join(stateDir, 'items', id)   // id 是 '../..' → 恢复操作越界
+     * ```
+     *
+     * manifest 是**磁盘数据**：可能被崩溃写坏、人工编辑、旧版本写坏。
+     * 任何一项不合格就整体返回 null —— 调用方会保留目录，
+     * 不推断"缺条目就删索引"。
+     */
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    if (typeof parsed.batchId !== 'string' || parsed.batchId === '') return null
+    // batchId 必须与请求的目录名一致，否则 manifest 与目录对不上。
+    if (parsed.batchId !== batchId) return null
+    // schemaVersion 必须为 1；未来有 v2 时应当显式迁移，而不是猜字段。
+    if (parsed.schemaVersion !== 1) return null
+    const statuses = new Set<string>(['staging', 'staged', 'recycling'])
+    if (typeof parsed.status !== 'string' || !statuses.has(parsed.status)) return null
+    if (!Number.isFinite(parsed.createdAt)) return null
+    if (!Array.isArray(parsed.entries)) return null
+
+    /*
+     * 逐条校验。**一个坏条目就让整个 manifest 判为损坏** ——
+     * 部分接受会让"批次里到底有什么"变得不确定，而恢复正是据此决定搬什么。
+     */
+    const seen = new Set<string>()
+    const entries: BatchManifestEntry[] = []
+    for (const raw of parsed.entries) {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+      const e = raw as Partial<BatchManifestEntry>
+      if (typeof e.id !== 'string' || e.id === '') return null
+      // 与索引用同一套白名单（单一来源，避免两处规则漂移）。
+      if (!isValidEntryId(e.id)) return null
+      if (seen.has(e.id)) return null
+      seen.add(e.id)
+      if (typeof e.originalPath !== 'string') return null
+      if (!Number.isFinite(e.bytes) || (e.bytes as number) < 0) return null
+      entries.push({ id: e.id, originalPath: e.originalPath, bytes: e.bytes as number })
+    }
+
+    return {
+      schemaVersion: 1,
+      batchId: parsed.batchId,
+      // 上面已用 Number.isFinite 校验过，这里断言收敛类型。
+      createdAt: parsed.createdAt as number,
+      status: parsed.status as BatchStatus,
+      entries,
+    }
   } catch {
     return null
   }

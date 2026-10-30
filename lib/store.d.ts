@@ -45,6 +45,16 @@ export interface MoveOptions {
  */
 export declare function writeIndexFiltered(stateDir: string, keep: (entry: TrashEntry) => boolean): Promise<void>;
 /**
+ * 校验条目 ID 是否合法。
+ *
+ * 除了正则，还额外拒绝 Windows 保留名与尾随空格/点 —— 正则已经挡住了它们，
+ * 这里是第二道防线：即使正则将来被放宽，这些形态仍然进不来。
+ *
+ * @param id 待校验的 ID。
+ * @returns 合法返回 true。
+ */
+export declare function isValidEntryId(id: string): boolean;
+/**
  * `child` 是否在 `parent` **之内**（**不含** `parent` 本身）。
  *
  * ## 为什么排除"等于自己"（2026-10-30 复审 SD-N01，P0）
