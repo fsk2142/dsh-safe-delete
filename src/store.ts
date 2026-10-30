@@ -18,6 +18,8 @@ import {
   existsSync,
   linkSync,
   mkdirSync,
+  openSync,
+  closeSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -832,6 +834,28 @@ function placeNoReplace(
   desired: string,
   onClaimed?: (candidate: string) => void,
 ): string {
+  /*
+   * ## 先确定落点，再移动内容（2026-10-30 复审 SD-R1）
+   *
+   * 第一版是「先把 `items/<id>` 的内容 rename 到 staging，再去试 100 个候选」。
+   * 问题在于：staging 在**目标目录**里，内容一旦进去就离开了安全区。
+   * 若 100 个候选全被占用（或进程在此时被杀），会出现最糟的组合：
+   *
+   * ```
+   * items/<id>        已空
+   * staging           内容在这里，但恢复扫描只查 items/<id>
+   * 索引              仍保留该 id
+   * → safe_zone_restore(id) 报「没有内容」，用户以为数据丢了
+   * ```
+   *
+   * 现在改成两阶段：
+   *
+   * 1. **先**在目标目录抢一个落点（`open(wx)` / `mkdir`），此时不动内容；
+   * 2. 抢到之后才把内容搬过去。
+   *
+   * 抢不到就**直接失败，内容原地不动** —— `items/<id>` 完好，索引完好，
+   * 用户重试或换个位置再来一次即可。这是"宁可恢复失败，不可让内容失联"。
+   */
   mkdirSync(path.dirname(desired), { recursive: true })
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
 
@@ -846,125 +870,144 @@ function placeNoReplace(
     throw contentMissingError(stateDir, id)
   }
 
-  /*
-   * 内容先进目标同级的唯一 staging 名。
+  /**
+   * 抢一个候选落点：文件用 `open(wx)`，目录用 `mkdir`。
    *
-   * 这样它不占用任何候选路径，后续每次尝试都是干净的 no-replace。
-   * 它同时是失败时的落点 —— 内容在这里仍然完整。
+   * 两者都以 `EEXIST` 原子拒绝已存在的路径，所以**没有任何窗口**。
+   *
+   * @param candidate 候选路径。
+   * @returns 抢到返回 true。
    */
-  const staging = path.join(
-    path.dirname(desired),
-    `.dsh-restore-${id}-${process.pid}-${Date.now().toString(36)}`,
-  )
-
-  try {
-    renameSync(source, staging)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code !== 'EXDEV') throw error
-    // 跨卷：复制到 staging，成功后删源；复制失败则源原样保留。
-    cpSync(source, staging, { recursive: true, preserveTimestamps: true })
-    rmSync(source, { recursive: true, force: true })
-  }
-
-  /** 尝试把 staging 落到候选路径；返回是否成功。 */
-  const placeAt = (candidate: string): boolean => {
-    if (!isDir) {
+  const claim = (candidate: string): boolean => {
+    if (isDir) {
       try {
-        if (linkFileNoReplace(staging, candidate)) {
-          // 链接成功：目标已指向同一 inode，删掉 staging 这个名字即可。
-          rmSync(staging, { force: true })
-          return true
-        }
-        return false
-      } catch {
-        /*
-         * 硬链接不可用（跨卷、文件系统限制）。回退到"存在性检查 + rename"，
-         * 但把它当成**最后手段**：检查与 rename 之间仍有极小窗口，所以只在
-         * 平台确实不支持 link 时才会走到这里。
-         */
-        if (existsSync(candidate)) return false
-        try {
-          renameSync(staging, candidate)
-          return true
-        } catch {
-          return false
-        }
+        mkdirSync(candidate)
+        return true
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'EEXIST') return false
+        throw error
       }
     }
-
-    /*
-     * ## 目录路径**仍有窗口** —— 必须诚实标注
-     *
-     * 文件能用 `linkSync` 做到真正原子（EEXIST 即冲突，无窗口）。
-     * **目录做不到**：Node 没有跨平台的 no-replace 目录改名原语
-     * （POSIX 的 `renameat2(RENAME_NOREPLACE)`、Windows 的
-     * `MoveFileEx` 不含 `MOVEFILE_REPLACE_EXISTING`，都需要原生模块，
-     * 而本插件零运行时依赖）。
-     *
-     * 所以目录走 mkdir → rmdir → rename，仍有一个极短窗口：
-     *
-     * ```
-     * mkdirSync(candidate)    ← 抢位
-     * rmdirSync(candidate)    ← 空出来（窗口）
-     * renameSync(staging, candidate)
-     * ```
-     *
-     * ## 与旧实现（SD-01）的关键区别
-     *
-     * 1. `rmdir` 只能删空目录。若竞态方在窗口里往我们这个空目录写了文件，
-     *    `rmdir` 会 `ENOTEMPTY` 失败 —— 我们换候选名，**绝不删对方的内容**。
-     *    旧实现用 `rmSync(recursive)`，会连同那些文件一起删掉。
-     * 2. 内容始终在 `staging`（目标同级的唯一名），失败不丢、位置写进错误。
-     *
-     * ## 剩余风险（未消除，必须说明）
-     *
-     * 窗口里若恰好有人创建了同名**目录**：Windows 上 `renameSync` 失败
-     * （保守 —— 内容留在 staging，报错给出位置）；POSIX 上会覆盖那个目录。
-     * 后者只可能覆盖一个**空**目录（非空会 ENOTEMPTY），空目录没有数据可丢。
-     */
     try {
-      mkdirSync(candidate)
+      closeSync(openSync(candidate, 'wx'))
+      return true
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'EEXIST') return false
       throw error
     }
+  }
+
+  /**
+   * 把内容放进已经抢占的落点。
+   *
+   * 落点是我们刚创建的空文件/空目录，所以删除它只会删掉自己的空壳。
+   *
+   * @param candidate 已抢占的路径。
+   * @returns 成功返回 true；失败抛错（内容仍在 source）。
+   */
+  const fill = (candidate: string): void => {
+    if (isDir) {
+      // 目录：占位是空目录，先用 rmdir 收掉再 rename。
+      // 若期间有人往里放了东西，rmdir 会 ENOTEMPTY —— 那就换候选。
+      try {
+        rmdirSync(candidate)
+      } catch {
+        throw new Error('claim-polluted')
+      }
+      try {
+        renameSync(source, candidate)
+        return
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code !== 'EXDEV') throw error
+        cpSync(source, candidate, { recursive: true, preserveTimestamps: true })
+        rmSync(source, { recursive: true, force: true })
+        return
+      }
+    }
+
     /*
-     * 窗口在这里。生产路径 `onClaimed` 是 undefined，什么都不做；
-     * 测试用它模拟"别人在这个瞬间往我们的空目录里写了文件"。
+     * 文件：先试着硬链接（真正零拷贝、且原子 no-replace）。
+     *
+     * `linkSync` 到我们刚 `open(wx)` 建的空文件会 EEXIST —— 所以这里换个顺序：
+     * 先删掉空壳，再用 link 直奔 candidate。删空壳与 link 之间确实有窗口，
+     * 但 **link 本身仍然 no-replace**：即使有人在这段时间创建了 candidate，
+     * link 会 EEXIST 而失败，我们换下一个候选，绝不覆盖。
      */
-    onClaimed?.(candidate)
     try {
-      rmdirSync(candidate)
+      rmSync(candidate, { force: true })
     } catch {
-      // 有人在我们的占位目录里放了东西 —— 不能动它，换下一个候选。
-      return false
+      throw new Error('claim-polluted')
     }
     try {
-      renameSync(staging, candidate)
-      return true
+      if (linkFileNoReplace(source, candidate)) {
+        rmSync(source, { force: true })
+        return
+      }
+      throw new Error('claim-polluted')
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
-      if (code === 'EEXIST' || code === 'EPERM' || code === 'ENOTEMPTY') return false
-      throw error
+      if (code === 'EEXIST' || (error instanceof Error && error.message === 'claim-polluted')) {
+        throw new Error('claim-polluted')
+      }
+      /*
+       * 硬链接不可用（EXDEV/EPERM/ENOTSUP）：回到"先抢 open(wx) 再复制"。
+       *
+       * 这条路径没有窗口：`open(wx)` 原子拒绝已存在的目标。
+       */
+      let fd: number
+      try {
+        fd = openSync(candidate, 'wx')
+      } catch (openError) {
+        const openCode = (openError as NodeJS.ErrnoException).code
+        if (openCode === 'EEXIST') throw new Error('claim-polluted')
+        throw openError
+      }
+      try {
+        closeSync(fd)
+        cpSync(source, candidate, { recursive: true, preserveTimestamps: true })
+        rmSync(source, { recursive: true, force: true })
+      } catch (copyError) {
+        try {
+          rmSync(candidate, { recursive: true, force: true })
+        } catch {
+          /* 删不掉就留着空壳，至少 source 还在 */
+        }
+        throw copyError
+      }
     }
   }
 
   for (let i = 0; i < 100; i += 1) {
-    if (placeAt(restoreCandidate(desired, i, stamp))) {
-      return i === 0 ? desired : restoreCandidate(desired, i, stamp)
+    const candidate = restoreCandidate(desired, i, stamp)
+    if (!claim(candidate)) continue
+    /*
+     * 窗口钩子：已抢到落点、内容尚未搬进去。
+     *
+     * 生产路径 `onClaimed` 是 undefined。测试用它模拟"别人在这个瞬间
+     * 往我们的空落点里写了文件"，从而验证 `rmdir`/`open(wx)` 与非递归
+     * 删除的行为（SD-01、SD-R2）。
+     */
+    onClaimed?.(candidate)
+    try {
+      fill(candidate)
+      return candidate
+    } catch (error) {
+      if (error instanceof Error && error.message === 'claim-polluted') continue
+      throw error
     }
   }
 
   /*
-   * 100 个候选全被占用。**内容仍在 staging** —— 必须把位置告诉调用方，
-   * 否则用户会以为数据丢了。
+   * 100 个候选全被占用。**内容仍在 `items/<id>`** —— 索引与磁盘完全一致，
+   * 用户重试或换个位置即可。这是 SD-R1 的修复点：不再把内容搬到半路。
    */
   throw new Error(
     `cannot find a free restore path for ${desired}: 100 candidates are all taken. ` +
-      `The content is intact at ${staging} — move the existing files away and restore again, ` +
-      'or copy that path back manually.',
+      `Nothing was moved — the entry is still intact in the safe zone, so you can ` +
+      'move the existing files away and restore again, or restore to a different path.',
   )
 }
 

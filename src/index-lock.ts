@@ -33,7 +33,7 @@
  * @module dsh-safe-delete/index-lock
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 锁文件名。 */
@@ -142,11 +142,75 @@ function tryOnce(stateDir: string, token: string): boolean {
   const age = Date.now() - holder.at
   const alive = isAlive(holder.pid)
   if (age > STALE_MS && !alive) {
+    /*
+     * ## 接管陈旧锁必须是一个原子步骤（2026-10-30 复审 SD-L1）
+     *
+     * 第一版是 `rmSync(file)` 然后 `writeFileSync(wx)`。两个接管者会这样交错：
+     *
+     * ```
+     * A: 读到旧锁，判定可接管
+     * B: 读到旧锁，判定可接管
+     * A: rmSync(旧锁) → write(wx) 成功，A 开始写索引
+     * B: rmSync(锁路径) —— 此时删掉的是 A 刚建的新锁！
+     * B: write(wx) 成功，B 也开始写索引
+     * → A、B 都认为自己持锁，互斥失效
+     * ```
+     *
+     * ## 改法：用 rename 抢，而不是删除后重建
+     *
+     * `renameSync(lock, uniqueName)` 是原子的：只有一个进程能把那个文件
+     * 改名成功，另一个会拿到 ENOENT（文件已不在原名）。谁改名成功，谁就是
+     * 唯一合法的接管者，随后它建新锁。
+     *
+     * 抢到的人保留那个改名后的文件直到结束时删掉 —— 它只是"我已接管"的凭证。
+     */
+    const tombstone = `${file}.stale-${process.pid}-${Date.now().toString(36)}`
     try {
-      rmSync(file, { force: true })
+      renameSync(file, tombstone)
+    } catch {
+      // 文件已不在原名（别人抢先接管了），本轮放弃。
+      return false
+    }
+    /*
+     * 抢到了。但还要确认一件事：我们改名拿走的那个锁，**真的是我们判定过的
+     * 那把陈旧锁吗**？极端情况下，判读到建新锁之间它可能已被别人刷新。
+     * 用改名后的文件再核一次 token。
+     */
+    let taken = ''
+    try {
+      taken = readFileSync(tombstone, 'utf8')
+    } catch {
+      /* 读不到就当它已失效，继续 */
+    }
+    try {
+      const parsed = JSON.parse(taken) as { token?: string }
+      if (parsed.token !== holder.token) {
+        /*
+         * 拿到的不是我们判定过的那把 —— 说明期间有人刷新了锁。
+         * 把它放回去（尽力而为）并放弃，绝不当成接管成功。
+         */
+        try {
+          renameSync(tombstone, file)
+        } catch {
+          /* 放不回去也没关系：它本来就是陈旧的 */
+        }
+        return false
+      }
+    } catch {
+      /* 内容读不出 JSON：它本来就是坏的，继续接管 */
+    }
+
+    try {
       writeFileSync(file, payload, { flag: 'wx' })
+      rmSync(tombstone, { force: true })
       return true
     } catch {
+      // 新锁建不出来（别人抢先了）：让出，并把凭证清掉。
+      try {
+        rmSync(tombstone, { force: true })
+      } catch {
+        /* 无所谓 */
+      }
       return false
     }
   }

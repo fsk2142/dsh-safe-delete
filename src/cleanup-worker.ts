@@ -77,9 +77,49 @@ async function main(): Promise<number> {
    * 若本进程崩溃、主进程还活着，存活判定会一直为真，锁永不接管
    * （2026-10-30 复审 SD-02，已隔离复现）。
    *
-   * 绑定之后，存活判定以 `workerPid` 为准：本进程一死，锁就能被接管。
+   * ## 绑定失败必须**中止**（2026-10-30 复审 SD-L2）
+   *
+   * 第一版是 `if (token !== '') bindWorkerPid(...)` —— 只看有没有 token，
+   * 不看绑定**是否成功**。绑定失败意味着：
+   *
+   *   - token 对不上（锁已被别人接管）；
+   *   - 锁文件不可写 / 已被删除。
+   *
+   * 这两种情况下我们**没有可验证的锁所有权**。继续清理会与另一个进程
+   * 同时搬动同一批条目 —— 那正是索引锁要防止的事。
+   *
+   * 所以：绑不上就不干，写一个 failed 状态退出。
    */
-  if (token !== '') bindWorkerPid(stateDir, token)
+  if (token === '') {
+    writeCleanupJobState(stateDir, {
+      requestId: id,
+      pid: process.pid,
+      requestedAt: Date.now(),
+      startedAt: null,
+      finishedAt: Date.now(),
+      outcome: 'failed',
+      recycled: 0,
+      skipped: 0,
+      lastError: 'no owner token was passed; refusing to run without a verifiable lock',
+    })
+    return 3
+  }
+  if (!bindWorkerPid(stateDir, token)) {
+    writeCleanupJobState(stateDir, {
+      requestId: id,
+      pid: process.pid,
+      requestedAt: Date.now(),
+      startedAt: null,
+      finishedAt: Date.now(),
+      outcome: 'failed',
+      recycled: 0,
+      skipped: 0,
+      lastError:
+        'could not bind this worker to the cleanup lock (token mismatch, lock removed, or not writable); ' +
+        'refusing to clean without a verified lock',
+    })
+    return 3
+  }
 
   const prev = readCleanupJob(stateDir)
   const requestedAt = prev?.requestedAt ?? Date.now()
