@@ -162,6 +162,36 @@ describe('SD-L1: stale index-lock takeover is atomic', () => {
     expect(tail, '不许用 rmSync(file) 做接管').not.toMatch(/rmSync\(file[^)]*\)[\s\S]{0,80}writeFileSync\(file/)
   })
 
+  it('abandons a mismatched lock instead of renaming it back (SD-N04)', async () => {
+    /*
+     * SD-N04：接管时若发现拿到的锁 token 不符，第一版会把它 `renameSync`
+     * **放回去**。放回是又一次 rename —— 期间锁路径短暂不存在，
+     * 第三方可趁这个间隙拿锁。
+     *
+     * 现在直接放弃，让那把锁留在 tombstone 里。
+     *
+     * 同样是结构性检查（跨进程窗口无法在单进程里稳定命中）。
+     */
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync('src/index-lock.ts', 'utf8')
+
+    const at = src.indexOf('parsed.token !== holder.token')
+    expect(at, '应能找到 token 不符的分支').toBeGreaterThan(0)
+
+    /*
+     * 只看**代码行**，跳过注释 —— 注释里会引用旧写法作为反例。
+     */
+    const branch = src.slice(at, at + 1600)
+    const codeOnly = branch
+      .split('\n')
+      .filter((l) => !/^\s*(\*|\/\/)/.test(l))
+      .join('\n')
+
+    expect(codeOnly, 'token 不符时不许把锁 rename 回去').not.toMatch(/renameSync\(tombstone, file\)/)
+    // 该分支必须以 return false 放弃。
+    expect(codeOnly, '应放弃而非重试').toMatch(/return false/)
+  })
+
   it('reports the holder so a stuck lock can be diagnosed', () => {
     const state = scratchDir('dsd-sdl1-diag-')
     writeStaleLock(state, 'dead')

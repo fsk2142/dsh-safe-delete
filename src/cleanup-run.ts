@@ -242,6 +242,20 @@ export async function pruneNowForWorker(
     }
 
     /*
+     * `vanished`：内容不在 `items/<id>`、但不是我们回收的（SD-N05）。
+     *
+     * 不计入 `recycled`、不写 prune 审计 —— 那条内容可能刚刚被 restore
+     * 搬回用户目录，宣称"已清理"是错的。
+     *
+     * 但索引要清：内容确实不在安全区里了，留着只会让
+     * `safe_zone_restore` 每次报 "no content"。
+     */
+    if (outcome.vanished.length > 0) {
+      const vanishedSet = new Set(outcome.vanished)
+      await writeIndexFiltered(stateDir, (e) => !vanishedSet.has(e.id))
+    }
+
+    /*
      * 推进游标 —— 这里**不再 `break` 整轮**（SD-N07 的修复点）。
      *
      * `batch.length` 可能小于 `slice.length`（被字节上限截断），
@@ -274,8 +288,8 @@ async function recycleBatch(
   stateDir: string,
   batch: Array<{ id: string; bytes?: number; originalPath?: string }>,
   recycler: Recycler,
-): Promise<{ recycled: number; skipped: number; removedIds: string[]; batchId: string }> {
-  if (batch.length === 0) return { recycled: 0, skipped: 0, removedIds: [], batchId: '' }
+): Promise<{ recycled: number; skipped: number; removedIds: string[]; batchId: string; vanished: string[] }> {
+  if (batch.length === 0) return { recycled: 0, skipped: 0, removedIds: [], batchId: '', vanished: [] }
 
   const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const batchRoot = join(stateDir, BATCH_DIR, batchId)
@@ -284,7 +298,7 @@ async function recycleBatch(
   try {
     mkdirSync(batchItems, { recursive: true })
   } catch {
-    return { recycled: 0, skipped: batch.length, removedIds: [], batchId: '' }
+    return { recycled: 0, skipped: batch.length, removedIds: [], batchId: '', vanished: [] }
   }
 
   /*
@@ -309,11 +323,17 @@ async function recycleBatch(
   } catch {
     // 清单写不下去就不该动文件 —— 没有清单等于没有恢复能力。
     cleanupBatchDir(batchRoot)
-    return { recycled: 0, skipped: batch.length, removedIds: [], batchId: '' }
+    return { recycled: 0, skipped: batch.length, removedIds: [], batchId: '', vanished: [] }
   }
 
   const moved: Array<{ id: string }> = []
   const failed: Array<{ id: string }> = []
+  /**
+   * 内容不在 `items/<id>`、但**不是**因我们回收而消失的条目。
+   *
+   * 这些不能计入 `recycled`，也不能写入 `prune` 审计（2026-10-30 复审 SD-N05）。
+   */
+  const vanished: string[] = []
 
   // 阶段一：同卷 rename 聚合。任何一条失败都不影响其他条。
   for (const entry of batch) {
@@ -321,8 +341,27 @@ async function recycleBatch(
     const to = join(batchItems, entry.id)
     try {
       if (!existsSync(from)) {
-        // 内容已经不在（历史上被回收过）：不算失败，索引该清掉。
-        moved.push({ id: entry.id })
+        /*
+         * ## "内容不在了"不等于"我们回收了它"（2026-10-30 复审 SD-N05）
+         *
+         * 第一版把这种情况当成成功：
+         *
+         * ```
+         * if (!existsSync(from)) { moved.push(id); continue }
+         * ```
+         *
+         * 于是它被计入 `recycled`、写进 `prune` 审计、并从索引移除。
+         *
+         * 真实交错：用户在这期间执行了 `restore`，内容已回到原路径，
+         * 而索引还没来得及更新（或已被 deleteEntry 处理）。worker 看到
+         * `items/<id>` 空了，就报告"已清理" —— **同一份数据被同时宣称
+         * 恢复成功与清理成功**。
+         *
+         * 现在单独归类为 `vanished`：不计入 recycled、不写 prune 审计，
+         * 只把索引清掉（因为内容确实不在安全区了，留着只会让
+         * `safe_zone_restore` 一直报错）。
+         */
+        vanished.push(entry.id)
         continue
       }
       renameSync(from, to)
@@ -334,7 +373,7 @@ async function recycleBatch(
 
   if (moved.length === 0) {
     cleanupBatchDir(batchRoot)
-    return { recycled: 0, skipped: failed.length, removedIds: [], batchId }
+    return { recycled: 0, skipped: failed.length, removedIds: [], batchId, vanished }
   }
 
   // 全部搬完，进入"准备提交回收"状态。
@@ -366,7 +405,7 @@ async function recycleBatch(
     const leftovers = existsSync(batchItems) ? readdirSync(batchItems) : []
     if (leftovers.length === 0) {
       cleanupBatchDir(batchRoot)
-      return { recycled: moved.length, skipped: failed.length, removedIds: moved.map((m) => m.id), batchId }
+      return { recycled: moved.length, skipped: failed.length, removedIds: moved.map((m) => m.id), batchId, vanished }
     }
     /*
      * 报告成功但内容还在：把它当作"结果不确定"处理 —— 搬回原处，
@@ -431,6 +470,7 @@ async function recycleBatch(
     skipped: batch.length,
     removedIds: [],
     batchId,
+    vanished,
   }
 }
 

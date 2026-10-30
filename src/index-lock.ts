@@ -186,14 +186,32 @@ function tryOnce(stateDir: string, token: string): boolean {
       const parsed = JSON.parse(taken) as { token?: string }
       if (parsed.token !== holder.token) {
         /*
-         * 拿到的不是我们判定过的那把 —— 说明期间有人刷新了锁。
-         * 把它放回去（尽力而为）并放弃，绝不当成接管成功。
+         * ## 拿到的不是我们判定过的那把锁 —— **不要放回去**
+         * （2026-10-30 复审 SD-N04）
+         *
+         * 第一版在这里 `renameSync(tombstone, file)` 把它放回原位。
+         * 两个问题：
+         *
+         * 1. 放回是**又一次 rename**，期间锁路径短暂不存在。第三方可以趁
+         *    这个间隙 `wx` 拿到锁 —— 于是又出现两个 writer。这恰好是
+         *    我们想消除的那类窗口，却在"防御性回滚"里重新引入了一个。
+         * 2. 我们并不知道那把锁现在的语义：它可能是别人刚建的、正在使用的。
+         *    由我们把它搬来搬去，是在替别人做决定。
+         *
+         * 现在**放弃**，让那把锁留在 tombstone 里。持有者会发现自己的锁
+         * 不见了 —— 那是"锁被别人动过"的明确信号，比"锁还在但内容被换过"
+         * 更容易诊断。
+         *
+         * 本轮返回 false，调用方重试或报错，不会写索引。
+         *
+         * ## 仍然存在的窗口（如实标注）
+         *
+         * `renameSync(file, tombstone)` 本身不校验 inode，所以理论上仍可能
+         * 搬走别人刚建的新锁。要彻底消除需要 OS 级锁句柄
+         * （`fcntl` / `LockFileEx`），而本插件零运行时依赖。
+         *
+         * 与此前相比的改进：**不再有一次额外的、可被利用的 rename**。
          */
-        try {
-          renameSync(tombstone, file)
-        } catch {
-          /* 放不回去也没关系：它本来就是陈旧的 */
-        }
         return false
       }
     } catch {
