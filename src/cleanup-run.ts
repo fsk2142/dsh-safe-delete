@@ -179,12 +179,21 @@ export async function pruneNowForWorker(
      * 而自动清理搬走的条目在流水里查不到。那是"记录"与"实际行为"不一致。
      *
      * 只记**确认成功**的条目：失败的、留在批次里的不该被记成已清理。
-     * 一条记录带批次 id，便于把一次清理的条目聚在一起查。
+     *
+     * ## batchId 必须是真的那个（2026-10-30 复审 SD-N08）
+     *
+     * 第一版在这里又造了一个 id：`Date.now().toString(36)`。而
+     * `recycleBatch` 内部用的是 `${Date.now()}-${random}` —— **两个值永远不同**。
+     *
+     * 结果：journal 里写着 `batch=abc123`，而 `batches/abc123/manifest.json`
+     * 根本不存在。事故调查时顺着审计去对账，会找不到对应的批次目录 ——
+     * 一条本来用于"可追溯"的记录反而误导。
+     *
+     * 现在 `recycleBatch` 把真实 batchId 返回出来，审计原样写入。
      *
      * 用批量接口：逐条调用要 6 次系统调用做半行检查，几万条就是几分钟。
      */
     if (outcome.removedIds.length > 0) {
-      const batchId = `${Date.now().toString(36)}`
       appendAuditBatch(
         stateDir,
         outcome.removedIds.map((id) => {
@@ -193,7 +202,7 @@ export async function pruneNowForWorker(
             event: 'prune' as const,
             target: entry?.originalPath ?? id,
             tool: 'cleanup-worker',
-            detail: `id=${id} batch=${batchId}`,
+            detail: `id=${id} batch=${outcome.batchId}`,
           }
         }),
       )
@@ -235,8 +244,8 @@ async function recycleBatch(
   stateDir: string,
   batch: Array<{ id: string; bytes?: number; originalPath?: string }>,
   recycler: Recycler,
-): Promise<{ recycled: number; skipped: number; removedIds: string[] }> {
-  if (batch.length === 0) return { recycled: 0, skipped: 0, removedIds: [] }
+): Promise<{ recycled: number; skipped: number; removedIds: string[]; batchId: string }> {
+  if (batch.length === 0) return { recycled: 0, skipped: 0, removedIds: [], batchId: '' }
 
   const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const batchRoot = join(stateDir, BATCH_DIR, batchId)
@@ -245,7 +254,7 @@ async function recycleBatch(
   try {
     mkdirSync(batchItems, { recursive: true })
   } catch {
-    return { recycled: 0, skipped: batch.length, removedIds: [] }
+    return { recycled: 0, skipped: batch.length, removedIds: [], batchId: '' }
   }
 
   /*
@@ -270,7 +279,7 @@ async function recycleBatch(
   } catch {
     // 清单写不下去就不该动文件 —— 没有清单等于没有恢复能力。
     cleanupBatchDir(batchRoot)
-    return { recycled: 0, skipped: batch.length, removedIds: [] }
+    return { recycled: 0, skipped: batch.length, removedIds: [], batchId: '' }
   }
 
   const moved: Array<{ id: string }> = []
@@ -295,7 +304,7 @@ async function recycleBatch(
 
   if (moved.length === 0) {
     cleanupBatchDir(batchRoot)
-    return { recycled: 0, skipped: failed.length, removedIds: [] }
+    return { recycled: 0, skipped: failed.length, removedIds: [], batchId }
   }
 
   // 全部搬完，进入"准备提交回收"状态。
@@ -327,7 +336,7 @@ async function recycleBatch(
     const leftovers = existsSync(batchItems) ? readdirSync(batchItems) : []
     if (leftovers.length === 0) {
       cleanupBatchDir(batchRoot)
-      return { recycled: moved.length, skipped: failed.length, removedIds: moved.map((m) => m.id) }
+      return { recycled: moved.length, skipped: failed.length, removedIds: moved.map((m) => m.id), batchId }
     }
     /*
      * 报告成功但内容还在：把它当作"结果不确定"处理 —— 搬回原处，
@@ -391,6 +400,7 @@ async function recycleBatch(
     recycled: 0,
     skipped: batch.length,
     removedIds: [],
+    batchId,
   }
 }
 

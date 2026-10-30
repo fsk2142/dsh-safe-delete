@@ -175,10 +175,46 @@ function tryAcquireLock(stateDir: string, staleMs: number, token: string): boole
         typeof holder.workerPid === 'number' ? holder.workerPid : holder.pid
       const holderAlive = typeof livenessPid === 'number' && isAlive(livenessPid)
       if (age > staleMs && !holderAlive) {
-        // 过期且持有者已死：接管。
-        rmSync(lockPath, { force: true })
-        writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' })
-        return true
+        /*
+         * 过期且持有者已死：接管。
+         *
+         * ## 必须用 rename 抢占，不能"删了再建"（2026-10-30 复审 SD-N03）
+         *
+         * `rmSync(lock) → writeFileSync(wx)` 是两步：
+         *
+         * ```
+         * A: 读到旧锁，判定可接管
+         * B: 读到旧锁，判定可接管
+         * A: rmSync(旧锁) → write(wx) 成功，A 派发 Worker
+         * B: rmSync(锁路径) —— 删掉的是 A 刚建的新锁！
+         * B: write(wx) 成功，B 也派发 Worker
+         * → 两个 Worker 并行清理
+         * ```
+         *
+         * `renameSync(lock, tombstone)` 是原子的：只有一个进程能把它改走，
+         * 另一个拿到 ENOENT。这与 `index-lock.ts` 用的是同一套方案 ——
+         * 那里已经修过，这里当时漏了。
+         */
+        const tombstone = `${lockPath}.stale-${process.pid}-${Date.now().toString(36)}`
+        try {
+          renameSync(lockPath, tombstone)
+        } catch {
+          // 文件已不在原名：别人抢先接管了。
+          return false
+        }
+        try {
+          writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' })
+          rmSync(tombstone, { force: true })
+          return true
+        } catch {
+          // 新锁建不出来（别人抢先了）：清掉凭证并让出。
+          try {
+            rmSync(tombstone, { force: true })
+          } catch {
+            /* 无所谓，它本来就是陈旧的 */
+          }
+          return false
+        }
       }
     } catch {
       /* 锁文件损坏，当作被占用 */
