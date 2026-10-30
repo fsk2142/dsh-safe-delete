@@ -45,6 +45,26 @@ export interface MoveOptions {
  */
 export declare function writeIndexFiltered(stateDir: string, keep: (entry: TrashEntry) => boolean): Promise<void>;
 /**
+ * `child` 是否在 `parent` **之内**（**不含** `parent` 本身）。
+ *
+ * ## 为什么排除"等于自己"（2026-10-30 复审 SD-N01，P0）
+ *
+ * 第一版 `if (c === p) return true`。那在"检查某路径是否在目录树内"的场景
+ * 里是合理的，但**在删除判定里是灾难**：
+ *
+ * `destroyEntry` 用它确认"要销毁的目录在 items/ 之下"。当 `id` 恰好让
+ * `entryDir` 等于 `items/` 本身时（`id='.'`），这个 `true` 就放行了
+ * "把整个 items/ 当作一个条目删掉"。
+ *
+ * 判定"可以删除这个子项"时，**父目录本身永远不是合法的子项**。
+ * 确实需要"包含自己"的判断（例如列目录）应当用另一个函数，不要共用。
+ *
+ * @param child 子路径。
+ * @param parent 父路径。
+ * @returns 严格在内部返回 true；相等或在外返回 false。
+ */
+export declare function isStrictlyUnder(child: string, parent: string): boolean;
+/**
  * 把一个路径移入安全区。
  *
  * @param stateDir 安全区根目录。

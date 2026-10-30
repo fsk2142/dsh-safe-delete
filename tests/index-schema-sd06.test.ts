@@ -116,14 +116,14 @@ describe('SD-06: index schema validation', () => {
   it('keeps rejecting duplicate ids', async () => {
     // 回归：重复 id 会让"按 id 查找"命中错误的那条。
     const r = await listSafeZoneDetailed(
-      zoneWith(JSON.stringify([good({ id: 'same' }), good({ id: 'same', originalPath: 'D:\\b' })])),
+      zoneWith(JSON.stringify([good({ id: '20261030-120000-aaaaaa' }), good({ id: '20261030-120000-aaaaaa', originalPath: 'D:\\b' })])),
     )
     expect(r.corrupt).toMatch(/duplicate id/i)
   })
 
   it('accepts a well-formed index', async () => {
     // 防过度反应：合法索引必须照常读出来。
-    const r = await listSafeZoneDetailed(zoneWith(JSON.stringify([good(), good({ id: 'other' })])))
+    const r = await listSafeZoneDetailed(zoneWith(JSON.stringify([good(), good({ id: '20261030-120000-bbbbbb' })])))
     expect(r.corrupt).toBeUndefined()
     expect(r.entries).toHaveLength(2)
   })

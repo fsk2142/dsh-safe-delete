@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { listSafeZone, moveToSafeZone, restoreFromSafeZone } from '../src/store'
@@ -58,38 +58,29 @@ describe('SD-R1: content stays in the safe zone until a destination is secured',
 
   it('keeps the content in items/ when every candidate is taken', async () => {
     /*
-     * SD-R1 的核心断言。
+     * SD-R1 的核心断言：候选全被占用时，内容**仍在安全区**、索引**不失联**。
      *
-     * ## 怎么让 100 个候选全被占
+     * ## 为什么用目录而不是文件
      *
-     * 候选名带时间戳，测试无法预知，所以没法预先枚举。用窗口钩子：
-     * 每次抢到落点后，立刻在里面写一个文件把它"污染"，实现就会换下一个。
-     * 100 次都污染 → 全部候选不可用 → 抛错。
+     * 文件恢复在 SD-N02 之后**不再建占位** —— 直接 `linkSync`，`EEXIST` 就换
+     * 下一个候选。所以窗口钩子对文件不再触发（这是修复的结果，不是测试退化）。
      *
-     * 这同时验证了新语义：**内容全程没离开 `items/<id>`**，因为新实现
-     * 是"先抢落点、后搬内容"，抢不到就直接失败。
+     * 目录恢复仍走 `mkdir` 抢位 → 钩子 → `rmdir` → `rename`，钩子有效。
+     * 在钩子里把占位目录塞满，`rmdir` 会 ENOTEMPTY，实现换下一个候选；
+     * 100 次都这样 → 全部不可用 → 抛错。
      *
-     * 旧实现在这里会先把内容 rename 到目标目录的 staging，于是
-     * `items/<id>` 变空、索引仍留着 id —— 用户再也恢复不出来。
+     * 这验证的正是 SD-R1 要保证的：**抢不到落点就不搬内容**。
      */
     const root = scratchDir('dsd-sdr1-all-taken-')
     const state = join(root, 'state')
     const work = join(root, 'work')
 
-    const { id } = await stage(state, work, 'blocked.txt')
+    // 恢复一个**目录**：只有目录路径会走 mkdir/rmdir。
+    const { id } = await stage(state, work, 'pkg', true)
 
     await expect(
       restoreFromSafeZone(state, id, (candidate) => {
-        /*
-         * 把这个落点"污染"掉。
-         *
-         * 恢复的是**文件**，钩子拿到的落点是刚 `open(wx)` 建的空文件 ——
-         * 里面写不了子文件（ENOENT）。所以改成"删掉空壳、再建一个目录"，
-         * 让实现在删除空壳那一步失败（rmSync 一个非空目录或类型不符）。
-         */
-        const { rmSync } = require('node:fs') as typeof import('node:fs')
-        rmSync(candidate, { force: true })
-        mkdirSync(candidate, { recursive: true })
+        // 往我们的空占位目录里放东西，让 rmdir 失败。
         writeFileSync(join(candidate, 'squatter.txt'), 'OCCUPIED')
       }),
     ).rejects.toThrow(/100 candidates are all taken/i)
@@ -97,7 +88,7 @@ describe('SD-R1: content stays in the safe zone until a destination is secured',
     /*
      * 关键：`items/<id>` 里必须还有内容。
      *
-     * 旧实现会先 rename 到目标目录的 staging，所以这里会空。
+     * 旧实现会先把内容 rename 到目标目录的 staging，所以这里会空。
      */
     const itemsDir = join(state, 'items', id)
     expect(existsSync(itemsDir), '条目目录应仍存在').toBe(true)
@@ -110,10 +101,7 @@ describe('SD-R1: content stays in the safe zone until a destination is secured',
 
     // 错误信息必须明确说"什么都没搬"。
     await expect(
-      restoreFromSafeZone(state, id, (c) => {
-        rmSync(c, { force: true })
-        mkdirSync(c, { recursive: true })
-      }),
+      restoreFromSafeZone(state, id, (c) => writeFileSync(join(c, 'x.txt'), 'x')),
     ).rejects.toThrow(/Nothing was moved/i)
   })
 

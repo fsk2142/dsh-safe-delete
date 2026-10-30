@@ -14,12 +14,12 @@
  */
 
 import {
+  closeSync,
   cpSync,
   existsSync,
   linkSync,
   mkdirSync,
   openSync,
-  closeSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -27,6 +27,7 @@ import {
   rmdirSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import path from 'node:path'
 
@@ -303,12 +304,27 @@ async function readIndex(stateDir: string): Promise<IndexRead> {
       return { kind: 'corrupt', reason: `index entry missing id/originalPath: ${JSON.stringify(item).slice(0, 120)}` }
     }
     /*
-     * id 会拼进 `items/<id>`，绝不能含路径分隔符或遍历片段。
+     * ## id 必须走**白名单**（2026-10-30 复审 SD-N01，P0）
      *
-     * 这不是理论风险：`destroyEntry` / `restoreFromSafeZone` 都从索引取 id
-     * 再拼路径，校验过的 id 才让 `isUnder` 那道双保险有意义。
+     * 第一版是黑名单：拒绝 `/`、`\`、`..`、NUL。**它漏掉了单个 `.`**。
+     *
+     * 而 `entryDir` 用 `path.join(stateDir, 'items', id)` —— `join` 会把 `.`
+     * 规范化掉：
+     *
+     * ```
+     * path.join('/s/items', '.')  ===  '/s/items'
+     * ```
+     *
+     * 于是 `id: '.'` 的条目指向**整个 items/ 根目录**。更糟的是 `isUnder`
+     * 把 `child === parent` 判为允许，`destroyEntry` 因此放行，把整个安全区
+     * 当成一个条目交给回收站（或按已授权的永久删除路径递归删掉）。
+     *
+     * 隔离复现：两个正常条目在"搬走 id='.'"时**同时消失**。
+     *
+     * 黑名单永远会漏（`. `、`...`、Windows 保留名 `CON`、大小写变体……）。
+     * 改成白名单：只接受我们自己会生成的形态。
      */
-    if (e.id.includes('/') || e.id.includes('\\') || e.id.includes('..') || e.id.includes('\0')) {
+    if (!isValidEntryId(e.id)) {
       return { kind: 'corrupt', reason: `index entry has an illegal id: ${JSON.stringify(e.id)}` }
     }
     if (seen.has(e.id)) {
@@ -434,7 +450,84 @@ function makeId(now: number): string {
   return `${stamp}-${rand}`
 }
 
-/** `child` 是否在 `parent` 之内（按分隔符边界）。 */
+/**
+ * 合法条目 ID 的形态。
+ *
+ * ## 为什么是白名单而不是黑名单（2026-10-30 复审 SD-N01，P0）
+ *
+ * 第一版拒绝 `/`、`\`、`..`、NUL —— 看起来够了，**但漏掉了单个 `.`**。
+ * 而 `path.join(dir, '.')` 会被规范化成 `dir` 本身，于是 `id: '.'` 的条目
+ * 指向了整个 `items/` 根目录。
+ *
+ * 黑名单天生会漏：`.`、`..`、`...`、Windows 保留名（`CON`/`NUL`/`AUX`）、
+ * 尾随空格与点（Windows 会静默去掉）、大小写变体、Unicode 归一化……
+ * 与其枚举"不允许什么"，不如只接受"我们自己会生成什么"。
+ *
+ * ## 形态
+ *
+ * `makeId()` 生成 `${YYYYMMDD}-${HHMMSS}-${base36}`，例如
+ * `20261030-120000-abcdef`。
+ *
+ * 后缀允许 4–16 位、含 `-` 和 `_`，以兼容：
+ *   - 手工构造的测试 ID（`20261022-000000-testid`）；
+ *   - 早期版本可能用过的稍长后缀。
+ *
+ * 这些都是**字母数字**，不含路径分隔符、点、空格 —— 所以即使放宽长度，
+ * `.`、`..`、`/`、`\` 仍然进不来。白名单守住的是**字符集**，长度只是实用范围。
+ */
+const ENTRY_ID = /^\d{8}-\d{6}-[a-z0-9][a-z0-9_-]{2,30}$/i
+
+/**
+ * 校验条目 ID 是否合法。
+ *
+ * 除了正则，还额外拒绝 Windows 保留名与尾随空格/点 —— 正则已经挡住了它们，
+ * 这里是第二道防线：即使正则将来被放宽，这些形态仍然进不来。
+ *
+ * @param id 待校验的 ID。
+ * @returns 合法返回 true。
+ */
+function isValidEntryId(id: string): boolean {
+  if (!ENTRY_ID.test(id)) return false
+  // 正则已排除，但显式再挡一次：任何空白或路径分隔符都不该出现。
+  if (/[\s/\\]/.test(id)) return false
+  return true
+}
+
+/**
+ * `child` 是否在 `parent` **之内**（**不含** `parent` 本身）。
+ *
+ * ## 为什么排除"等于自己"（2026-10-30 复审 SD-N01，P0）
+ *
+ * 第一版 `if (c === p) return true`。那在"检查某路径是否在目录树内"的场景
+ * 里是合理的，但**在删除判定里是灾难**：
+ *
+ * `destroyEntry` 用它确认"要销毁的目录在 items/ 之下"。当 `id` 恰好让
+ * `entryDir` 等于 `items/` 本身时（`id='.'`），这个 `true` 就放行了
+ * "把整个 items/ 当作一个条目删掉"。
+ *
+ * 判定"可以删除这个子项"时，**父目录本身永远不是合法的子项**。
+ * 确实需要"包含自己"的判断（例如列目录）应当用另一个函数，不要共用。
+ *
+ * @param child 子路径。
+ * @param parent 父路径。
+ * @returns 严格在内部返回 true；相等或在外返回 false。
+ */
+export function isStrictlyUnder(child: string, parent: string): boolean {
+  const c = path.resolve(child)
+  const p = path.resolve(parent)
+  if (c === p) return false
+  return c.startsWith(p + path.sep)
+}
+
+/**
+ * `child` 是否在 `parent` 之内（**含** `parent` 本身）。
+ *
+ * 只用于"列目录 / 定位"这类只读场景。**删除判定必须用 `isStrictlyUnder`。**
+ *
+ * @param child 子路径。
+ * @param parent 父路径。
+ * @returns 在内部或相等返回 true。
+ */
 function isUnder(child: string, parent: string): boolean {
   const c = path.resolve(child)
   const p = path.resolve(parent)
@@ -750,38 +843,6 @@ function restoreCandidate(desired: string, i: number, stamp: string): string {
   return `${desired}.restored-${stamp}${suffix}`
 }
 
-/**
- * 把一个**文件**落到候选路径，绝不覆盖已存在的内容。
- *
- * ## 为什么 `link` + `unlink` 而不是 `rename`
- *
- * `rename` 在 POSIX 上会覆盖已存在的目标、Windows 上会失败 —— 行为不一致，
- * 而 POSIX 上"覆盖"意味着用户刚落下的文件被我们删了。
- *
- * `linkSync` 在两个平台上都以 `EEXIST` 拒绝已存在的目标（实测）：
- *
- * ```
- * linkSync(src, 已存在的 dst) → EEXIST，dst 内容不变
- * linkSync(src, 不存在的 dst) → 成功，两者指向同一 inode
- * ```
- *
- * 成功后 `unlinkSync` 源即可 —— 中间**不存在目标缺失的瞬间**。
- *
- * @param source 源文件（staging）。
- * @param target 目标路径。
- * @returns 成功 true；目标已存在 false；其他错误抛出（交给复制回退）。
- */
-function linkFileNoReplace(source: string, target: string): boolean {
-  try {
-    linkSync(source, target)
-    return true
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'EEXIST') return false
-    // EXDEV / EPERM / ENOTSUP：不支持硬链接，交给调用方的回退。
-    throw error
-  }
-}
 
 /**
  * 把内容放到一个**保证不覆盖**的目标路径。
@@ -871,26 +932,40 @@ function placeNoReplace(
   }
 
   /**
-   * 抢一个候选落点：文件用 `open(wx)`，目录用 `mkdir`。
+   * 抢一个候选落点。
    *
-   * 两者都以 `EEXIST` 原子拒绝已存在的路径，所以**没有任何窗口**。
+   * ## 只对**目录**做"抢占"（2026-10-30 复审 SD-N02，P0）
+   *
+   * 文件路径**不建占位**。第一版对文件先 `open(wx)` 建空壳、再 `rmSync` 删掉、
+   * 然后 `linkSync`。中间那一步 `rmSync` 是致命的：
+   *
+   * ```
+   * open(wx)  创建空占位            ← 路径已存在，别人也可以往里写
+   * （并发方写入自己的内容）
+   * rmSync(candidate)               ← 删掉了并发方的数据
+   * linkSync(source, candidate)
+   * ```
+   *
+   * `open(wx)` 只保证"创建时不存在"，**不保证之后内容仍归我们**。
+   * 隔离实验证实：并发写入的字节被丢弃。
+   *
+   * 所以文件改为**直接 link**（原子 no-replace，没有"先建后删"），
+   * 目录仍用 `mkdir` 抢占（目录无法用 link，且 `rmdir` 只删空目录，安全）。
    *
    * @param candidate 候选路径。
-   * @returns 抢到返回 true。
+   * @returns 抢到返回 true（文件路径永远返回 false，由 `fill` 直接尝试）。
    */
   const claim = (candidate: string): boolean => {
-    if (isDir) {
-      try {
-        mkdirSync(candidate)
-        return true
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code === 'EEXIST') return false
-        throw error
-      }
+    if (!isDir) {
+      /*
+       * 文件不抢占 —— 直接交给 `fill` 去做 `linkSync`。
+       *
+       * 返回 true 表示"该你去试了"，不是"已经占住了"。
+       */
+      return true
     }
     try {
-      closeSync(openSync(candidate, 'wx'))
+      mkdirSync(candidate)
       return true
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
@@ -900,12 +975,23 @@ function placeNoReplace(
   }
 
   /**
-   * 把内容放进已经抢占的落点。
+   * 把内容放进候选落点。
    *
-   * 落点是我们刚创建的空文件/空目录，所以删除它只会删掉自己的空壳。
+   * ## 文件：直接 link，**没有"先建占位再删"**
    *
-   * @param candidate 已抢占的路径。
-   * @returns 成功返回 true；失败抛错（内容仍在 source）。
+   * `linkSync(source, candidate)` 在目标已存在时原子返回 `EEXIST`，
+   * 成功时两者指向同一 inode，然后 `unlink(source)` 收尾。全程没有
+   * "路径短暂由我们持有、随后被 rmSync 释放"的步骤 ——
+   * 那一步正是 SD-N02 的缺陷来源。
+   *
+   * ## 硬链接不可用：`open(wx)` **保持句柄打开**，通过句柄写入
+   *
+   * 跨卷（`EXDEV`）、不支持硬链接的文件系统（`EPERM`/`ENOTSUP`）回退到复制。
+   * 关键是**不关闭 fd 再按路径操作** —— 那会重新暴露"路径可被别人替换"的窗口。
+   * 我们通过自己持有的 fd 写入，写入完成才关闭。
+   *
+   * @param candidate 候选路径。
+   * @returns 成功返回；失败抛 `claim-polluted`（换候选）或其他错误。
    */
   const fill = (candidate: string): void => {
     if (isDir) {
@@ -929,68 +1015,78 @@ function placeNoReplace(
     }
 
     /*
-     * 文件：先试着硬链接（真正零拷贝、且原子 no-replace）。
+     * 文件：**第一次就试 link**，不先建占位。
      *
-     * `linkSync` 到我们刚 `open(wx)` 建的空文件会 EEXIST —— 所以这里换个顺序：
-     * 先删掉空壳，再用 link 直奔 candidate。删空壳与 link 之间确实有窗口，
-     * 但 **link 本身仍然 no-replace**：即使有人在这段时间创建了 candidate，
-     * link 会 EEXIST 而失败，我们换下一个候选，绝不覆盖。
+     * link 成功 → 两个名字指向同一 inode → 删掉 source 那个名字即可。
      */
     try {
-      rmSync(candidate, { force: true })
-    } catch {
-      throw new Error('claim-polluted')
-    }
-    try {
-      if (linkFileNoReplace(source, candidate)) {
-        rmSync(source, { force: true })
-        return
-      }
-      throw new Error('claim-polluted')
+      linkSync(source, candidate)
+      rmSync(source, { force: true })
+      return
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
-      if (code === 'EEXIST' || (error instanceof Error && error.message === 'claim-polluted')) {
-        throw new Error('claim-polluted')
-      }
+      if (code === 'EEXIST') throw new Error('claim-polluted')
       /*
-       * 硬链接不可用（EXDEV/EPERM/ENOTSUP）：回到"先抢 open(wx) 再复制"。
-       *
-       * 这条路径没有窗口：`open(wx)` 原子拒绝已存在的目标。
+       * 只有"这个文件系统不支持硬链接"才回退复制。
+       * 其他错误（权限、磁盘满）直接上抛 —— 不要用复制去掩盖一个真问题。
        */
-      let fd: number
-      try {
-        fd = openSync(candidate, 'wx')
-      } catch (openError) {
-        const openCode = (openError as NodeJS.ErrnoException).code
-        if (openCode === 'EEXIST') throw new Error('claim-polluted')
-        throw openError
-      }
-      try {
-        closeSync(fd)
-        cpSync(source, candidate, { recursive: true, preserveTimestamps: true })
-        rmSync(source, { recursive: true, force: true })
-      } catch (copyError) {
-        try {
-          rmSync(candidate, { recursive: true, force: true })
-        } catch {
-          /* 删不掉就留着空壳，至少 source 还在 */
-        }
-        throw copyError
+      if (code !== 'EXDEV' && code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS') {
+        throw error
       }
     }
+
+    /*
+     * 回退：`open(wx)` 抢到目标，**保持 fd 打开**，通过它写入内容。
+     *
+     * 不关闭 fd 就按路径 cpSync 会让别人有机会在关闭与复制之间替换该文件。
+     * 用 `writeSync(fd, ...)` 写到自己持有的句柄上，就不存在那个窗口。
+     */
+    let fd: number
+    try {
+      fd = openSync(candidate, 'wx')
+    } catch (openError) {
+      const openCode = (openError as NodeJS.ErrnoException).code
+      if (openCode === 'EEXIST') throw new Error('claim-polluted')
+      throw openError
+    }
+    try {
+      const data = readFileSync(source)
+      writeSync(fd, data, 0, data.length, 0)
+      closeSync(fd)
+    } catch (writeError) {
+      try {
+        closeSync(fd)
+      } catch {
+        /* 已经关了 */
+      }
+      /*
+       * 写入失败：把目标清成 0 字节而不是删除。
+       *
+       * 删除会留下"路径空出来"的窗口；留一个空文件则保持路径被占，
+       * 且空文件里没有别人的数据可丢。
+       */
+      try {
+        writeFileSync(candidate, '')
+      } catch {
+        /* 尽力而为 */
+      }
+      throw writeError
+    }
+    rmSync(source, { force: true })
   }
 
   for (let i = 0; i < 100; i += 1) {
     const candidate = restoreCandidate(desired, i, stamp)
     if (!claim(candidate)) continue
     /*
-     * 窗口钩子：已抢到落点、内容尚未搬进去。
+     * 窗口钩子：目录已抢到占位、内容尚未搬进去。
      *
      * 生产路径 `onClaimed` 是 undefined。测试用它模拟"别人在这个瞬间
-     * 往我们的空落点里写了文件"，从而验证 `rmdir`/`open(wx)` 与非递归
-     * 删除的行为（SD-01、SD-R2）。
+     * 往我们的空占位目录里写了文件"，验证 `rmdir` 会 ENOTEMPTY 而不删对方内容。
+     *
+     * 文件路径不再有"占位"阶段，所以钩子对文件是空操作。
      */
-    onClaimed?.(candidate)
+    if (isDir) onClaimed?.(candidate)
     try {
       fill(candidate)
       return candidate
@@ -1224,9 +1320,23 @@ export async function destroyEntry(
     }
 
     const dir = entryDir(stateDir, id)
-    // 双保险：即使索引被篡改，也绝不删到安全区之外的路径。
-    if (!isUnder(dir, path.join(stateDir, ITEMS_DIR))) {
-      throw new Error(`refusing to destroy a path outside the safe zone: ${dir}`)
+    /*
+     * 双保险：即使索引被篡改（或来自不兼容版本），也绝不删到安全区之外。
+     *
+     * **必须用 `isStrictlyUnder`**：`items/` 根目录本身不是合法的"条目"。
+     * 用允许相等的 `isUnder` 时，`id='.'` 会让 `dir === items/` 通过检查，
+     * 于是整个安全区的条目被当成一个条目处理（2026-10-30 复审 SD-N01）。
+     */
+    const itemsRoot = path.join(stateDir, ITEMS_DIR)
+    if (!isStrictlyUnder(dir, itemsRoot)) {
+      throw new Error(
+        `refusing to destroy ${JSON.stringify(id)}: it resolves to ${dir}, ` +
+          `which is not a single entry directory under ${itemsRoot}`,
+      )
+    }
+    // 单独再校验一次 id —— 不依赖"路径恰好算对了"。
+    if (!isValidEntryId(id)) {
+      throw new Error(`refusing to destroy an entry with an illegal id: ${JSON.stringify(id)}`)
     }
     if (!existsSync(dir)) {
       // 磁盘上已经没有了：只清理索引，不算失败。
