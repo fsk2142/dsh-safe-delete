@@ -162,9 +162,24 @@ declare function moveManyToSafeZone(stateDir: string, absPaths: string[], opts: 
 /** 列出安全区条目（按移入时间升序）。 */
 declare function listSafeZone(stateDir: string): Promise<TrashEntry[]>;
 /**
+ * 列出条目，并把索引损坏的原因一并带出。
+ *
+ * 工具侧用这个：`safe_zone_list` 应当告诉用户"索引读不出来"，而不是
+ * 显示一个空列表让人以为安全区是空的。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 条目与（可能的）损坏原因。
+ */
+declare function listSafeZoneDetailed(stateDir: string): Promise<{
+  entries: TrashEntry[];
+  corrupt?: string;
+}>;
+/**
  * 从安全区还原一条。
  *
- * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— 绝不覆盖现在的文件。
+ * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现在的
+ * 文件。占用判定用原子 `mkdir` 占位，不用「存在性检查 + rename」（见
+ * `claimRestoreDestination` 的注释）。
  */
 declare function restoreFromSafeZone(stateDir: string, id: string): Promise<{
   restoredTo: string;
@@ -207,4 +222,4 @@ declare function destroyEntry(stateDir: string, id: string, options?: {
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 declare function isEmptySafeZone(stateDir: string): Promise<boolean>;
 //#endregion
-export { listSafeZone as a, restoreFromSafeZone as c, moveToSystemRecycleBin as d, isEmptySafeZone as i, writeIndexFiltered as l, destroyEntry as n, moveManyToSafeZone as o, discardEntryContent as r, moveToSafeZone as s, MoveOptions as t, Recycler as u };
+export { listSafeZone as a, moveToSafeZone as c, Recycler as d, moveToSystemRecycleBin as f, isEmptySafeZone as i, restoreFromSafeZone as l, destroyEntry as n, listSafeZoneDetailed as o, discardEntryContent as r, moveManyToSafeZone as s, MoveOptions as t, writeIndexFiltered as u };
