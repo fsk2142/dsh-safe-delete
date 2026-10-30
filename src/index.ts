@@ -768,6 +768,14 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         stateDir,
         limit: selected.length,
         minIntervalMs: 0,
+        /*
+         * 用户敲 `/safe-delete clean` 的意图是**清空安全区**，包括刚删除、
+         * 还没到保留期的条目。
+         *
+         * 这里原来只传 `limit: selected.length`，而 worker 永远只选过期项 ——
+         * 于是"清空"清不掉任何新鲜条目，命令却报告成功（2026-10-30 复审 SD-03）。
+         */
+        mode: 'all',
       })
 
       if (!submitted.started) {
@@ -1080,7 +1088,13 @@ async function maybeRunRequestedClean(
       const submitted =
         selected.length === 0
           ? { started: true, reason: 'nothing to clean' }
-          : await requestCleanup({ stateDir: opts.stateDir, limit: selected.length, minIntervalMs: 0 })
+          : await requestCleanup({
+              stateDir: opts.stateDir,
+              limit: selected.length,
+              minIntervalMs: 0,
+              // 面板按钮的语义同样是"清空安全区"，含未过期条目（SD-03）。
+              mode: 'all',
+            })
 
       /*
        * **只有真正启动成功才标记为已消费。**

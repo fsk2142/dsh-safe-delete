@@ -112,6 +112,8 @@ export async function recoverResidualBatches(stateDir: string): Promise<number> 
  * @param recycler 回收实现；省略时走真实系统回收站。**测试必须注入**，
  *   否则会真的往回收站扔东西。
  * @param now 当前时间；省略用 `Date.now()`。测试注入可控时钟。
+ * @param mode 选中哪些条目：`expired`（只清过期）或 `all`（清空安全区）。
+ *   见下方"为什么必须显式区分"。
  * @returns 统计。
  */
 export async function pruneNowForWorker(
@@ -119,6 +121,7 @@ export async function pruneNowForWorker(
   limit: number,
   recycler: Recycler = moveToSystemRecycleBin,
   now: () => number = Date.now,
+  mode: 'expired' | 'all' = 'expired',
 ): Promise<WorkerResult> {
   /*
    * **先恢复上次的残留批次**，再开始新一轮。
@@ -129,7 +132,23 @@ export async function pruneNowForWorker(
   await recoverResidualBatches(stateDir)
 
   const entries = await listSafeZone(stateDir)
-  const expired = selectForPrune(entries, { now: now() }).slice(0, Math.max(0, limit))
+  /*
+   * ## 为什么必须区分 mode（2026-10-30 复审 SD-03）
+   *
+   * 第一版只有 `selectForPrune`（仅过期）。而 `/safe-delete clean` 和面板
+   * 按钮的语义是"清空安全区"—— 它们把 `selected.length` 当 limit 传下来，
+   * 以为这样就能全清。
+   *
+   * 实际结果：用户 5 分钟前删的文件（保留期 1 天）不会被选中，worker 返回
+   * `recycled=0`，而命令报告"已请求清理 N 条"—— **看起来成功，实际什么都没做**。
+   *
+   * 数量上限和选取范围是两件事。现在 `all` 走"全部条目"，`expired` 只选过期的。
+   */
+  const chosen =
+    mode === 'all'
+      ? [...entries].sort((a, b) => a.movedAt - b.movedAt)
+      : selectForPrune(entries, { now: now() })
+  const expired = chosen.slice(0, Math.max(0, limit))
   if (expired.length === 0) return { recycled: 0, skipped: 0 }
 
   let recycled = 0

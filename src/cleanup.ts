@@ -290,6 +290,24 @@ export interface RequestCleanupOptions {
   limit?: number
   /** 多久没清理过才真的启动（毫秒）；0 表示总是启动。 */
   minIntervalMs?: number
+  /**
+   * 选中哪些条目。**必须显式给出**（2026-10-30 复审 SD-03）。
+   *
+   * - `expired`：只选超过保留期的（自动清理）；
+   * - `all`：不论是否过期都选（用户明确的"清空安全区"）。
+   *
+   * ## 为什么不能用"传个很大的 limit"代替
+   *
+   * 第一版正是如此：`/safe-delete clean` 与面板按钮把 `selected.length`
+   * 当 limit 传下去，而 worker 永远只 `selectForPrune`（仅过期）。
+   *
+   * 结果是**功能语义错误**：用户 5 分钟前删的文件（保留期 1 天），
+   * 点"清空安全区"时命令报告"已请求清理 1 条"，worker 却找不到过期项、
+   * 返回 `recycled=0`，那条纹丝不动 —— 而命令看起来成功了。
+   *
+   * "处理多少条"和"选哪些"是两件事，一个数字表达不了。
+   */
+  mode: 'expired' | 'all'
 }
 
 /**
@@ -299,7 +317,7 @@ export interface RequestCleanupOptions {
  * @returns 是否真的派生了子进程；已有一个在跑、或未到间隔时返回 false。
  */
 export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ started: boolean; reason?: string }> {
-  const { stateDir, limit = 500, minIntervalMs = 0 } = opts
+  const { stateDir, limit = 500, minIntervalMs = 0, mode } = opts
 
   const prev = readCleanupJob(stateDir)
   if (prev !== null && minIntervalMs > 0) {
@@ -361,11 +379,21 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
    * 在 ESM 产物里始终有效，`fileURLToPath` 是纯函数调用。
    */
   const workerPath = join(dirname(fileURLToPath(import.meta.url)), WORKER_ENTRY)
-  const child = spawn(process.execPath, [workerPath, stateDir, String(limit), requestId, ownerToken], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-  })
+  /*
+   * 参数：stateDir limit requestId ownerToken mode
+   *
+   * `mode` 必须显式传 —— worker 原来只会清过期项，导致"清空安全区"清不掉
+   * 刚删除的条目（SD-03）。
+   */
+  const child = spawn(
+    process.execPath,
+    [workerPath, stateDir, String(limit), requestId, ownerToken, mode],
+    {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    },
+  )
 
   /*
    * **必须监听 `error`。**

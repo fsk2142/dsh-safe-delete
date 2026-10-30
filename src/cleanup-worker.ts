@@ -33,13 +33,23 @@ import { pruneNowForWorker } from './cleanup-run'
  * @returns 退出码。
  */
 async function main(): Promise<number> {
-  const [stateDir, limitArg, requestId, ownerToken] = process.argv.slice(2)
+  const [stateDir, limitArg, requestId, ownerToken, modeArg] = process.argv.slice(2)
   if (stateDir === undefined || stateDir === '') {
     console.error('cleanup-worker: missing stateDir')
     return 2
   }
+  /*
+   * 用法：cleanup-worker.js <stateDir> <limit> <requestId> <ownerToken> <mode>
+   *
+   * `mode` 是 `expired`（只清过期）或 `all`（用户明确要求清空安全区）。
+   * 缺省按 `expired` —— 更保守：宁可少清，不可多删。
+   *
+   * 这个参数是 SD-03 的修复点。此前 worker 只清过期项，于是用户点
+   * "清空安全区"时，刚删除（还没过期）的条目一条都不会动，而命令报告成功。
+   */
   const limit = Number(limitArg ?? '500')
   const id = requestId ?? `${Date.now()}`
+  const mode: 'expired' | 'all' = modeArg === 'all' ? 'all' : 'expired'
   /*
    * owner token 由派发方生成并传入。
    *
@@ -65,7 +75,7 @@ async function main(): Promise<number> {
   const requestedAt = prev?.requestedAt ?? Date.now()
 
   try {
-    const result = await pruneNowForWorker(stateDir, Number.isFinite(limit) ? limit : 500)
+    const result = await pruneNowForWorker(stateDir, Number.isFinite(limit) ? limit : 500, undefined, undefined, mode)
 
     writeCleanupJobState(stateDir, {
       requestId: id,

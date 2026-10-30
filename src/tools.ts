@@ -560,6 +560,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         stateDir: deps.stateDir,
         limit: MAX_PRUNE_PER_RUN,
         minIntervalMs: AUTO_PRUNE_INTERVAL_MS,
+        // 自动清理只动过期条目 —— 用户没要求清空，不该碰新鲜的。
+        mode: 'expired',
       })
     } catch {
       /* 调度失败不该让工具调用失败 */
@@ -679,6 +681,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
               stateDir: deps.stateDir,
               limit: MAX_PRUNE_PER_RUN,
               minIntervalMs: AUTO_PRUNE_INTERVAL_MS,
+              // 删除后顺带清理：同样只动过期条目。
+              mode: 'expired',
             })
           } catch {
             /* 调度失败不影响删除结果 */

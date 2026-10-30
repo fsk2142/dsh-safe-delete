@@ -275,12 +275,56 @@ async function readIndex(stateDir: string): Promise<IndexRead> {
   const entries: TrashEntry[] = []
   const seen = new Set<string>()
   for (const item of parsed) {
-    const e = item as Partial<TrashEntry>
+    /*
+     * ## 严格校验每一条（2026-10-30 复审 SD-06）
+     *
+     * 第一版只查 `id` 与 `originalPath`，于是三种坏数据都被"当作有效"：
+     *
+     * | 输入 | 后果 |
+     * |---|---|
+     * | `[null]` | **崩溃** —— `item as Partial<TrashEntry>` 后读 `.id` 抛 TypeError |
+     * | 非法时间戳 | 后续 `new Date(x).toISOString()` 抛 RangeError |
+     * | `id: "../../etc"` | 被当真 —— 而 id 会拼进文件路径 |
+     *
+     * 索引是**磁盘上的数据**，可能被手动编辑、被崩溃写坏、被旧版本写坏。
+     * 它不该让插件崩溃，也不该让一个带路径分隔符的 id 去构造出安全区之外的
+     * 路径。这里逐条验证，任何一条不合格就整体报 corrupt（**保留原文件**）。
+     */
+    const e = item as Partial<TrashEntry> | null | undefined
+    if (e === null || e === undefined || typeof e !== 'object' || Array.isArray(e)) {
+      return {
+        kind: 'corrupt',
+        reason: `index entry is not an object: ${JSON.stringify(item)?.slice(0, 120) ?? String(item)}`,
+      }
+    }
     if (typeof e.id !== 'string' || e.id === '' || typeof e.originalPath !== 'string') {
       return { kind: 'corrupt', reason: `index entry missing id/originalPath: ${JSON.stringify(item).slice(0, 120)}` }
     }
+    /*
+     * id 会拼进 `items/<id>`，绝不能含路径分隔符或遍历片段。
+     *
+     * 这不是理论风险：`destroyEntry` / `restoreFromSafeZone` 都从索引取 id
+     * 再拼路径，校验过的 id 才让 `isUnder` 那道双保险有意义。
+     */
+    if (e.id.includes('/') || e.id.includes('\\') || e.id.includes('..') || e.id.includes('\0')) {
+      return { kind: 'corrupt', reason: `index entry has an illegal id: ${JSON.stringify(e.id)}` }
+    }
     if (seen.has(e.id)) {
       return { kind: 'corrupt', reason: `duplicate id in index: ${e.id}` }
+    }
+    // 时间戳必须是有限数 —— 否则后面算过期时间会得到 NaN，永不清理。
+    if (!Number.isFinite(e.movedAt) || !Number.isFinite(e.expiresAt)) {
+      return {
+        kind: 'corrupt',
+        reason: `index entry has a non-finite timestamp: ${JSON.stringify({ id: e.id, movedAt: e.movedAt, expiresAt: e.expiresAt })}`,
+      }
+    }
+    // 字节数与文件数必须是非负有限数（旧版本可能写缺这些字段）。
+    if (!Number.isFinite(e.bytes) || (e.bytes as number) < 0) {
+      return { kind: 'corrupt', reason: `index entry has an invalid bytes value: ${JSON.stringify(e.bytes)}` }
+    }
+    if (!Number.isFinite(e.fileCount) || (e.fileCount as number) < 0) {
+      return { kind: 'corrupt', reason: `index entry has an invalid fileCount value: ${JSON.stringify(e.fileCount)}` }
     }
     seen.add(e.id)
     entries.push(item as TrashEntry)

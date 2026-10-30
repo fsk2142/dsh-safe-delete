@@ -59,6 +59,39 @@ const files = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
 console.log(`审计范围：${files.length} 个被跟踪文件\n`)
 
 /**
+ * 读**暂存区**里该文件的内容。
+ *
+ * ## 为什么必须扫暂存区（2026-10-30 复审 SD-04）
+ *
+ * 第一版只 `readFileSync(file)` —— 读的是**工作区**。而 `git commit` 提交的是
+ * **暂存区**。两者可以不同：
+ *
+ * ```
+ * git add config.txt          # 暂存区里是带 token 的版本
+ * # 再把工作区改成干净的
+ * git commit                  # 推送的是暂存区那份！
+ * ```
+ *
+ * 已隔离复现：暂存区含 `ghp_…`、工作区是 `REDACTED`，第一版审计**放行**。
+ *
+ * 现在两个版本都扫，任一有命中就失败。
+ *
+ * @param file 仓库相对路径。
+ * @returns 暂存区内容；文件未暂存或读取失败时 null。
+ */
+function readStaged(file) {
+  try {
+    return execFileSync('git', ['show', `:${file}`], {
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+  } catch {
+    return null
+  }
+}
+
+/**
  * 本身内嵌检测模式的脚本：它们的"命中"是规则，不是泄露，必须跳过。
  */
 const SCANNERS = new Set(['scripts/privacy-audit.mjs', 'scripts/verify-remote.mjs'])
@@ -75,23 +108,27 @@ for (const check of checks) {
     }
   }
 
-  // 内容层面的检查
+  // 内容层面的检查：**工作区与暂存区都要过**。
   for (const file of files) {
     if (binary.test(file)) continue
     if (SCANNERS.has(file)) continue
     if (check.ignoreFiles?.includes(file) === true) continue
-    let text
+
+    /** @type {Array<[string, string]>} */
+    const versions = []
     try {
-      text = readFileSync(file, 'utf8')
+      versions.push(['working tree', readFileSync(file, 'utf8')])
     } catch {
-      continue
+      /* 工作区读不到（已删除等），只看暂存区 */
     }
-    if (!check.pattern.test(text)) continue
-    const lines = text.split('\n')
-    for (let i = 0; i < lines.length; i += 1) {
-      if (check.pattern.test(lines[i])) {
-        hits.push({ file, line: i + 1, text: lines[i].trim().slice(0, 100) })
-      }
+    const staged = readStaged(file)
+    if (staged !== null) versions.push(['staged', staged])
+
+    for (const [label, text] of versions) {
+      if (!check.pattern.test(text)) continue
+      const line = text.split('\n').findIndex((l) => check.pattern.test(l)) + 1
+      hits.push({ file: `${file} (${label})`, line, text: text.slice(0, 200) })
+      break
     }
   }
 

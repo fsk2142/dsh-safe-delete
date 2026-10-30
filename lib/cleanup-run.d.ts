@@ -35,7 +35,9 @@ export declare function recoverResidualBatches(stateDir: string): Promise<number
  * @param recycler 回收实现；省略时走真实系统回收站。**测试必须注入**，
  *   否则会真的往回收站扔东西。
  * @param now 当前时间；省略用 `Date.now()`。测试注入可控时钟。
+ * @param mode 选中哪些条目：`expired`（只清过期）或 `all`（清空安全区）。
+ *   见下方"为什么必须显式区分"。
  * @returns 统计。
  */
-export declare function pruneNowForWorker(stateDir: string, limit: number, recycler?: Recycler, now?: () => number): Promise<WorkerResult>;
+export declare function pruneNowForWorker(stateDir: string, limit: number, recycler?: Recycler, now?: () => number, mode?: 'expired' | 'all'): Promise<WorkerResult>;
 //#endregion

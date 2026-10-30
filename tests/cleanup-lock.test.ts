@@ -109,7 +109,7 @@ describe('requestCleanup', () => {
     const state = scratchDir('dsd-req-busy-')
     expect(tryAcquireLock(state, 60_000, 'held-by-someone')).toBe(true)
 
-    const r = await requestCleanup({ stateDir: state, limit: 10 })
+    const r = await requestCleanup({ stateDir: state, limit: 10, mode: 'expired' })
     expect(r.started, '锁在别人手里时不该启动').toBe(false)
     expect(r.reason).toContain('lock')
 
@@ -118,7 +118,7 @@ describe('requestCleanup', () => {
 
   it('records a pending job before spawning', async () => {
     const state = scratchDir('dsd-req-job-')
-    const r = await requestCleanup({ stateDir: state, limit: 10 })
+    const r = await requestCleanup({ stateDir: state, limit: 10, mode: 'expired' })
     // 子进程可能立刻失败（测试环境无打包产物），但任务记录必须先落盘。
     const job = readCleanupJob(state)
     if (r.started) {
