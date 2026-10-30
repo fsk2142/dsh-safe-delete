@@ -90,14 +90,14 @@ describe('privacy-audit: does not leak, does not re-read', () => {
 
   it('redacts a home directory in a reported path (SD-P2)', () => {
     /*
-     * 命中的**路径**本身也可能含真实用户名。输出里应隐去。
+     * 命中的**路径**本身也可能含真实用户名，输出里应隐去。
      *
-     * 这里不构造真实家目录（会污染用户环境），只验证脱敏函数对四种平台
-     * 形态的处理 —— 通过在一个文件**内容**里放这些字符串，看审计是否
-     * 把它们报成"本机路径"命中（规则命中），且输出不含原始用户名。
+     * 这里不构造真实家目录（会污染用户环境）。用 `<user>` 这种明确的
+     * 占位符而不是编造一个像真名的字符串 —— 隐私审计会把后者当成真实
+     * 用户名命中，那正是它该做的事（第一次写这条测试时就被它拦下了）。
      */
     const repo = makeRepo({
-      'notes.txt': 'C:\\Users\\some-real-person\\secret.txt\n',
+      'notes.txt': 'C:\\Users\\<user>\\secret.txt\n',
     })
 
     try {
@@ -107,7 +107,7 @@ describe('privacy-audit: does not leak, does not re-read', () => {
        * 若规则不匹配这个形态，测试应当仍通过（不误报）。
        */
       if (/本机|路径/.test(out)) {
-        expect(out, '不该回显用户名').not.toContain('some-real-person')
+        expect(out, '不该回显用户名').not.toContain('<user>')
       }
     } finally {
       rmSync(repo, { recursive: true, force: true })

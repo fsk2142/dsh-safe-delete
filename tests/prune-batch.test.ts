@@ -194,12 +194,16 @@ describe('batch recycle (worker execution body)', () => {
     await runCleanup(state, fakeBin)
 
     /*
-     * 注意：worker 路径当前不写逐条审计（它在独立进程里，与主进程的
-     * audit 文件并发写会有交错风险）。这里只断言**索引确实清空**，
-     * 审计细节留给后续阶段。
+     * Worker 现在**写**逐条审计（2026-10-30 复审 SD-F1）。
+     *
+     * 这里原来写的是 `expect(records.length).toBeGreaterThanOrEqual(0)` ——
+     * 一个恒真断言。它在整整一个版本里掩盖了"worker 完全不写审计"这个缺口，
+     * 因为无论记录有没有、有几条，它都通过。
+     *
+     * 现在断言确切数量。
      */
     const records = readAudit(state, 100).filter((r) => r.event === 'prune')
-    expect(records.length).toBeGreaterThanOrEqual(0)
+    expect(records, '6 条应各有一条审计记录').toHaveLength(6)
     expect(await listSafeZone(state)).toHaveLength(0)
   })
 

@@ -35,6 +35,7 @@ import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 
 import type { Recycler } from './recycle'
+import { appendAuditBatch } from './audit'
 import { moveToSystemRecycleBin } from './recycle'
 import { listSafeZone, writeIndexFiltered } from './store'
 import { selectForPrune } from './prune'
@@ -170,6 +171,33 @@ export async function pruneNowForWorker(
     const outcome = await recycleBatch(stateDir, batch, recycler)
     recycled += outcome.recycled
     skipped += outcome.skipped
+
+    /*
+     * ## 每批写审计（2026-10-30 复审 SD-F1）
+     *
+     * Worker 此前**完全不写审计** —— `safe_zone_journal` 的说明承诺可追溯，
+     * 而自动清理搬走的条目在流水里查不到。那是"记录"与"实际行为"不一致。
+     *
+     * 只记**确认成功**的条目：失败的、留在批次里的不该被记成已清理。
+     * 一条记录带批次 id，便于把一次清理的条目聚在一起查。
+     *
+     * 用批量接口：逐条调用要 6 次系统调用做半行检查，几万条就是几分钟。
+     */
+    if (outcome.removedIds.length > 0) {
+      const batchId = `${Date.now().toString(36)}`
+      appendAuditBatch(
+        stateDir,
+        outcome.removedIds.map((id) => {
+          const entry = batch.find((b) => b.id === id)
+          return {
+            event: 'prune' as const,
+            target: entry?.originalPath ?? id,
+            tool: 'cleanup-worker',
+            detail: `id=${id} batch=${batchId}`,
+          }
+        }),
+      )
+    }
 
     // 每批都推进索引 —— 崩溃时已完成的部分不会重做。
     if (outcome.removedIds.length > 0) {

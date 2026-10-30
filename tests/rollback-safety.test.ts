@@ -186,7 +186,14 @@ describe('batch recycle: never deletes content that could not be restored', () =
       leftover + active.length,
       `内容不能凭空消失（batches 剩 ${leftover}，索引 ${active.length}）`,
     ).toBeGreaterThanOrEqual(2)
-    expect(result.recycled, '成功数应与真实处理情况一致').toBeGreaterThanOrEqual(0)
+    /*
+     * `recycled` 必须是 **0**，不是 ">= 0"。
+     *
+     * 这里的故事是：recycler 声称成功但什么都没移动，所以自检把它判成
+     * "回收没有真正发生"。若报出正数，就说明代码相信了那个假的成功 ——
+     * 而那正是 P0-02 的缺陷。
+     */
+    expect(result.recycled, '误报的成功不该被计入 recycled').toBe(0)
 
     /*
      * 第 1 层防线的直接证据：误报的"成功"不该被当成回收成功，
