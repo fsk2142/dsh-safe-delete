@@ -499,10 +499,34 @@ async function stageInto(stateDir: string, absPath: string, opts: MoveOptions): 
       )
     }
     crossVolume = true
-    // 顺序很重要：先复制、再登记索引、**最后**才删源。
-    // 如果在删源之前就登记失败，源还在，用户什么都没丢；反过来则会留下
-    // "磁盘上没有、索引里也没有"的孤儿数据。
-    cpSync(target, dest, { recursive: true, preserveTimestamps: true })
+    /*
+     * 顺序很重要：先复制、再登记索引、**最后**才删源。
+     * 如果在删源之前就登记失败，源还在，用户什么都没丢；反过来则会留下
+     * "磁盘上没有、索引里也没有"的孤儿数据。
+     *
+     * ## 复制中途失败必须回滚（2026-10-30 复审 SD-05.1）
+     *
+     * `cpSync` 可能在复制了一部分之后抛错（`ENOSPC`、`EACCES`、源文件被占用）。
+     * 第一版直接上抛，于是 `items/<id>` 里留下一个**半副本**，而索引从未登记它。
+     *
+     * 这种目录是最糟的泄漏形态：
+     *   - `prune` 只扫索引 → 永远轮不到它；
+     *   - `safe_zone_list` 看不到它 → 用户不知道它占着空间；
+     *   - 只有手工翻 `items/` 才会发现。
+     *
+     * 现在失败即回滚：删掉刚建的 `items/<id>`。源文件从未被改动（删源在后），
+     * 所以用户数据零风险；回滚本身失败也不吞掉原始错误。
+     */
+    try {
+      cpSync(target, dest, { recursive: true, preserveTimestamps: true })
+    } catch (error) {
+      try {
+        rmSync(entryRoot, { recursive: true, force: true })
+      } catch {
+        /* 回滚失败时保留原位：宁可留孤儿，也不能掩盖真正的复制错误 */
+      }
+      throw error
+    }
   }
 
   return {
@@ -792,6 +816,7 @@ function linkFileNoReplace(source: string, target: string): boolean {
  * 尝试都是干净的。任何一步失败都不删内容：它要么还在 staging（错误信息给出
  * 确切位置），要么已经在候选路径上。
  *
+ * @param stateDir 安全区目录（用于在内容缺失时诊断它是否在批次里）。
  * @param id 条目 id（用于 staging 命名）。
  * @param source 内容路径。
  * @param desired 期望还原到的路径。
@@ -801,6 +826,7 @@ function linkFileNoReplace(source: string, target: string): boolean {
  * @returns 实际使用的路径。
  */
 function placeNoReplace(
+  stateDir: string,
   id: string,
   source: string,
   desired: string,
@@ -813,7 +839,11 @@ function placeNoReplace(
   try {
     isDir = statSync(source).isDirectory()
   } catch {
-    throw new Error(`safe-zone entry ${id} has no content on disk`)
+    /*
+     * 内容可能刚被清理 worker 搬进批次目录 —— 用能说清楚的诊断，
+     * 而不是让用户以为数据丢了（SD-05.2）。
+     */
+    throw contentMissingError(stateDir, id)
   }
 
   /*
@@ -939,6 +969,70 @@ function placeNoReplace(
 }
 
 /**
+ * 当 `items/<id>` 里找不到内容时，查它是不是正被清理搬到别处去了。
+ *
+ * ## 为什么需要（2026-10-30 复审 SD-05.2）
+ *
+ * worker 把条目从 `items/<id>` 搬进 `batches/<batchId>/items/<id>` 的那一步
+ * **不持索引锁**（只有写索引时才拿锁）。而 restore 在锁内也可能跑到这里。
+ *
+ * 于是有一个真实的交错：
+ *
+ * ```
+ * restore  读索引 → 找到条目 → 去找 items/<id>   ← 文件刚被搬走
+ * worker   把 items/<id> 搬进 batches/...          ← 就在这一刻
+ * restore  报 "no content on disk"                 ← 用户以为数据丢了
+ * ```
+ *
+ * 内容其实完好地躺在批次目录里。报"磁盘上没有内容"是**误导**：用户会以为
+ * 丢了，于是去做更糟的事（清空回收站、重装）。
+ *
+ * 这里查一遍批次目录，命中就把确切位置和原因告诉调用方。
+ *
+ * @param stateDir 安全区目录。
+ * @param id 条目 id。
+ * @returns 内容所在位置与说明；找不到时 null。
+ */
+function locateInBatches(stateDir: string, id: string): { path: string; batchId: string } | null {
+  const root = path.join(stateDir, 'batches')
+  let batchIds: string[]
+  try {
+    batchIds = readdirSync(root)
+  } catch {
+    return null
+  }
+  for (const batchId of batchIds) {
+    const candidate = path.join(root, batchId, 'items', id)
+    if (existsSync(candidate)) return { path: candidate, batchId }
+  }
+  return null
+}
+
+/**
+ * 生成"找不到内容"的错误 —— 如果内容正躺在批次目录里，说清楚。
+ *
+ * @param stateDir 安全区目录。
+ * @param id 条目 id。
+ * @returns 错误对象。
+ */
+function contentMissingError(stateDir: string, id: string): Error {
+  const inBatch = locateInBatches(stateDir, id)
+  if (inBatch !== null) {
+    return new Error(
+      `safe-zone entry ${id} is being cleaned up right now: its content has already been moved ` +
+        `into batch ${inBatch.batchId} (${inBatch.path}). ` +
+        'The cleanup runs in a separate process, so this can happen while you restore. ' +
+        'Nothing is lost — wait for the cleanup to finish, or if it already returned to the ' +
+        'safe zone, restore again. Do NOT delete the batches directory.',
+    )
+  }
+  return new Error(
+    `safe-zone entry ${id} has no content on disk. ` +
+      'It may have been emptied by hand; check items/ and batches/ before assuming the data is gone.',
+  )
+}
+
+/**
  * 从安全区还原一条。
  *
  * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现有的
@@ -967,7 +1061,8 @@ export async function restoreFromSafeZone(
     // 内容在 `items/<id>/<basename>`；取该目录下唯一的那个条目。
     const source = resolveStoredContent(stateDir, id)
     if (source === null) {
-      throw new Error(`safe-zone entry ${id} has no content on disk`)
+      // 同 `placeNoReplace`：内容可能正在批次目录里等着被回收。
+      throw contentMissingError(stateDir, id)
     }
 
     /*
@@ -977,7 +1072,7 @@ export async function restoreFromSafeZone(
      * 所以这里不再需要分两步判断。任何失败都会抛错并把内容位置写进消息，
      * 索引保持不动 —— 用户可以重试或手工取回。
      */
-    const destination = placeNoReplace(id, source, entry.originalPath, onClaimed)
+    const destination = placeNoReplace(stateDir, id, source, entry.originalPath, onClaimed)
 
     // 取回后清掉空的条目目录，避免在安全区里留下空壳。
     try {
