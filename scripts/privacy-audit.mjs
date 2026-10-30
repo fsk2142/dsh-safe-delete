@@ -96,6 +96,65 @@ function readStaged(file) {
  */
 const SCANNERS = new Set(['scripts/privacy-audit.mjs', 'scripts/verify-remote.mjs'])
 
+/**
+ * 把路径里的本机用户名隐去。
+ *
+ * 命中的文件路径本身可能含真实用户名（例如 `C:\Users\<name>\...`），
+ * 直接打印同样是一种泄露。保留结构、隐去具体名字。
+ *
+ * @param {string} p 路径。
+ * @returns {string} 脱敏后的路径。
+ */
+function redactPath(p) {
+  return p
+    .replace(/^[A-Za-z]:\\Users\\[^\\]+/i, 'C:\\Users\\<user>')
+    .replace(/^\/home\/[^/]+/i, '/home/<user>')
+    .replace(/^\/Users\/[^/]+/i, '/Users/<user>')
+    .replace(/^\/mnt\/[a-z]\/Users\/[^/]+/i, '/mnt/<drive>/Users/<user>')
+}
+
+/**
+ * 每个文件的内容只读一次（2026-10-30 复审 SD-P3）。
+ *
+ * ## 为什么（实测）
+ *
+ * 第一版把 `readFileSync` 与 `readStaged` 放在**每条规则的循环里**，
+ * 于是 N 个文件 × 6 条规则 = 6N 次 `git show` 子进程 + 6 次工作区读取。
+ *
+ * 隔离基准（60 文件 × 6 规则）：约 360 次 `git show`、805 ms；
+ * 每文件读一次约 60 次、135 ms。文件的读取次数与规则数完全无关，
+ * 重复读纯属浪费 —— 而且在 Windows 上每次子进程还有进程创建开销。
+ *
+ * 缓存以**文件**为键，值是它的各个版本。
+ *
+ * @type {Map<string, Array<[string, string]>>}
+ */
+const contentCache = new Map()
+
+/**
+ * 取某文件的所有版本内容（工作区 + 暂存区），带缓存。
+ *
+ * @param {string} file 仓库相对路径。
+ * @returns {Array<[string, string]>} `[版本标签, 内容]` 列表。
+ */
+function versionsOf(file) {
+  const cached = contentCache.get(file)
+  if (cached !== undefined) return cached
+
+  /** @type {Array<[string, string]>} */
+  const versions = []
+  try {
+    versions.push(['working tree', readFileSync(file, 'utf8')])
+  } catch {
+    /* 工作区读不到（已删除等），只看暂存区 */
+  }
+  const staged = readStaged(file)
+  if (staged !== null) versions.push(['staged', staged])
+
+  contentCache.set(file, versions)
+  return versions
+}
+
 let findings = 0
 
 for (const check of checks) {
@@ -108,26 +167,16 @@ for (const check of checks) {
     }
   }
 
-  // 内容层面的检查：**工作区与暂存区都要过**。
+  // 内容层面的检查：**工作区与暂存区都要过**，且每个文件只读一次。
   for (const file of files) {
     if (binary.test(file)) continue
     if (SCANNERS.has(file)) continue
     if (check.ignoreFiles?.includes(file) === true) continue
 
-    /** @type {Array<[string, string]>} */
-    const versions = []
-    try {
-      versions.push(['working tree', readFileSync(file, 'utf8')])
-    } catch {
-      /* 工作区读不到（已删除等），只看暂存区 */
-    }
-    const staged = readStaged(file)
-    if (staged !== null) versions.push(['staged', staged])
-
-    for (const [label, text] of versions) {
+    for (const [label, text] of versionsOf(file)) {
       if (!check.pattern.test(text)) continue
       const line = text.split('\n').findIndex((l) => check.pattern.test(l)) + 1
-      hits.push({ file: `${file} (${label})`, line, text: text.slice(0, 200) })
+      hits.push({ file: `${file} (${label})`, line })
       break
     }
   }
@@ -140,7 +189,17 @@ for (const check of checks) {
   findings += hits.length
   console.log(`[${check.severity.toUpperCase()}] ${check.label} — ${hits.length} 处`)
   for (const hit of hits.slice(0, 6)) {
-    console.log(`       ${hit.file}:${hit.line}  ${hit.text}`)
+    /*
+     * **只报位置，不报原文**（2026-10-30 复审 SD-P2）。
+     *
+     * 第一版打印 `hit.text`（命中行的前 200 字符）。那等于把正在拦截的
+     * 敏感内容**再写一遍**到终端、CI 日志、录屏和会话上下文里 ——
+     * 门禁本身成了泄露渠道。
+     *
+     * 现在只给出：规则、文件相对路径、工作区/暂存区、行号。
+     * 知道"哪儿、什么类型"足够去修，不需要看到值。
+     */
+    console.log(`       ${redactPath(hit.file)}:${hit.line}  [命中已隐去]`)
   }
   if (hits.length > 6) console.log(`       … 另有 ${hits.length - 6} 处`)
 }
