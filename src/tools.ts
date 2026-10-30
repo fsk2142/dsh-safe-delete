@@ -744,7 +744,16 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
        *
        * 日期也从完整 ISO 截成 `MM-DD`：年份和毫秒对"哪天过期"没有信息量。
        */
-      const limit = Math.max(1, Number(args.limit) || 20)
+      /*
+       * **上限 200**，与 `safe_zone_journal` 对齐（2026-10-30 复审 SD-08）。
+       *
+       * 第一版是 `Math.max(1, Number(args.limit) || 20)` —— 没有上限。
+       * 模型若传 `limit: 100000`，会把全部条目的绝对路径、日期、ID 都塞进
+       * 上下文。既烧 Token，也把用户主目录结构不必要地送进模型上下文。
+       *
+       * 200 与 journal 一致；真要更多就分页或按条件筛。
+       */
+      const limit = Math.min(200, Math.max(1, Number(args.limit) || 20))
       const shown = entries.slice(-limit)
       const lines = shown.map(
         (e) =>
@@ -758,7 +767,10 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           ` (${humanBytes(safeZoneBytes(entries))}):\n` +
           lines.join('\n') +
           (entries.length > shown.length
-            ? `\n… ${entries.length - shown.length} older entr(ies) not shown; pass limit to see more`
+            ? limit >= 200
+              ? `\n… ${entries.length - shown.length} older entr(ies) not shown; this view is capped at 200 — ` +
+                'restore or clear entries to shorten the list rather than paging further'
+              : `\n… ${entries.length - shown.length} older entr(ies) not shown; pass a larger limit (max 200)`
             : ''),
       }
     },
