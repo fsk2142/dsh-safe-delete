@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createTools, type ToolDeps } from '../src/tools'
 import { listSafeZone, moveToSafeZone } from '../src/store'
 import { scratchDir } from './support/tmpdir'
+import { makeFakeRecycler } from './support/fake-recycler'
 
 /**
  * 批量 prune 不能在写索引时覆盖并发写入。
@@ -99,7 +100,7 @@ describe('prune: does not clobber concurrent writes', { timeout: 30_000 }, () =>
      * 因此直接调内部函数。
      */
     const { pruneNowForWorker } = await import('../src/cleanup-run')
-    const prunePromise = pruneNowForWorker(state, 100, () => ({ ok: true }))
+    const prunePromise = pruneNowForWorker(state, 100, makeFakeRecycler(join(root, 'fake-bin')))
     // 让 prune 跑起来，进入处理内容的阶段。
     await new Promise((r) => setTimeout(r, 0))
     const target = raceTarget()
@@ -147,7 +148,7 @@ describe('prune: does not clobber concurrent writes', { timeout: 30_000 }, () =>
 
     // 并发发起 3 次 move，与 prune 交错。同样直接驱动 worker 执行体。
     const { pruneNowForWorker } = await import('../src/cleanup-run')
-    const prunePromise = pruneNowForWorker(state, 100, () => ({ ok: true }))
+    const prunePromise = pruneNowForWorker(state, 100, makeFakeRecycler(join(root, 'fake-bin')))
     const moves: Array<Promise<unknown>> = []
     for (let i = 0; i < 3; i += 1) {
       const p = join(work, `c${i}.tmp`)

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createTools, type ToolDeps } from '../src/tools'
 import { destroyEntry, listSafeZone, moveToSafeZone } from '../src/store'
 import { scratchDir } from './support/tmpdir'
+import { makeFakeRecycler } from './support/fake-recycler'
 
 /**
  * 清理 = **移入系统回收站**，不是永久删除。
@@ -240,7 +241,7 @@ describe('auto-prune keeps entries it cannot recycle', () => {
      * 必须传 recycler 替身：省略它会走真实 `moveToSystemRecycleBin`
      * （PowerShell，约 1 秒/次），既慢、又真的往系统回收站扔东西。
      */
-    const result = await pruneNowForWorker(d.stateDir, 100, () => ({ ok: true }))
+    const result = await pruneNowForWorker(d.stateDir, 100, makeFakeRecycler(join(d.env.workdir, 'fake-bin')))
 
     expect(result.recycled, '应回收 1 条').toBe(1)
     expect(result.skipped).toBe(0)

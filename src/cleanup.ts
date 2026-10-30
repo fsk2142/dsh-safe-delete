@@ -114,15 +114,27 @@ function isAlive(pid: number): boolean {
  * 只按文件存在与否判断，会在子进程崩溃后永久卡住；只按 `mtime` 过期判断，
  * 又会误杀一个正在慢慢跑的长任务。两者结合：过期 **且** pid 已死才接管。
  *
+ * ## 为什么要 owner token
+ *
+ * 第一版用 `pid` 判断所有权，结果**锁永远释放不掉**：锁由主进程创建
+ * （`pid = 主进程`），而释放发生在 worker 里（`pid = worker`），两个 pid
+ * 永不相等，`releaseLock` 的所有权检查必然失败。表现是"第一次清理之后，
+ * 后续每次清理都被 `another cleanup holds the lock` 挡住"。
+ *
+ * 现在锁里带一个随机 `token`：谁创建锁谁拿到 token，创建者把它传给 worker；
+ * 释放时比对 token，而不是比对 pid。pid 只用于判断"持有者是否还活着"
+ * （决定能否接管过期锁）。
+ *
  * @param stateDir 安全区目录。
  * @param staleMs 多久算过期。
+ * @param token 本次要写入锁的 owner token。
  * @returns 拿到锁返回 true。
  */
-function tryAcquireLock(stateDir: string, staleMs: number): boolean {
+function tryAcquireLock(stateDir: string, staleMs: number, token: string): boolean {
   const lockPath = join(stateDir, LOCK_FILE)
   try {
     // `wx` 是原子的：文件已存在就失败。
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: 'wx' })
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' })
     return true
   } catch {
     // 已存在 —— 判断能否接管。
@@ -133,7 +145,7 @@ function tryAcquireLock(stateDir: string, staleMs: number): boolean {
       if (age > staleMs && !holderAlive) {
         // 过期且持有者已死：接管。
         rmSync(lockPath, { force: true })
-        writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: 'wx' })
+        writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' })
         return true
       }
     } catch {
@@ -144,19 +156,29 @@ function tryAcquireLock(stateDir: string, staleMs: number): boolean {
 }
 
 /**
- * 释放清理锁（**只释放自己的**）。
+ * 释放清理锁（**只释放自己持有的那把**）。
+ *
+ * 所有权按 `token` 判断而不是 `pid` —— 锁由主进程创建、由 worker 释放，
+ * 两者的 pid 本来就不同。详见 `tryAcquireLock` 的注释。
  *
  * @param stateDir 安全区目录。
+ * @param token 创建锁时用的 owner token。
+ * @returns 是否真的删掉了锁。
  */
-function releaseLock(stateDir: string): void {
+function releaseLock(stateDir: string, token: string): boolean {
   const lockPath = join(stateDir, LOCK_FILE)
   try {
-    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: number }
-    if (holder.pid !== process.pid) return
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as { token?: string }
+    if (holder.token !== token) return false
   } catch {
-    return
+    return false
   }
-  rmSync(lockPath, { force: true })
+  try {
+    rmSync(lockPath, { force: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** 请求清理的选项。 */
@@ -191,7 +213,15 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
     return { started: false, reason: 'already running' }
   }
 
-  if (!tryAcquireLock(stateDir, 10 * 60 * 1000)) {
+  /*
+   * 锁的 owner token。
+   *
+   * 主进程创建锁、worker 释放锁，两个进程的 pid 不同 —— 所以所有权按
+   * 这个 token 判断，并通过命令行参数交给 worker。
+   */
+  const ownerToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+  if (!tryAcquireLock(stateDir, 10 * 60 * 1000, ownerToken)) {
     return { started: false, reason: 'another cleanup holds the lock' }
   }
 
@@ -230,10 +260,37 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
    * 在 ESM 产物里始终有效，`fileURLToPath` 是纯函数调用。
    */
   const workerPath = join(dirname(fileURLToPath(import.meta.url)), WORKER_ENTRY)
-  const child = spawn(process.execPath, [workerPath, stateDir, String(limit), requestId], {
+  const child = spawn(process.execPath, [workerPath, stateDir, String(limit), requestId, ownerToken], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
+  })
+
+  /*
+   * **必须监听 `error`。**
+   *
+   * `spawn` 失败（worker 文件不存在、node 无法启动、权限不足）是**异步**
+   * 报告的 —— 通过 `error` 事件。没有监听器时 EventEmitter 会把 `error`
+   * 变成未捕获异常，可能让宿主主进程崩掉。
+   *
+   * 而且 `child.pid` 在这类情况下可能是 undefined，所以不能只靠它判断。
+   */
+  let spawnFailed: string | undefined
+  child.on('error', (error: Error) => {
+    spawnFailed = error.message
+    // 派发失败必须把锁还回去，否则后续清理永远被挡住。
+    releaseLock(stateDir, ownerToken)
+    writeCleanupJob(stateDir, {
+      requestId,
+      pid: null,
+      requestedAt: Date.now(),
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      outcome: 'failed',
+      recycled: 0,
+      skipped: 0,
+      lastError: `failed to spawn cleanup worker: ${error.message}`,
+    })
   })
   child.unref()
 
@@ -249,12 +306,19 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
       skipped: 0,
     })
   } else {
-    releaseLock(stateDir)
-    return { started: false, reason: 'failed to spawn the cleanup worker' }
+    /*
+     * 没有 pid：spawn 失败了。`error` 事件可能稍后才到，但此刻我们已能
+     * 判定失败 —— 立刻释放锁并返回，不等异步事件。
+     */
+    releaseLock(stateDir, ownerToken)
+    return {
+      started: false,
+      reason: spawnFailed ?? 'failed to spawn the cleanup worker (no pid)',
+    }
   }
 
   return { started: true }
 }
 
-/** 供 worker 复用的锁释放（导出给子进程用）。 */
+/** 供 worker 复用（导出给子进程用）。 */
 export { releaseLock as releaseCleanupLock, writeCleanupJob as writeCleanupJobState, tryAcquireLock }

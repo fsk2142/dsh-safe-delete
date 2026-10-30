@@ -31,7 +31,7 @@
  * @module dsh-safe-delete/cleanup-run
  */
 
-import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 
 import type { Recycler } from './recycle'
@@ -82,8 +82,12 @@ export async function recoverResidualBatches(stateDir: string): Promise<number> 
   const results = recoverAllBatches(stateDir)
 
   /*
-   * 内容确认丢失的条目要从索引里清掉，否则 `safe_zone_restore` 会一直
-   * 报 "has no content on disk"，用户无从下手。
+   * 内容**确认丢失**的条目才从索引里清掉 —— 留着只会让
+   * `safe_zone_restore` 一直报 "has no content on disk"，用户无从下手。
+   *
+   * **只有 `missing` 才清。** `recovery-failed` 表示内容还在 `batches/` 里、
+   * 只是这次没搬回来 —— 那种情况必须保留索引，否则用户会看到"条目突然消失，
+   * 但磁盘上明明还有内容"（2026-10-30 复审 P1-02 就是这个）。
    */
   const missing: string[] = []
   for (const batch of results) {
@@ -257,31 +261,74 @@ async function recycleBatch(
    */
   const recycleOutcome = recycler(batchItems)
 
+  /*
+   * **回收"成功"不等于内容真的走了。**
+   *
+   * 2026-10-30 复审 P0-02：这里原来无条件 `cleanupBatchDir(batchRoot)`，
+   * 于是只要 recycler 返回 `ok`、而它其实没有移动内容（平台 API 误报、
+   * 未来的假实现、契约变化），这段代码就把**还在原地的用户数据**
+   * 递归删掉了。
+   *
+   * 现在的判据是**双重的**：
+   *   1. recycler 报告成功；
+   *   2. 批次目录里**确实**已经没有活动内容了。
+   *
+   * 第 2 条由我们自己核实，不依赖外部实现来保护用户数据。若内容还在，
+   * 说明回收没有真正发生 —— 保守地把它们搬回去，而不是删掉。
+   */
   if (recycleOutcome.ok) {
-    cleanupBatchDir(batchRoot)
-    return { recycled: moved.length, skipped: failed.length, removedIds: moved.map((m) => m.id) }
+    const leftovers = existsSync(batchItems) ? readdirSync(batchItems) : []
+    if (leftovers.length === 0) {
+      cleanupBatchDir(batchRoot)
+      return { recycled: moved.length, skipped: failed.length, removedIds: moved.map((m) => m.id) }
+    }
+    /*
+     * 报告成功但内容还在：把它当作"结果不确定"处理 —— 搬回原处，
+     * 不删任何东西，让下一轮重试。
+     */
   }
 
   /*
-   * 回收失败：把内容**搬回原处**。
+   * 回收未确认成功：把内容**搬回原处**。
    *
-   * 不能留在批次目录里 —— 那会让条目变成"索引里有、items/ 里没有"的
-   * 不一致状态。宁可恢复原样、下一轮再试。
+   * 搬不回去的（目标被占用、权限不足）必须**留在批次目录**，并保留
+   * manifest 供人工/下次对账。绝不能因为"搬不动"就删掉。
    */
-  let restored = 0
+  const notRestored: string[] = []
   for (const m of moved) {
     const from = join(batchItems, m.id)
     const to = join(stateDir, 'items', m.id)
     try {
-      if (existsSync(from) && !existsSync(to)) {
-        renameSync(from, to)
-        restored += 1
+      if (!existsSync(from)) continue // 内容已不在批次里（真的被回收了），无需搬
+      if (existsSync(to)) {
+        // 目标被占用：留在批次目录，不覆盖、不删除。
+        notRestored.push(m.id)
+        continue
       }
+      renameSync(from, to)
     } catch {
-      /* 搬不回去就留在批次目录，至少数据还在磁盘上 */
+      // 搬不回去就留在批次目录，至少数据还在磁盘上。
+      notRestored.push(m.id)
     }
   }
-  cleanupBatchDir(batchRoot)
+
+  /*
+   * **只有确认批次目录里没有剩余内容时才删它。**
+   *
+   * 这是 P0-01 的修复点。原来这里无条件 `cleanupBatchDir(batchRoot)`，
+   * 把 `notRestored` 里的用户数据连同目录一起 `rmSync` 掉了 ——
+   * 而注释还写着"至少数据还在磁盘上"。两者直接矛盾。
+   */
+  const remaining = existsSync(batchItems) ? readdirSync(batchItems) : []
+  if (remaining.length === 0) {
+    cleanupBatchDir(batchRoot)
+  } else {
+    /*
+     * 还有内容留在批次里：保留目录与 manifest，把状态标成需要人工处理。
+     * 下次启动的恢复扫描会再试着搬回。
+     */
+    updateManifestStatus(stateDir, batchId, 'staging')
+  }
 
   /*
    * 回收失败 → 本批**全部**记为跳过。
@@ -301,15 +348,36 @@ async function recycleBatch(
 }
 
 /**
- * 清掉空的批次目录。
+ * 删掉批次目录 —— **只在它确实是空的时候**。
+ *
+ * ## 为什么函数自己也要检查
+ *
+ * 调用方理论上已经确认过批次里没有内容，但这个函数原本用
+ * `rmSync(recursive)`，一旦某个调用点漏了那次检查，就会**静默删除用户数据**。
+ * 2026-10-30 复审 P0-01 正是这样发生的。
+ *
+ * 函数自己再守一道：还有内容就拒绝，返回 false，把目录留着。这样即使将来
+ * 新增调用点忘了判断，最坏结果也只是"残留一个批次目录"，而不是"数据没了"。
  *
  * @param batchRoot 批次根目录。
+ * @returns 是否真的删掉了。
  */
-function cleanupBatchDir(batchRoot: string): void {
+function cleanupBatchDir(batchRoot: string): boolean {
+  const items = join(batchRoot, 'items')
+  if (existsSync(items)) {
+    try {
+      if (readdirSync(items).length > 0) return false
+    } catch {
+      // 读不到就不删 —— 宁可留垃圾，不可误删数据。
+      return false
+    }
+  }
   try {
     rmSync(batchRoot, { recursive: true, force: true })
+    return true
   } catch {
     /* 残留不影响正确性 */
+    return false
   }
 }
 

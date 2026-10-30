@@ -1081,15 +1081,31 @@ async function maybeRunRequestedClean(
        */
       const submitted =
         selected.length === 0
-          ? { started: false, reason: 'nothing to clean' }
+          ? { started: true, reason: 'nothing to clean' }
           : await requestCleanup({ stateDir: opts.stateDir, limit: selected.length, minIntervalMs: 0 })
 
-      // 只有真正提交过才记下已消费，避免失败时下次重试被吞掉。
-      await fs.promises.writeFile(
-        markerPath,
-        JSON.stringify({ consumedAt: opts.requestedAt, submitted: submitted.started, count: selected.length }),
-        'utf8',
-      )
+      /*
+       * **只有真正启动成功才标记为已消费。**
+       *
+       * 2026-10-30 复审 P1-06：这里原来无条件写 `consumedAt`，于是
+       * "Worker 正忙 / 锁被别人持有 / spawn 失败" 这些**未启动**的情况
+       * 也会把请求标记为已处理 —— 用户点了按钮、什么都没发生，
+       * 而且后续配置重载不再重试。
+       *
+       * 现在：没启动就不写标记，下次 reload 还会再试。
+       */
+      if (submitted.started) {
+        await fs.promises.writeFile(
+          markerPath,
+          JSON.stringify({ consumedAt: opts.requestedAt, count: selected.length }),
+          'utf8',
+        )
+      } else {
+        (ctx as { logger?: { warn?: (msg: string) => void } }).logger?.warn?.(
+          `[dsh-safe-delete] panel clean request NOT consumed (${submitted.reason ?? 'unknown'}); ` +
+            'it stays pending so a later reload can retry',
+        )
+      }
       ;(ctx as { logger?: { info?: (msg: string) => void } }).logger?.info?.(
         `[dsh-safe-delete] panel clean request: ${submitted.started ? 'started background cleanup' : `not started (${submitted.reason ?? 'unknown'})`} for ${selected.length} entr(ies)`,
       )

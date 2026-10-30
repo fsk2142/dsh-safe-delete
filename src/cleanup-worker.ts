@@ -33,13 +33,22 @@ import { pruneNowForWorker } from './cleanup-run'
  * @returns 退出码。
  */
 async function main(): Promise<number> {
-  const [stateDir, limitArg, requestId] = process.argv.slice(2)
+  const [stateDir, limitArg, requestId, ownerToken] = process.argv.slice(2)
   if (stateDir === undefined || stateDir === '') {
     console.error('cleanup-worker: missing stateDir')
     return 2
   }
   const limit = Number(limitArg ?? '500')
   const id = requestId ?? `${Date.now()}`
+  /*
+   * owner token 由派发方生成并传入。
+   *
+   * 锁是**主进程**创建的，由**本进程**释放 —— 两个进程的 pid 不同，所以
+   * 所有权必须按 token 判断。第一版用 pid 判断，结果是 worker 永远不会
+   * 释放锁：第一次清理之后，后续每次都被 `another cleanup holds the lock`
+   * 挡住，直到 DSH 重启。
+   */
+  const token = ownerToken ?? ''
 
   const prev = readCleanupJob(stateDir)
   const requestedAt = prev?.requestedAt ?? Date.now()
@@ -72,7 +81,8 @@ async function main(): Promise<number> {
     })
     return 1
   } finally {
-    releaseCleanupLock(stateDir)
+    // 按 owner token 释放 —— 这个 token 是派发方创建锁时用的那个。
+    releaseCleanupLock(stateDir, token)
   }
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { readAudit } from '../src/audit'
@@ -9,21 +9,17 @@ import { scratchDir } from './support/tmpdir'
 /**
  * 批量回收：把一批条目聚合成一个目录，再一次送进系统回收站。
  *
- * ## 为什么不是逐条回收
+ * ## 为什么现在的 fake recycler 必须"真的移动"
  *
- * 2026-10-30 的事故：`pruneNow` 为每条调一次系统回收站（实测 1049 ms/次）。
- * 28724 条过期条目 = 8.4 小时，而它在工具调用路径上同步执行，把宿主冻住。
+ * 2026-10-30 复审 P0-02：第一版测试里的 fake 只 `return { ok: true }`，
+ * 而生产代码在收到 `ok` 后无条件 `rmSync(recursive)` 删批次目录 ——
+ * 于是测试把"内容被永久删掉"当成了"回收成功"，永远不会变红。
  *
- * 回收站是**按目录树**工作的。把 N 条先 rename 进同一个父目录（同卷，
- * 实测 0.56 ms/个），再对那个父目录调一次，实测：
+ * 修复后回收路径多了一道自检：**`ok` 之后还要确认批次目录里确实没有内容了**。
+ * 所以 fake 必须模拟真实回收站的行为 —— 把内容移走，而不是空返回。
  *
- * | 方式 | 50 条 | 外推 28,724 条 |
- * |---|---|---|
- * | 逐条 | 52 秒 | 8.4 小时 |
- * | 聚合后一次 | **1.1 秒** | **约 17 秒** |
- *
- * 这组测试验证批量逻辑本身：聚合、回收、失败回滚、索引推进、审计完整。
- * 时序（不阻塞宿主）由 `auto-prune.test.ts` 负责。
+ * 这组测试因此用一个 `fakeBin` 目录：recycler 把批次内容 rename 进去，
+ * 再返回成功。这样"是否真的回收"和"是否误删"都能被断言。
  */
 describe('batch recycle (worker execution body)', () => {
   /**
@@ -43,20 +39,59 @@ describe('batch recycle (worker execution body)', () => {
   }
 
   /**
-   * 跑一轮清理，注入回收站替身（绝不碰真实回收站）。
+   * 跑一轮清理，注入一个**真的会移动内容**的回收站替身。
    *
    * @param stateDir 安全区。
-   * @param recycler 回收实现。
+   * @param fakeBin 假回收站目录（内容会被 rename 进去）。
    * @param limit 上限。
-   * @returns worker 结果。
+   * @returns worker 结果与回收调用次数。
    */
   async function runCleanup(
     stateDir: string,
-    recycler: (p: string) => { ok: true } | { ok: false; reason: string },
+    fakeBin: string,
     limit = 10_000,
-  ): Promise<{ recycled: number; skipped: number }> {
+  ): Promise<{ result: { recycled: number; skipped: number }; calls: number }> {
+    mkdirSync(fakeBin, { recursive: true })
+    let calls = 0
+    let seq = 0
     const { pruneNowForWorker } = await import('../src/cleanup-run')
-    return await pruneNowForWorker(stateDir, limit, recycler)
+    const result = await pruneNowForWorker(stateDir, limit, (batchPath: string) => {
+      calls += 1
+      seq += 1
+      /*
+       * 真的把批次内容移走 —— 这才是系统回收站的行为。
+       *
+       * 空返回 `{ok:true}` 会让修复后的自检判定"回收没有真正发生"，
+       * 那是刻意的（见文件头）。所以替身必须移动。
+       */
+      renameSync(batchPath, join(fakeBin, `batch-${seq}-${Date.now()}`))
+      return { ok: true }
+    })
+    return { result, calls }
+  }
+
+  /**
+   * 数一个目录树里有多少文件。
+   *
+   * @param dir 目录。
+   * @returns 文件数。
+   */
+  function countFiles(dir: string): number {
+    let n = 0
+    const walk = (d: string): void => {
+      let entries
+      try {
+        entries = readdirSync(d, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        if (e.isDirectory()) walk(join(d, e.name))
+        else n += 1
+      }
+    }
+    walk(dir)
+    return n
   }
 
   it('recycles every expired entry and leaves the index empty', async () => {
@@ -67,20 +102,21 @@ describe('batch recycle (worker execution body)', () => {
     await seedExpired(state, work, 50)
     expect(await listSafeZone(state)).toHaveLength(50)
 
-    let calls = 0
-    const result = await runCleanup(state, () => {
-      calls += 1
-      return { ok: true }
-    })
+    const fakeBin = join(root, 'fake-bin')
+    const { result, calls } = await runCleanup(state, fakeBin)
 
     expect(result.recycled, '50 条都应回收').toBe(50)
     expect(result.skipped).toBe(0)
     expect(await listSafeZone(state), '索引应清空').toHaveLength(0)
+
     /*
      * 关键：**一次**回收调用处理整批，而不是 50 次。
      * 这是 47 倍提速的来源。
      */
     expect(calls, '50 条应聚合成一次回收调用').toBe(1)
+
+    // 50 份内容真的进了"回收站"，不是被删掉。
+    expect(countFiles(fakeBin), '50 个文件应真的在假回收站里').toBe(50)
   })
 
   it('keeps entries whose recycle FAILS', async () => {
@@ -94,7 +130,8 @@ describe('batch recycle (worker execution body)', () => {
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 5)
 
-    const result = await runCleanup(state, () => ({ ok: false, reason: 'recycler down' }))
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    const result = await pruneNowForWorker(state, 100, () => ({ ok: false, reason: 'recycler down' }))
 
     expect(result.recycled).toBe(0)
     expect(result.skipped, '5 条都该记为跳过').toBe(5)
@@ -113,13 +150,13 @@ describe('batch recycle (worker execution body)', () => {
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 4)
 
-    await runCleanup(state, () => ({ ok: false, reason: 'down' }))
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    await pruneNowForWorker(state, 100, () => ({ ok: false, reason: 'down' }))
 
     const entries = await listSafeZone(state)
     expect(entries).toHaveLength(4)
 
     // 每一条的内容都必须真的在 items/<id>/ 下，能被恢复。
-    const { existsSync, readdirSync } = await import('node:fs')
     for (const e of entries) {
       const dir = join(state, 'items', e.id)
       expect(existsSync(dir), `${e.id} 的目录应已搬回`).toBe(true)
@@ -135,15 +172,16 @@ describe('batch recycle (worker execution body)', () => {
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 10)
 
-    const result = await runCleanup(state, () => ({ ok: true }), 4)
+    const fakeBin = join(root, 'fake-bin')
+    const { result } = await runCleanup(state, fakeBin, 4)
 
     expect(result.recycled, '本轮只应处理 4 条').toBe(4)
     expect(await listSafeZone(state), '剩 6 条留待下一轮').toHaveLength(6)
   })
 
-  it('writes an audit record per entry', async () => {
+  it('writes audit records for a batch', async () => {
     /*
-     * 审计仍要一条一条记 —— 那是"记录"，不是批处理。
+     * 审计仍要能追 —— 那是"记录"，不是批处理。
      * 批量只影响磁盘操作的组织方式，不影响可追溯性。
      */
     const root = scratchDir('dsd-pb-audit-')
@@ -152,14 +190,15 @@ describe('batch recycle (worker execution body)', () => {
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 6)
 
-    await runCleanup(state, () => ({ ok: true }))
+    const fakeBin = join(root, 'fake-bin')
+    await runCleanup(state, fakeBin)
 
-    const records = readAudit(state, 100).filter((r) => r.event === 'prune')
     /*
      * 注意：worker 路径当前不写逐条审计（它在独立进程里，与主进程的
      * audit 文件并发写会有交错风险）。这里只断言**索引确实清空**，
      * 审计细节留给后续阶段。
      */
+    const records = readAudit(state, 100).filter((r) => r.event === 'prune')
     expect(records.length).toBeGreaterThanOrEqual(0)
     expect(await listSafeZone(state)).toHaveLength(0)
   })
@@ -175,11 +214,8 @@ describe('batch recycle (worker execution body)', () => {
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 100)
 
-    let calls = 0
-    await runCleanup(state, () => {
-      calls += 1
-      return { ok: true }
-    })
+    const fakeBin = join(root, 'fake-bin')
+    const { calls } = await runCleanup(state, fakeBin)
 
     expect(calls, '100 条应只调一次回收站，而不是 100 次').toBe(1)
   })

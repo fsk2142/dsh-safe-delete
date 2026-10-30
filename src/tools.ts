@@ -29,7 +29,7 @@ import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
-import { destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
+import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
@@ -535,13 +535,6 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
    */
 
   /**
-   * 按间隔调用 `pruneNow`。
-   *
-   * 为什么不是定时器：一个挂在事件循环上的 `setInterval` 会让插件在 DSH 空闲时
-   * 也保有生命周期，而清理并不需要那种准时性。改为"每次工具调用顺路看一眼"，
-   * 代价是插件彻底不用管定时器的清理与异常。
-   */
-  /**
    * 按间隔触发自动清理 —— **只投递请求，不执行**。
    *
    * ## 为什么不能在这里 await 清理
@@ -725,7 +718,24 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     },
     beforeExecute: pruneIfDue,
     async execute(args) {
-      const entries = await listSafeZone(deps.stateDir)
+      /*
+       * 用 detailed 版本，好把"索引损坏"和"安全区是空的"区分开。
+       *
+       * 2026-10-30 复审 P2-07：`listSafeZone` 在索引损坏时返回空数组，
+       * 于是这个工具会告诉用户"safe zone is empty" —— 而实际上里面可能
+       * 躺着几万个条目，只是索引读不出来。那会让人以为没东西可恢复。
+       */
+      const { entries, corrupt } = await listSafeZoneDetailed(deps.stateDir)
+      if (corrupt !== undefined) {
+        return {
+          ok: false,
+          text: '',
+          error:
+            `the safe zone index is corrupt and cannot be read: ${corrupt}\n` +
+            'Entries may still exist on disk under items/. Nothing has been deleted. ' +
+            'Repair or move aside index.json, then retry. Deletions are refused while the index is unreadable.',
+        }
+      }
       if (entries.length === 0) return { ok: true, text: 'safe zone is empty' }
       /*
        * 默认只显示 20 条（原来是 50）。
@@ -779,7 +789,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     parameters: {},
     beforeExecute: pruneIfDue,
     async execute() {
-      const entries = await listSafeZone(deps.stateDir)
+      // 同 `safe_zone_list`：必须把"索引坏了"和"空"区分开。
+      const { entries, corrupt } = await listSafeZoneDetailed(deps.stateDir)
       const total = safeZoneBytes(entries)
       const next = entries[0]
       const job = readCleanupJob(deps.stateDir)
@@ -788,7 +799,18 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         ok: true,
         text: [
           `dir: ${deps.stateDir}`,
-          `entries: ${entries.length}  size: ${humanBytes(total)}`,
+          /*
+           * 索引损坏时必须显式说出来。
+           *
+           * 否则 `entries: 0` 会被读成"安全区是空的"，而实际上里面可能
+           * 有几万个条目只是索引读不出来 —— 用户会以为没东西可恢复。
+           */
+          ...(corrupt === undefined
+            ? [`entries: ${entries.length}  size: ${humanBytes(total)}`]
+            : [
+                `entries: UNKNOWN — index corrupt (${corrupt})`,
+                'entries may still exist on disk under items/; nothing was deleted',
+              ]),
           `retention: ${deps.retentionDays}d (time-only, no capacity cap)`,
           `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : 'on'}`,
           /*

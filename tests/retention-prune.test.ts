@@ -6,6 +6,7 @@ import { selectForPrune, safeZoneBytes } from '../src/prune'
 import { createTools, type ToolDeps } from '../src/tools'
 import { listSafeZone, moveToSafeZone } from '../src/store'
 import { scratchDir } from './support/tmpdir'
+import { makeFakeRecycler } from './support/fake-recycler'
 import type { TrashEntry } from '../src/types'
 
 /**
@@ -136,7 +137,7 @@ describe('prune timing', () => {
      *   - 不传 recycler 会真的往系统回收站扔东西。
      */
     const { pruneNowForWorker } = await import('../src/cleanup-run')
-    await pruneNowForWorker(d.stateDir, 100, () => ({ ok: true }), () => clock)
+    await pruneNowForWorker(d.stateDir, 100, makeFakeRecycler(join(d.env.workdir, 'fake-bin')), () => clock)
     expect(await listSafeZone(d.stateDir), '到期后应已移入回收站').toHaveLength(0)
   })
 

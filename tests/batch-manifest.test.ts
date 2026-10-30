@@ -239,6 +239,82 @@ describe('crash recovery: content moved to batches/ is put back', () => {
     expect(result.entries[0]?.outcome, '两处都无应报 missing').toBe('missing')
   })
 
+  it('reports recovery-failed (not missing) when the move back throws', async () => {
+    /*
+     * P1-02：搬不回去时绝不能报 `missing`。
+     *
+     * `recoverResidualBatches` 见到 `missing` 就把 id 从索引里剔掉。若把
+     * "搬不动"也标成 missing，结果就是：内容还在 `batches/` 里、索引却被删了、
+     * `safe_zone_restore` 报 unknown id —— 用户无从找回。
+     *
+     * ## 怎么构造真正搬不回去的情形
+     *
+     * 试过两种都不行：
+     *   - 目标位置放一个**文件**：Windows 上目录 rename 会成功覆盖它（实测）；
+     *   - 目标位置放一个**非空目录**：`isDirectory` 为真，代码判定
+     *     `left-in-place`（内容确实"在原位"，只是被用户的新目录占着）——
+     *     那是正确的语义，不是失败。
+     *
+     * 真正触发 `renameSync` 抛错的是**父目录不可写**：`items/` 被设成只读时
+     * 无法在其中创建或替换条目。这里用一个**文件占住 `items/` 本身**来模拟 ——
+     * `mkdirSync(items, {recursive:true})` 会失败（路径是文件），
+     * 于是恢复走 catch 分支。
+     */
+    const { state, batchId } = await simulateCrash(1)
+
+    const itemsRoot = join(state, 'items')
+    const { rmSync, writeFileSync: write } = await import('node:fs')
+    rmSync(itemsRoot, { recursive: true, force: true })
+    // `items/` 变成一个文件：之后任何想在里面放东西的操作都会失败。
+    write(itemsRoot, 'blocking the restore')
+
+    const result = recoverBatch(state, batchId)
+    expect(
+      result.entries[0]?.outcome,
+      '搬不回去时必须报 recovery-failed，而不是 missing（那会导致索引被清）',
+    ).toBe('recovery-failed')
+  })
+
+  it('keeps the index entry when recovery fails', async () => {
+    /*
+     * P1-02 的后果断言：recovery-failed 的条目**必须留在索引里**。
+     *
+     * 这条比上面那条更贴近用户感受 —— 它直接检查
+     * `recoverResidualBatches` 有没有错误地清掉索引。
+     */
+    const root = scratchDir('dsd-recovery-failed-')
+    const work = join(root, 'work')
+    const state = join(root, 'state')
+    mkdirSync(work, { recursive: true })
+
+    const p = join(work, 'a.txt')
+    writeFileSync(p, 'CONTENT')
+    await moveToSafeZone(state, p, { retentionDays: 1 })
+    const id = (await listSafeZone(state))[0]!.id
+
+    const batchId = 'stuck'
+    writeManifest(state, {
+      schemaVersion: 1,
+      batchId,
+      createdAt: 1,
+      status: 'staging',
+      entries: [{ id, originalPath: 'p', bytes: 1 }],
+    })
+    const staged = join(batchDirOf(state, batchId), 'items')
+    mkdirSync(staged, { recursive: true })
+    const { renameSync } = await import('node:fs')
+    renameSync(join(state, 'items', id), join(staged, id))
+
+    // 在 items/<id> 放一个文件，阻止目录搬回。
+    writeFileSync(join(state, 'items', id), 'BLOCKER')
+
+    await recoverResidualBatches(state)
+
+    // 索引里必须还有它 —— 否则用户会看到条目消失，而内容其实还在 batches/。
+    const entries = await listSafeZone(state)
+    expect(entries.map((e) => e.id), '恢复失败时不能删索引').toContain(id)
+  })
+
   it('does not delete a batch directory that still holds content', async () => {
     /*
      * 保守性：如果 batches/ 里还有内容（比如清单不完整、有条目不在清单里），

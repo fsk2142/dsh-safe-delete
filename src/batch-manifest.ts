@@ -42,7 +42,7 @@
  * @module dsh-safe-delete/batch-manifest
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 批次里一条条目的记录。 */
@@ -165,8 +165,25 @@ export function listBatchIds(stateDir: string): string[] {
 /** 一条条目的恢复结果。 */
 export interface EntryRecovery {
   id: string
-  /** 内容最终在哪儿。 */
-  outcome: 'left-in-place' | 'moved-back' | 'missing'
+  /**
+   * 内容最终在哪儿 / 发生了什么。
+   *
+   * ## 为什么 `recovery-failed` 必须与 `missing` 分开
+   *
+   * 2026-10-30 复审 P1-02：第一版把「搬不回去」也标成 `missing`，
+   * 而调用方见到 `missing` 就把该 id 从索引里剔掉。于是出现最糟的组合：
+   *
+   *   - 内容**还在** `batches/` 里（没丢）；
+   *   - 索引却被删了；
+   *   - `safe_zone_restore` 报 `unknown id`，用户无从找回。
+   *
+   * 两者的语义完全不同：
+   *
+   *   - `missing`：两处都没有 → 内容真的没了，可以清索引；
+   *   - `recovery-failed`：内容还在，只是这次没搬回来 → **必须保留索引**，
+   *     下次再试。
+   */
+  outcome: 'left-in-place' | 'moved-back' | 'recovery-failed' | 'missing'
 }
 
 /** 一次批次恢复的结果。 */
@@ -215,7 +232,14 @@ export function recoverBatch(stateDir: string, batchId: string): BatchRecovery {
     const inItems = join(stateDir, 'items', entry.id)
     const inBatch = join(staged, entry.id)
 
-    if (existsSync(inItems)) {
+    /*
+     * 注意判的是**目录**，不是"存在"。
+     *
+     * `existsSync` 对同名文件也返回 true。若那里恰好被一个文件占住，旧代码
+     * 会认为"内容已在原位"（`left-in-place`），于是既不搬回、也不报失败 ——
+     * 而真正的用户内容还躺在 `batches/` 里。
+     */
+    if (isDirectory(inItems)) {
       results.push({ id: entry.id, outcome: 'left-in-place' })
       continue
     }
@@ -225,11 +249,17 @@ export function recoverBatch(stateDir: string, batchId: string): BatchRecovery {
         renameSync(inBatch, inItems)
         results.push({ id: entry.id, outcome: 'moved-back' })
       } catch {
-        // 搬不回去：内容还在 batches/ 里，不丢，但本次没恢复成功。
-        results.push({ id: entry.id, outcome: 'missing' })
+        /*
+         * 搬不回去 —— 但内容**还在** `batches/` 里。
+         *
+         * 必须报 `recovery-failed` 而不是 `missing`：后者会让调用方清掉索引，
+         * 于是内容在磁盘上、索引里却没有，用户再也恢复不出来。
+         */
+        results.push({ id: entry.id, outcome: 'recovery-failed' })
       }
       continue
     }
+    // 两处都没有 —— 这才是真正的"内容不在了"。
     results.push({ id: entry.id, outcome: 'missing' })
   }
 
@@ -262,6 +292,23 @@ function listDirSafe(dir: string): string[] {
     return readdirSync(dir)
   } catch {
     return []
+  }
+}
+
+/**
+ * 判断某个路径是否存在**且是目录**。
+ *
+ * `existsSync` 对同名文件也返回 true —— 而这里要判断的是"条目的内容目录
+ * 是否已经就位"。用文件冒充会让恢复流程误以为内容在原位，实际还躺在批次目录里。
+ *
+ * @param p 路径。
+ * @returns 是目录返回 true。
+ */
+function isDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory()
+  } catch {
+    return false
   }
 }
 
