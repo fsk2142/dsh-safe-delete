@@ -122,8 +122,29 @@ function isAlive(pid: number): boolean {
  * 后续每次清理都被 `another cleanup holds the lock` 挡住"。
  *
  * 现在锁里带一个随机 `token`：谁创建锁谁拿到 token，创建者把它传给 worker；
- * 释放时比对 token，而不是比对 pid。pid 只用于判断"持有者是否还活着"
- * （决定能否接管过期锁）。
+ * 释放时比对 token，而不是比对 pid。
+ *
+ * ## pid 必须是 **worker 的**，不是主进程的（2026-10-30 复审 SD-02）
+ *
+ * 第一版把 `pid: process.pid` 写进锁 —— 那是**主进程**的 pid。清理实际由
+ * spawn 出来的子进程执行，于是 worker 崩溃时出现了最糟的组合：
+ *
+ * ```
+ * worker 崩溃          ← 锁没释放
+ * 主进程还活着          ← holderAlive 永远为真
+ * → 即使锁过期 10 小时，接管判据 age > stale && !alive 也永不成立
+ * ```
+ *
+ * 结果是"清理永久停摆，直到重启 DSH"。隔离复现证实：写一个
+ * `{pid: 活着的调度方, at: 11 分钟前}` 的锁，`eligibleForTakeover` 为 false。
+ *
+ * 现在分两个阶段写锁：
+ *
+ * 1. 主进程派发时写 `{ pid: 主进程, token, requestId }` —— 这一小段窗口里
+ *    还没有 worker，用主进程 pid 是对的（主进程若死，锁自可接管）；
+ * 2. **worker 启动后立刻把 `workerPid` 写进锁**，此后存活判定以它为准。
+ *
+ * 判据因此变成：`workerPid` 存在 → 看它是否活着；否则看 `pid`。
  *
  * @param stateDir 安全区目录。
  * @param staleMs 多久算过期。
@@ -139,9 +160,20 @@ function tryAcquireLock(stateDir: string, staleMs: number, token: string): boole
   } catch {
     // 已存在 —— 判断能否接管。
     try {
-      const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: number; at?: number }
+      const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as {
+        pid?: number
+        workerPid?: number | null
+        at?: number
+      }
       const age = Date.now() - (holder.at ?? 0)
-      const holderAlive = typeof holder.pid === 'number' && isAlive(holder.pid)
+      /*
+       * 存活判定优先看 workerPid。
+       *
+       * 这是 SD-02 的修复点：清理跑在子进程里，主进程活着不代表清理还在跑。
+       */
+      const livenessPid =
+        typeof holder.workerPid === 'number' ? holder.workerPid : holder.pid
+      const holderAlive = typeof livenessPid === 'number' && isAlive(livenessPid)
       if (age > staleMs && !holderAlive) {
         // 过期且持有者已死：接管。
         rmSync(lockPath, { force: true })
@@ -152,6 +184,75 @@ function tryAcquireLock(stateDir: string, staleMs: number, token: string): boole
       /* 锁文件损坏，当作被占用 */
     }
     return false
+  }
+}
+
+/**
+ * 把 **worker 自己的 pid** 绑定到锁上。
+ *
+ * ## 为什么必须绑定（2026-10-30 复审 SD-02）
+ *
+ * 锁由主进程创建，于是最初写进去的是主进程 pid。清理实际在子进程里跑，
+ * 一旦子进程崩溃而主进程还活着，存活判定 `isAlive(holder.pid)` 永远为真 ——
+ * 锁永不过期、永不接管，清理永久停摆到重启。
+ *
+ * worker 启动后第一件事就是调用这个函数，把 `workerPid` 写进锁。
+ * 此后存活判定以它为准（见 `tryAcquireLock`）。
+ *
+ * ## 为什么按 token 校验
+ *
+ * 只有锁的持有者才该改它。若 token 不匹配（说明锁已被别人接管），
+ * 这里安静地什么都不做 —— 让那个接管者继续。
+ *
+ * @param stateDir 安全区目录。
+ * @param token 派发方交给本 worker 的 owner token。
+ * @returns 是否成功绑定。
+ */
+function bindWorkerPid(stateDir: string, token: string): boolean {
+  const lockPath = join(stateDir, LOCK_FILE)
+  try {
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as {
+      token?: string
+      pid?: number
+      at?: number
+    }
+    if (holder.token !== token) return false
+    writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: holder.pid ?? process.pid,
+        workerPid: process.pid,
+        at: holder.at ?? Date.now(),
+        token,
+      }),
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 供诊断：锁当前由谁持有、判定用的是哪个 pid。 */
+export function cleanupLockHolder(
+  stateDir: string,
+): { pid: number; workerPid: number | null; ageMs: number; alive: boolean } | null {
+  const lockPath = join(stateDir, LOCK_FILE)
+  try {
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as {
+      pid?: number
+      workerPid?: number | null
+      at?: number
+    }
+    if (typeof holder.pid !== 'number' || typeof holder.at !== 'number') return null
+    const workerPid = typeof holder.workerPid === 'number' ? holder.workerPid : null
+    return {
+      pid: holder.pid,
+      workerPid,
+      ageMs: Date.now() - holder.at,
+      alive: isAlive(workerPid ?? holder.pid),
+    }
+  } catch {
+    return null
   }
 }
 
@@ -321,4 +422,9 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
 }
 
 /** 供 worker 复用（导出给子进程用）。 */
-export { releaseLock as releaseCleanupLock, writeCleanupJob as writeCleanupJobState, tryAcquireLock }
+export {
+  releaseLock as releaseCleanupLock,
+  writeCleanupJob as writeCleanupJobState,
+  tryAcquireLock,
+  bindWorkerPid,
+}

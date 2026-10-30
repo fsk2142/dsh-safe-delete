@@ -120,11 +120,19 @@ export declare function listSafeZoneUnordered(stateDir: string): Promise<{
 /**
  * 从安全区还原一条。
  *
- * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现在的
- * 文件。占用判定用原子 `mkdir` 占位，不用「存在性检查 + rename」（见
- * `claimRestoreDestination` 的注释）。
+ * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现有的
+ * 文件。冲突判定用平台原语（文件 `linkSync` 的 EEXIST、目录 `mkdirSync` 的
+ * EEXIST），不用「存在性检查 + rename」—— 见 `placeNoReplace` 的注释。
  */
-export declare function restoreFromSafeZone(stateDir: string, id: string): Promise<{
+export declare function restoreFromSafeZone(stateDir: string, id: string,
+/**
+ * 测试钩子，生产不传。
+ *
+ * 在"目录落位时已用 mkdir 抢到候选路径、还没收掉"的窗口内被调用 ——
+ * 那是唯一无法从外部用真实时序复现的窗口（两次系统调用之间）。
+ * 没有它，SD-01 里 `rmdir` 与 `rmSync(recursive)` 的区别就只能靠人工审阅。
+ */
+onClaimed?: (candidate: string) => void): Promise<{
   restoredTo: string;
 }>;
 /**

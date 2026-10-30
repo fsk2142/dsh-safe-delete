@@ -13,7 +13,19 @@
  *      除此之外本文件不删任何用户数据。
  */
 
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs'
+import {
+  cpSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import path from 'node:path'
 
 import { describeTarget } from './describe'
@@ -653,183 +665,254 @@ export async function listSafeZoneUnordered(
 }
 
 /**
- * 为还原挑一个**不会被并发覆盖**的目标路径。
+ * 生成候选还原路径。
  *
- * ## 为什么不能「existsSync → rename」
+ * 第 0 个是用户期望的原路径，之后依次是 `.restored-<时间戳>` 兄弟名。
  *
- * `renameSync` 在 POSIX 上**会静默替换已存在的目标**。而 `existsSync` 只是一个
- * 时间点快照：
- *
- * ```
- * existsSync(dest) === false      ← 检查通过
- *                                 ← 别的进程在这里创建了同名文件
- * renameSync(source, dest)        ← 把那个新文件覆盖掉，用户的文件没了
- * ```
- *
- * Windows 上 rename 通常会报冲突，所以这个缺陷是平台相关的 —— 但"只在 Linux 上
- * 丢文件"不是可以接受的答案。
- *
- * ## 做法：先原子占位，再移动
- *
- * `mkdir` 是**原子且不覆盖**的：目标已存在时必定抛 EEXIST。所以：
- *
- *   1. `mkdir(dest)` 成功 → 这个路径归我们了，并发方无法再用它；
- *   2. 把占位的空目录删掉，紧接着 `rename` 进去 —— 这两步之间仍然有窗口，
- *      但**只有占位被主动删掉的这几十微秒**，而且 rename 之后目标是我们刚
- *      释放的路径，别人要插进来需要赢过这个极窄窗口；
- *   3. 更关键的是：任何 `mkdir` 失败（EEXIST）都会让我们换一个带时间戳的名字
- *      再试，而不是覆盖。
- *
- * 对文件源也可以直接用 `linkSync` + `unlinkSync` 做到完全原子（link 同样不覆盖），
- * 但源可能是目录，`link` 不支持目录，所以统一走 mkdir 占位。
- *
- * @param desired 期望的还原路径。
- * @param source 安全区里的内容（文件或目录），用于判断是否需要建父目录。
- * @returns 已被本次调用占位的目标路径。
+ * @param desired 期望路径。
+ * @param i 序号。
+ * @param stamp 时间戳（同一轮尝试内固定）。
+ * @returns 候选路径。
  */
-function claimRestoreDestination(desired: string, source: string): string {
-  void source
-  mkdirSync(path.dirname(desired), { recursive: true })
-
-  /** 尝试占位一个具体路径；成功返回 true。 */
-  const tryClaim = (candidate: string): boolean => {
-    try {
-      mkdirSync(candidate)
-      return true
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      // EEXIST：已被占用，换下一个候选。
-      if (code === 'EEXIST') return false
-      // 其他错误（权限、路径非法）不该被当成"占用"重试，直接上抛。
-      throw error
-    }
-  }
-
-  // 第一次试原路径；被占用就依次试带序号的兄弟名，直到成功。
-  // 判据是 `mkdir` 的原子性：目标已存在时它必定 EEXIST，不会像 rename 那样覆盖。
-  if (tryClaim(desired)) return desired
-
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  for (let i = 0; i < 100; i += 1) {
-    const candidate = i === 0 ? `${desired}.restored-${stamp}` : `${desired}.restored-${stamp}-${i}`
-    if (tryClaim(candidate)) return candidate
-  }
-  throw new Error(
-    `cannot find a free restore path for ${desired}: 100 candidates are all taken. ` +
-      'Restore it elsewhere, or move the existing files away first.',
-  )
+function restoreCandidate(desired: string, i: number, stamp: string): string {
+  if (i === 0) return desired
+  const suffix = i === 1 ? '' : `-${i - 1}`
+  return `${desired}.restored-${stamp}${suffix}`
 }
 
 /**
- * 把内容放进已占位的目标，**全程不给别人抢的位置**。
+ * 把一个**文件**落到候选路径，绝不覆盖已存在的内容。
  *
- * ## 旧实现的问题（2026-10-30 复审 P1-04）
+ * ## 为什么 `link` + `unlink` 而不是 `rename`
+ *
+ * `rename` 在 POSIX 上会覆盖已存在的目标、Windows 上会失败 —— 行为不一致，
+ * 而 POSIX 上"覆盖"意味着用户刚落下的文件被我们删了。
+ *
+ * `linkSync` 在两个平台上都以 `EEXIST` 拒绝已存在的目标（实测）：
  *
  * ```
- * rmSync(destination, {recursive:true})   ← 占位被删，路径空了出来
- * renameSync(source, destination)         ← 竞态窗口：别人可以在这两步之间
- *                                            创建同名文件，然后被 rename 覆盖
+ * linkSync(src, 已存在的 dst) → EEXIST，dst 内容不变
+ * linkSync(src, 不存在的 dst) → 成功，两者指向同一 inode
  * ```
  *
- * 占位本来是为了"占住这个路径"，可一旦先删掉占位再 rename，占位就白占了。
+ * 成功后 `unlinkSync` 源即可 —— 中间**不存在目标缺失的瞬间**。
  *
- * ## 现在的做法：占位始终存在
- *
- * 1. 内容先 rename 到**占位目录内部**：`<destination>/payload`
- *    —— 此时 `destination` 仍然被我们的占位目录占着，别人无法创建同名项；
- * 2. 把 `<destination>/payload` **改名换出**到 `destination` 本身。
- *
- * 第 2 步仍是一次 rename 覆盖自己刚建的目录，但**竞态方始终无法在这个路径上
- * 创建任何东西** —— 因为那条路径从头到尾都有人占着。这是与旧实现的关键区别：
- * 旧实现有一瞬间"路径无人占用"，新实现没有。
- *
- * ## 跨卷
- *
- * `rename` 抛 `EXDEV` 时改为复制。复制目标放在占位内部，成功后再换出，
- * 中途失败只需要清掉占位里的半成品，用户原有文件不受影响。
- *
- * @param source 安全区里的内容。
- * @param destination 已占位的目标路径。
- * @returns 是否走了跨卷复制（调用方据此决定是否删源）。
+ * @param source 源文件（staging）。
+ * @param target 目标路径。
+ * @returns 成功 true；目标已存在 false；其他错误抛出（交给复制回退）。
  */
-function placeIntoClaimed(source: string, destination: string): { crossVolume: boolean } {
-  /*
-   * 内容先落到占位目录内部。
-   *
-   * 目录名用固定前缀，避免与用户内容冲突；占位是我们刚建的空目录，
-   * 里面不可能已经有东西。
-   */
-  const payload = path.join(destination, '.dsh-restore-payload')
-
+function linkFileNoReplace(source: string, target: string): boolean {
   try {
-    renameSync(source, payload)
-    return { crossVolume: false }
+    linkSync(source, target)
+    return true
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
-    if (code !== 'EXDEV') {
-      // 非跨卷失败：占位目录还在原处，清掉即可，用户路径不受影响。
-      rmSync(destination, { recursive: true, force: true })
-      throw error
-    }
-    // 跨卷：先复制到占位内部，成功后由调用方删源。
-    try {
-      cpSync(source, payload, { recursive: true, preserveTimestamps: true })
-    } catch (copyError) {
-      rmSync(destination, { recursive: true, force: true })
-      throw copyError
-    }
-    return { crossVolume: true }
-  }
-}
-
-/**
- * 把占位目录里的 payload 换出到目标路径，然后收掉空壳。
- *
- * 必须与 `placeIntoClaimed` 分开：只有内容确实进去了，才做这次换名。
- *
- * ## 为什么这一次 rename 是安全的
- *
- * `payload` 在占位目录内部，而占位目录占着 `destination`。竞态方从一开始
- * 就无法在 `destination` 创建任何东西，所以这次 rename 的"目标已存在"是
- * 我们自己刚建的那个目录 —— 不存在被别人抢先的可能。
- *
- * @param destination 已占位的目标路径。
- */
-function promotePayload(destination: string): void {
-  const payload = path.join(destination, '.dsh-restore-payload')
-
-  /*
-   * 先把占位目录挪到一个临时名字，把 `destination` 让出来 —— 但这次让出
-   * 只发生在**内容已经在手边**的瞬间，且紧接着就 rename 回来。
-   *
-   * 更稳的写法是平台相关的 no-replace 原语，但 Node 没有跨平台的。
-   * 这里的窗口只有一次 rename 的时长，且竞态方需要恰好在这个瞬间创建
-   * 同名项才能造成影响 —— 比旧实现"先 rmSync 再 rename"短得多，
-   * 而且不会因为 rmSync 的递归删除误伤别的数据。
-   */
-  renameSync(payload, `${destination}.dsh-tmp-${process.pid}`)
-  try {
-    rmSync(destination, { recursive: true, force: true })
-    renameSync(`${destination}.dsh-tmp-${process.pid}`, destination)
-  } catch (error) {
-    // 尽力恢复：把内容放回占位里，让调用方看到失败。
-    try {
-      renameSync(`${destination}.dsh-tmp-${process.pid}`, payload)
-    } catch {
-      /* 两条路都失败时保留临时文件，至少数据还在 */
-    }
+    if (code === 'EEXIST') return false
+    // EXDEV / EPERM / ENOTSUP：不支持硬链接，交给调用方的回退。
     throw error
   }
 }
 
 /**
+ * 把内容放到一个**保证不覆盖**的目标路径。
+ *
+ * ## 为什么彻底放弃"占位目录"（2026-10-30 复审 SD-01）
+ *
+ * 之前的三段式是：
+ *
+ * ```
+ * mkdirSync(destination)                  ← 占位
+ * renameSync(source, destination/payload) ← 内容进占位内部
+ * rmSync(destination, {recursive:true})   ← **递归删掉占位**
+ * renameSync(temp, destination)           ← 换出
+ * ```
+ *
+ * 第三行有两个独立缺陷，都用隔离实验复现过：
+ *
+ * 1. **它删掉别人写进占位目录的东西**。目录一旦出现在用户眼前，用户就可能
+ *    往里拖文件；`rmSync(recursive)` 会一并删除。
+ * 2. **删完到换出之间目标路径是空的**。竞态方恰好在这时创建同名项，
+ *    就会被最后一次 rename 覆盖（POSIX）或让恢复失败（Windows）。
+ *
+ * 失败路径更糟：内容已离开 `items/<id>`、停在 `.dsh-tmp-*`，而恢复扫描
+ * 只查 `items/<id>` —— 唯一副本找不回来。
+ *
+ * ## 现在的做法：平台原语做原子 no-replace
+ *
+ * - **文件**：`linkSync`（EEXIST 即冲突）+ `unlinkSync` 源；
+ * - **目录**：`mkdirSync` 抢位 → `rmdirSync` 收掉**空**目录 → `renameSync`。
+ *   `rmdir` 只能删空目录，若占位期间有人写入它会失败，我们就换候选名 ——
+ *   绝不递归删别人的内容。
+ *
+ * 内容先落到目标**同级**的唯一 staging 名，它不占用任何候选路径，所以每次
+ * 尝试都是干净的。任何一步失败都不删内容：它要么还在 staging（错误信息给出
+ * 确切位置），要么已经在候选路径上。
+ *
+ * @param id 条目 id（用于 staging 命名）。
+ * @param source 内容路径。
+ * @param desired 期望还原到的路径。
+ * @param onClaimed 测试钩子：在"已用 mkdir 抢到候选路径、尚未收掉它"的
+ *   **窗口内**调用。生产代码不传。存在的理由见下方目录落位处的注释 ——
+ *   那是唯一无法用外部时序复现的窗口，没有钩子就只能靠人工审阅来保证。
+ * @returns 实际使用的路径。
+ */
+function placeNoReplace(
+  id: string,
+  source: string,
+  desired: string,
+  onClaimed?: (candidate: string) => void,
+): string {
+  mkdirSync(path.dirname(desired), { recursive: true })
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+
+  let isDir: boolean
+  try {
+    isDir = statSync(source).isDirectory()
+  } catch {
+    throw new Error(`safe-zone entry ${id} has no content on disk`)
+  }
+
+  /*
+   * 内容先进目标同级的唯一 staging 名。
+   *
+   * 这样它不占用任何候选路径，后续每次尝试都是干净的 no-replace。
+   * 它同时是失败时的落点 —— 内容在这里仍然完整。
+   */
+  const staging = path.join(
+    path.dirname(desired),
+    `.dsh-restore-${id}-${process.pid}-${Date.now().toString(36)}`,
+  )
+
+  try {
+    renameSync(source, staging)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'EXDEV') throw error
+    // 跨卷：复制到 staging，成功后删源；复制失败则源原样保留。
+    cpSync(source, staging, { recursive: true, preserveTimestamps: true })
+    rmSync(source, { recursive: true, force: true })
+  }
+
+  /** 尝试把 staging 落到候选路径；返回是否成功。 */
+  const placeAt = (candidate: string): boolean => {
+    if (!isDir) {
+      try {
+        if (linkFileNoReplace(staging, candidate)) {
+          // 链接成功：目标已指向同一 inode，删掉 staging 这个名字即可。
+          rmSync(staging, { force: true })
+          return true
+        }
+        return false
+      } catch {
+        /*
+         * 硬链接不可用（跨卷、文件系统限制）。回退到"存在性检查 + rename"，
+         * 但把它当成**最后手段**：检查与 rename 之间仍有极小窗口，所以只在
+         * 平台确实不支持 link 时才会走到这里。
+         */
+        if (existsSync(candidate)) return false
+        try {
+          renameSync(staging, candidate)
+          return true
+        } catch {
+          return false
+        }
+      }
+    }
+
+    /*
+     * ## 目录路径**仍有窗口** —— 必须诚实标注
+     *
+     * 文件能用 `linkSync` 做到真正原子（EEXIST 即冲突，无窗口）。
+     * **目录做不到**：Node 没有跨平台的 no-replace 目录改名原语
+     * （POSIX 的 `renameat2(RENAME_NOREPLACE)`、Windows 的
+     * `MoveFileEx` 不含 `MOVEFILE_REPLACE_EXISTING`，都需要原生模块，
+     * 而本插件零运行时依赖）。
+     *
+     * 所以目录走 mkdir → rmdir → rename，仍有一个极短窗口：
+     *
+     * ```
+     * mkdirSync(candidate)    ← 抢位
+     * rmdirSync(candidate)    ← 空出来（窗口）
+     * renameSync(staging, candidate)
+     * ```
+     *
+     * ## 与旧实现（SD-01）的关键区别
+     *
+     * 1. `rmdir` 只能删空目录。若竞态方在窗口里往我们这个空目录写了文件，
+     *    `rmdir` 会 `ENOTEMPTY` 失败 —— 我们换候选名，**绝不删对方的内容**。
+     *    旧实现用 `rmSync(recursive)`，会连同那些文件一起删掉。
+     * 2. 内容始终在 `staging`（目标同级的唯一名），失败不丢、位置写进错误。
+     *
+     * ## 剩余风险（未消除，必须说明）
+     *
+     * 窗口里若恰好有人创建了同名**目录**：Windows 上 `renameSync` 失败
+     * （保守 —— 内容留在 staging，报错给出位置）；POSIX 上会覆盖那个目录。
+     * 后者只可能覆盖一个**空**目录（非空会 ENOTEMPTY），空目录没有数据可丢。
+     */
+    try {
+      mkdirSync(candidate)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') return false
+      throw error
+    }
+    /*
+     * 窗口在这里。生产路径 `onClaimed` 是 undefined，什么都不做；
+     * 测试用它模拟"别人在这个瞬间往我们的空目录里写了文件"。
+     */
+    onClaimed?.(candidate)
+    try {
+      rmdirSync(candidate)
+    } catch {
+      // 有人在我们的占位目录里放了东西 —— 不能动它，换下一个候选。
+      return false
+    }
+    try {
+      renameSync(staging, candidate)
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST' || code === 'EPERM' || code === 'ENOTEMPTY') return false
+      throw error
+    }
+  }
+
+  for (let i = 0; i < 100; i += 1) {
+    if (placeAt(restoreCandidate(desired, i, stamp))) {
+      return i === 0 ? desired : restoreCandidate(desired, i, stamp)
+    }
+  }
+
+  /*
+   * 100 个候选全被占用。**内容仍在 staging** —— 必须把位置告诉调用方，
+   * 否则用户会以为数据丢了。
+   */
+  throw new Error(
+    `cannot find a free restore path for ${desired}: 100 candidates are all taken. ` +
+      `The content is intact at ${staging} — move the existing files away and restore again, ` +
+      'or copy that path back manually.',
+  )
+}
+
+/**
  * 从安全区还原一条。
  *
- * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现在的
- * 文件。占用判定用原子 `mkdir` 占位，不用「存在性检查 + rename」（见
- * `claimRestoreDestination` 的注释）。
+ * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现有的
+ * 文件。冲突判定用平台原语（文件 `linkSync` 的 EEXIST、目录 `mkdirSync` 的
+ * EEXIST），不用「存在性检查 + rename」—— 见 `placeNoReplace` 的注释。
  */
-export async function restoreFromSafeZone(stateDir: string, id: string): Promise<{ restoredTo: string }> {
+export async function restoreFromSafeZone(
+  stateDir: string,
+  id: string,
+  /**
+   * 测试钩子，生产不传。
+   *
+   * 在"目录落位时已用 mkdir 抢到候选路径、还没收掉"的窗口内被调用 ——
+   * 那是唯一无法从外部用真实时序复现的窗口（两次系统调用之间）。
+   * 没有它，SD-01 里 `rmdir` 与 `rmSync(recursive)` 的区别就只能靠人工审阅。
+   */
+  onClaimed?: (candidate: string) => void,
+): Promise<{ restoredTo: string }> {
   return serialized(stateDir, async () => {
     const entries = await readIndexForWrite(stateDir)
     const entry = entries.find((e) => e.id === id)
@@ -844,21 +927,13 @@ export async function restoreFromSafeZone(stateDir: string, id: string): Promise
     }
 
     /*
-     * 跨卷还原：`rename` 会抛 EXDEV。
+     * 一次调用完成搬迁：内容先到 staging，再以 no-replace 原语落到候选路径。
      *
-     * 移入方向早就有「复制 + 删源」的回退，还原方向也必须对称 —— 否则
-     * `crossVolumeCopy` 造出来的条目**恰好全都取不回来**，与「可逆删除」的核心
-     * 承诺直接矛盾。
-     *
-     * 三步，任一步失败都留下源：
-     *   1. 占位（原子 mkdir，占住路径）；
-     *   2. 内容进占位内部（rename 或复制）；
-     *   3. 换出到目标路径（此刻目标一直是我们的）。
+     * 跨卷（EXDEV）由 `placeNoReplace` 内部处理成"复制到 staging 再删源"，
+     * 所以这里不再需要分两步判断。任何失败都会抛错并把内容位置写进消息，
+     * 索引保持不动 —— 用户可以重试或手工取回。
      */
-    const destination = claimRestoreDestination(entry.originalPath, source)
-    const { crossVolume } = placeIntoClaimed(source, destination)
-    promotePayload(destination)
-    if (crossVolume) rmSync(source, { recursive: true, force: true })
+    const destination = placeNoReplace(id, source, entry.originalPath, onClaimed)
 
     // 取回后清掉空的条目目录，避免在安全区里留下空壳。
     try {

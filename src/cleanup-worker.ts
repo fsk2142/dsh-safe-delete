@@ -24,7 +24,7 @@
  * @module dsh-safe-delete/cleanup-worker
  */
 
-import { readCleanupJob, releaseCleanupLock, writeCleanupJobState } from './cleanup'
+import { bindWorkerPid, readCleanupJob, releaseCleanupLock, writeCleanupJobState } from './cleanup'
 import { pruneNowForWorker } from './cleanup-run'
 
 /**
@@ -49,6 +49,17 @@ async function main(): Promise<number> {
    * 挡住，直到 DSH 重启。
    */
   const token = ownerToken ?? ''
+
+  /*
+   * **第一件事：把自己的 pid 绑到锁上。**
+   *
+   * 锁是主进程创建的，里面最初是主进程 pid。而清理在本进程里跑 ——
+   * 若本进程崩溃、主进程还活着，存活判定会一直为真，锁永不接管
+   * （2026-10-30 复审 SD-02，已隔离复现）。
+   *
+   * 绑定之后，存活判定以 `workerPid` 为准：本进程一死，锁就能被接管。
+   */
+  if (token !== '') bindWorkerPid(stateDir, token)
 
   const prev = readCleanupJob(stateDir)
   const requestedAt = prev?.requestedAt ?? Date.now()
