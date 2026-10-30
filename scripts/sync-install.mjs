@@ -26,7 +26,7 @@
  * 目标目录默认是 desktop profile，可用第一个参数覆盖。
  */
 
-import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -100,7 +100,10 @@ function isUnder(child, parent) {
 let removed = 0
 let removedBytes = 0
 let recycled = 0
-let hardDeleted = 0
+/** 回收站不可用而**留在原地**的文件数（不再硬删，见下方注释）。 */
+let kept = 0
+/** 保留下来的文件及原因，供用户判断。 */
+const keptReasons = []
 for (const name of dstNames) {
   if (srcNames.has(name)) continue
   const full = resolve(join(dstLib, name))
@@ -112,22 +115,38 @@ for (const name of dstNames) {
   removedBytes += statSync(full).size
 
   /*
-   * 先试系统回收站，失败才硬删。
+   * 先试系统回收站。**失败就留着并报告，不再硬删**
+   * （2026-10-30 复审 SD-O3）。
    *
-   * 这与本插件的产品理念一致（删除应当可撤回），也让"同步脚本自己误删了什么"
-   * 仍然能捞回来。构建产物是已验证不可达的陈旧文件，退到硬删是可接受的兜底 ——
-   * 否则回收站不可用（或该平台不支持）时同步会卡住。
+   * ## 为什么改掉了"失败才硬删"
+   *
+   * 第一版的理由是"构建产物是已验证不可达的陈旧文件，硬删可接受"。
+   * 但那个理由有两个漏洞：
+   *
+   * 1. **"已验证不可达"是针对构建产物的判断，不是针对这一份文件的判断**。
+   *    安装目录里可能混有人工补丁、本地调试改动、或别的工具放进来的文件 ——
+   *    它们同样会出现在 lib/ 里。
+   * 2. 回收站不可用**恰好**是"这台机器上文件操作不太正常"的信号。在那种
+   *    时刻选择永久删除，方向反了。
+   *
+   * 现在：回收失败 → 保留文件、计入 `kept`、打印原因。同步可能因此留下
+   * 几个陈旧 chunk，那是可见的小麻烦；永久删掉一份不可恢复的文件，是不可见的大麻烦。
    *
    * `moveToSystemRecycleBin` 是同步函数且自带熔断，不会拖慢大批量。
    */
   const outcome = moveToSystemRecycleBin(full)
   if (outcome.ok) {
     recycled += 1
+    removed += 1
   } else {
-    rmSync(full, { force: true })
-    hardDeleted += 1
+    /*
+     * 留在原地，让用户看到并自行决定。
+     *
+     * 不抛错中断整个同步 —— 那会让"一个陈旧文件回收失败"挡住其余的正常清理。
+     */
+    kept += 1
+    keptReasons.push(`${full.split(/[\\/]/).pop()} — ${outcome.reason}`)
   }
-  removed += 1
 }
 
 // 2. 覆盖复制构建产物。
@@ -147,10 +166,27 @@ const { version } = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'
 
 console.log(`同步到 ${target}`)
 if (removed > 0) {
-  const detail = hardDeleted > 0 ? `，其中 ${recycled} 个进回收站、${hardDeleted} 个直接删除` : '，均已移入回收站'
-  console.log(`  删除陈旧文件 ${removed} 个（${(removedBytes / 1024).toFixed(1)} KB${detail}）`)
+  console.log(
+    `  清理陈旧文件 ${removed} 个（${(removedBytes / 1024).toFixed(1)} KB，已移入系统回收站）`,
+  )
 } else {
-  console.log('  删除陈旧文件 0 个')
+  console.log('  清理陈旧文件 0 个')
+}
+/*
+ * 回收站不可用时**明确告诉用户哪些没删、为什么**。
+ *
+ * 这些文件留在原地不影响插件运行（它们是不可达的陈旧 chunk），
+ * 但用户需要知道"同步没有完全清干净"，而不是以为什么都没发生。
+ */
+if (kept > 0) {
+  console.log('')
+  console.log(`  ⚠ ${kept} 个陈旧文件未能移入回收站，**已保留在原处**（未永久删除）：`)
+  for (const reason of keptReasons.slice(0, 10)) {
+    console.log(`      ${reason}`)
+  }
+  if (keptReasons.length > 10) console.log(`      … 另有 ${keptReasons.length - 10} 个`)
+  console.log('    这些是不可达的旧构建产物，不影响运行。想手动清理请先修好回收站，')
+  console.log('    或自行确认后删除 —— 脚本不会替你永久删。')
 }
 console.log(`  复制 ${copied} 个文件`)
 console.log(`  安装版本 ${version}`)
