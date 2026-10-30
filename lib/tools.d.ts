@@ -1,5 +1,6 @@
+import { n as moveToSystemRecycleBin, t as Recycler } from "./recycle-DFk8PP0b.js";
 import { t as ClassifyEnv } from "./classify-DBIbYKr1.js";
-import { a as isEmptySafeZone, f as Recycler, i as destroyEntry, l as moveToSafeZone, o as listSafeZone, p as moveToSystemRecycleBin, u as restoreFromSafeZone } from "./store-CWkmEXQG.js";
+import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';

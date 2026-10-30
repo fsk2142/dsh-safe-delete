@@ -240,35 +240,66 @@ async function main(argv) {
         return 2
       }
 
-      // 移入系统回收站（或按显式要求永久删除）：失败的条目留在安全区。
-      //
-      // 字节数只能累加**成功移动**的条目。在循环前统计总数会把被跳过的条目也算进
-      // 「已释放」，而它其实还在盘上 —— 那是个会误导人的数字。
-      let moved = 0
-      let failed = 0
-      let movedBytes = 0
-      for (const entry of selected) {
-        const result = await store.destroyEntry(
-          stateDir(),
-          entry.id,
-          permanent ? { permanent: { reason: 'cli: prune --permanent --yes', confirmedByUser: true } } : {},
-        )
-        if (result.ok) {
-          moved += 1
-          movedBytes += entry.bytes
-          const verb = result.via === 'permanent' ? 'erased' : 'recycled'
-          process.stdout.write(`${verb} ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
-        } else {
-          failed += 1
-          process.stderr.write(`skipped ${entry.id} (${entry.originalPath}): ${result.reason}\n`)
+      /*
+       * 分批调用回收，而不是逐条。
+       *
+       * ## 为什么改（2026-10-30 复审 P2-02）
+       *
+       * 原来这里 `for (const entry of selected) destroyEntry(...)` ——
+       * 每条一次系统回收站调用（约 1 秒），1000 条要 17 分钟。
+       *
+       * 而回收站是**按目录树**工作的：把 N 条先聚合进一个目录、再一次送进去，
+       * 实测 50 条从 52 秒降到 1.1 秒。worker 里已经实现了这套逻辑
+       * （`pruneNowForWorker`），CLI 复用它。
+       *
+       * ## 永久删除不走这条路
+       *
+       * `--permanent` 要求的是逐条永久抹除、且要进审计；批量聚合是为了
+       * "一次性交给回收站"，语义不同，不能混。
+       */
+      if (permanent) {
+        let moved = 0
+        let failed = 0
+        let movedBytes = 0
+        for (const entry of selected) {
+          const result = await store.destroyEntry(stateDir(), entry.id, {
+            permanent: { reason: 'cli: prune --permanent --yes', confirmedByUser: true },
+          })
+          if (result.ok) {
+            moved += 1
+            movedBytes += entry.bytes
+            process.stdout.write(`erased ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+          } else {
+            failed += 1
+            process.stderr.write(`skipped ${entry.id} (${entry.originalPath}): ${result.reason}\n`)
+          }
         }
-      }
-      process.stdout.write(
-        `total: ${moved} entr(ies) ${permanent ? 'permanently deleted' : 'moved to the recycle bin'}, ${humanBytes(movedBytes)}\n`,
-      )
-      if (failed > 0) {
         process.stdout.write(
-          `${failed} entr(ies) left in the safe zone because the recycle bin was unavailable.\n`,
+          `total: ${moved} entr(ies) permanently deleted, ${humanBytes(movedBytes)}\n`,
+        )
+        if (failed > 0) {
+          process.stdout.write(`${failed} entr(ies) could not be erased and remain in the safe zone.\n`)
+          return 1
+        }
+        return 0
+      }
+
+      // 批量回收：worker 的执行体会按批聚合，每批一次回收调用。
+      const { pruneNowForWorker } = await import('../lib/cleanup-run.js')
+      const before = selected.length
+      const beforeBytes = safeZoneBytes(selected)
+
+      process.stdout.write(`recycling ${before} entr(ies), ${humanBytes(beforeBytes)} in batches...\n`)
+      const t0 = Date.now()
+      const result = await pruneNowForWorker(stateDir(), before)
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1)
+
+      process.stdout.write(
+        `total: ${result.recycled} of ${before} entr(ies) moved to the recycle bin in ${elapsed}s\n`,
+      )
+      if (result.skipped > 0) {
+        process.stdout.write(
+          `${result.skipped} entr(ies) left in the safe zone because the recycle bin was unavailable.\n`,
         )
         return 1
       }

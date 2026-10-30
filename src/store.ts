@@ -630,6 +630,29 @@ export async function listSafeZoneDetailed(
 }
 
 /**
+ * 列出条目，**但不排序**。
+ *
+ * ## 什么时候用
+ *
+ * 调用方只需要计数、求和、或扫描求最值时 —— 排序是白花的钱。
+ *
+ * 2026-10-30 复审 P2-05 实测（3 万条索引）：解析 575 ms、排序 324 ms。
+ * 解析不可避免（索引是 JSON 数组），排序可以省。
+ *
+ * **不要把它用在需要"最早一条在最前"的地方** —— 那正是排序的意义，
+ * 传给 `safe_zone_list` 会让输出顺序变得不可预测。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 条目（索引原序）与（可能的）损坏原因。
+ */
+export async function listSafeZoneUnordered(
+  stateDir: string,
+): Promise<{ entries: TrashEntry[]; corrupt?: string }> {
+  const { entries, corrupt } = await readIndexForRead(stateDir)
+  return corrupt === undefined ? { entries } : { entries, corrupt }
+}
+
+/**
  * 为还原挑一个**不会被并发覆盖**的目标路径。
  *
  * ## 为什么不能「existsSync → rename」

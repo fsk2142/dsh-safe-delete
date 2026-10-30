@@ -55,6 +55,15 @@ const hostConfig: UserConfig = {
      * 作为独立模块存在。
      */
     'cleanup-worker': 'src/cleanup-worker.ts',
+    /*
+     * `cleanup-run` 也必须是独立入口 —— 同样的理由。
+     *
+     * `bin/dsh-safe-delete.mjs` 用 `import('../lib/cleanup-run.js')` 拿到
+     * `pruneNowForWorker`，好让 CLI 的 `prune` 复用批量回收（否则要逐条
+     * 调回收站，1000 条约 17 分钟）。它若被打包进 chunk，CLI 会直接报
+     * `Cannot find module`。
+     */
+    'cleanup-run': 'src/cleanup-run.ts',
   },
   outDir: 'lib',
   format: 'esm',

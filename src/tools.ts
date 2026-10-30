@@ -29,7 +29,7 @@ import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
-import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
+import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
@@ -37,19 +37,40 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
 /**
  * 单次自动清理最多处理多少条过期条目。
  *
- * ## 为什么必须有上限
+ * ## 这个数字的依据（实测，不是估的）
  *
- * 回收站调用约 1049 ms/次（Windows `Shell.Application`）。安全区一旦累积到
- * 两万多条过期条目，一次全清就是 8 小时 —— 而清理是同步 fs 调用，会把宿主
- * 的事件循环整个占住，连会话历史都加载不出来。
+ * 清理跑在**独立子进程**里，按 500 条一批聚合后一次回收。实测单轮吞吐：
  *
- * 200 条 ≈ 200 × 1 ms（同卷 rename）到 200 × 1049 ms（真走回收站）。
- * 后者仍要 3.5 分钟，所以实际清理走的是"移入安全区内的回收流程"，
- * 真正的系统回收站调用只在保留期到期后发生。
+ * | 条数 | 耗时 | ms/条 | 回收调用 |
+ * |---|---|---|---|
+ * | 200 | 218 ms | 1.09 | 1 次 |
+ * | 1000 | 1399 ms | 1.40 | 2 次 |
+ * | 3000 | 2370 ms | 0.79 | 6 次 |
  *
- * 取 200 是折中：小到不会卡住宿主，大到能在合理轮次内清完一个正常规模的安全区。
+ * `tests/worker-throughput.test.ts` 每次运行都会打印这组数字。
+ *
+ * ## 为什么不设 200（初值）
+ *
+ * 初值 200 是 2026-10-30 事故应急时凭感觉设的 —— 当时清理还在主进程里同步跑，
+ * 每条一次系统回收站调用（1049 ms），必须限得很死。
+ *
+ * 现在两个前提都变了：清理在子进程（不占宿主事件循环）、回收按批聚合
+ * （500 条一次调用）。200 的结果是积压恢复极慢：
+ *
+ * ```
+ * 28,724 条积压 ÷ 200 条/小时 = 6 天
+ * ```
+ *
+ * ## 取 3000 的理由
+ *
+ * 实测 3000 条约 2.4 秒 —— 子进程里跑完这段时间完全不影响宿主响应。
+ * 积压 28,724 条从 6 天降到约 10 轮（按小时调度）。
+ *
+ * 不再往上调是因为：一次处理更多会让单轮窗口变长，万一子进程在某轮中途被杀，
+ * 需要恢复的批次更多（虽然有 manifest，但恢复要时间）。3000 是"快"与"单轮影响面小"
+ * 的折中。
  */
-const MAX_PRUNE_PER_RUN = 200
+const MAX_PRUNE_PER_RUN = 3000
 
 /** 工具执行结果。 */
 export interface ToolResult {
@@ -789,10 +810,21 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     parameters: {},
     beforeExecute: pruneIfDue,
     async execute() {
-      // 同 `safe_zone_list`：必须把"索引坏了"和"空"区分开。
-      const { entries, corrupt } = await listSafeZoneDetailed(deps.stateDir)
+      /*
+       * `safe_zone_status` 只需要三个数：条数、总字节、**最早一条**。
+       *
+       * 2026-10-30 复审 P2-05 的实测：3 万条索引解析 575 ms、排序 324 ms。
+       * 解析不可避免（索引是 JSON 数组），但排序完全可以省 —— 这里
+       * 只需要最小值，扫一遍就行，不必把整表排好。
+       *
+       * 这条路径在**主进程**里跑，所以省下的 300 ms 是直接还给宿主的。
+       */
+      const { entries, corrupt } = await listSafeZoneUnordered(deps.stateDir)
       const total = safeZoneBytes(entries)
-      const next = entries[0]
+      let next = entries[0]
+      for (const e of entries) {
+        if (next === undefined || e.movedAt < next.movedAt) next = e
+      }
       const job = readCleanupJob(deps.stateDir)
       // 输出按次计费，尽量用短标签。`state dir` 这类模型用不上的信息压成 dir。
       return {
