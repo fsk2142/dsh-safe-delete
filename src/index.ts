@@ -884,8 +884,6 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
 
 /**
  * 注册 `/safe-delete` 斜杠命令。
-/**
- * 注册 `/safe-delete` 斜杠命令。
  *
  * 与设置页的**配置是同一份**：两者都通过宿主的 settings 服务读写，所以命令行改完、
  * 重启后设置页会显示新值，反之亦然。不存在「两处配置需要对账」。
