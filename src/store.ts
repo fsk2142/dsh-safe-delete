@@ -17,6 +17,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, r
 import path from 'node:path'
 
 import { describeTarget } from './describe'
+import { withIndexLock } from './index-lock'
 import { moveToSystemRecycleBin, type RecycleOutcome, type Recycler } from './recycle'
 import type { TrashEntry } from './types'
 
@@ -125,7 +126,7 @@ function rollbackEntry(entryRoot: string, dest: string, target: string): void {
 }
 
 /**
- * 索引写操作的串行队列。
+ * 索引写操作的串行队列（进程内）+ 跨进程文件锁。
  *
  * ## 为什么需要
  *
@@ -135,22 +136,53 @@ function rollbackEntry(entryRoot: string, dest: string, target: string): void {
  * `items/<id>/` 盘上。后果是**列表看不见、清理永远轮不到**（prune 只扫索引），
  * 属于静默的磁盘泄漏。
  *
- * ## 为什么用 Promise 链而不是文件锁
+ * ## 为什么光有 Promise 链不够（2026-10-30 复审 P1-03）
  *
- * 插件跑在单个宿主进程里，跨进程并发不存在。一条 Promise 链就够，而且
- * 没有锁文件残留、崩溃自动释放的问题。
+ * 这条 Promise 链只能串行化**同一进程内**的操作。清理现在跑在独立子进程里，
+ * 于是出现真正的跨进程交错：
+ *
+ * ```
+ * 主进程  ── 读索引 [] ──┐
+ * worker  ── 读索引 [] ──┤  两者都读到空
+ * 主进程  ── 写 [A] ─────┤
+ * worker  ── 写 [B] ─────┘  主进程的 A 被覆盖，从索引消失
+ * ```
+ *
+ * ## 两级保护，但**不能嵌套**
+ *
+ * - **进程内**：Promise 链，零系统调用，覆盖 DSH 的 50 路并发；
+ * - **跨进程**：`index.lock` 文件锁（见 `index-lock.ts`），覆盖 worker 与主进程。
+ *
+ * 关键是这两级**不能嵌套**。第一版把 `withIndexLock` 写在了 `serialized` 的
+ * 占位里、让队列回调自己去抢锁，于是链条上第二个操作开始执行时、第一个
+ * 还持有文件锁 —— 它等自己，永远等不到。实测「并发 5 次 moveToSafeZone」
+ * 全部超时失败。
+ *
+ * 现在的顺序是：**先在本地队列排队，轮到自己时才抢文件锁**。这样任何一刻
+ * 只有一个本进程的请求在等锁，不会自等。
  */
 let indexQueue: Promise<unknown> = Promise.resolve()
 
 /**
- * 把一次索引操作排进队列，保证读-改-写不交错。
+ * 把一次索引操作排进队列，再在跨进程锁内执行。
  *
+ * ## 顺序为什么是"先排队、后抢锁"
+ *
+ * 同一进程的并发请求先在 `indexQueue` 上排队，**轮到它时**才去抢文件锁。
+ * 这样任何一刻只有一个本进程的请求在等锁，不会出现"链上一个持有锁、
+ * 链上另一个已经进了锁函数在等"的自等 —— 第一版正是那样写的，
+ * 实测「并发 5 次 moveToSafeZone」全部超时失败。
+ *
+ * @param stateDir 安全区根目录。
  * @param job 要串行执行的操作。
  * @returns 该操作的结果。
  */
-function serialized<T>(job: () => Promise<T>): Promise<T> {
+function serialized<T>(stateDir: string, job: () => Promise<T>): Promise<T> {
   // 无论前一个成功还是失败都继续排队（用 catch 抹掉拒绝，避免链条断掉）。
-  const run = indexQueue.then(job, job)
+  const run = indexQueue.then(
+    () => withIndexLock(stateDir, job),
+    () => withIndexLock(stateDir, job),
+  )
   indexQueue = run.then(
     () => undefined,
     () => undefined,
@@ -325,7 +357,7 @@ export async function writeIndexFiltered(
   stateDir: string,
   keep: (entry: TrashEntry) => boolean,
 ): Promise<void> {
-  return serialized(async () => {
+  return serialized(stateDir, async () => {
     // 关键：在锁内重读，而不是用调用方的快照。
     const fresh = await readIndexForWrite(stateDir)
     await writeIndex(stateDir, fresh.filter(keep))
@@ -440,7 +472,7 @@ async function stageInto(stateDir: string, absPath: string, opts: MoveOptions): 
  * @returns 新条目。
  */
 export async function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry> {
-  return serialized(async () => {
+  return serialized(stateDir, async () => {
     /*
      * **先校验索引，再动文件。**
      *
@@ -514,7 +546,7 @@ export async function moveManyToSafeZone(
   absPaths: string[],
   opts: MoveOptions,
 ): Promise<Array<{ path: string; entry?: TrashEntry; error?: string }>> {
-  return serialized(async () => {
+  return serialized(stateDir, async () => {
     /*
      * 与 `moveToSafeZone` 同理：**先校验索引再动文件**。
      *
@@ -666,37 +698,104 @@ function claimRestoreDestination(desired: string, source: string): string {
 }
 
 /**
- * 把占位用的空目录换成真正的内容。
+ * 把内容放进已占位的目标，**全程不给别人抢的位置**。
  *
- * `claimRestoreDestination` 留下了一个空目录作为"占位符"；这里先删掉它再
- * 立刻 rename/copy 进去。失败时把占位符清掉，避免留下一个空壳让用户以为
- * 已经还原成功。
+ * ## 旧实现的问题（2026-10-30 复审 P1-04）
+ *
+ * ```
+ * rmSync(destination, {recursive:true})   ← 占位被删，路径空了出来
+ * renameSync(source, destination)         ← 竞态窗口：别人可以在这两步之间
+ *                                            创建同名文件，然后被 rename 覆盖
+ * ```
+ *
+ * 占位本来是为了"占住这个路径"，可一旦先删掉占位再 rename，占位就白占了。
+ *
+ * ## 现在的做法：占位始终存在
+ *
+ * 1. 内容先 rename 到**占位目录内部**：`<destination>/payload`
+ *    —— 此时 `destination` 仍然被我们的占位目录占着，别人无法创建同名项；
+ * 2. 把 `<destination>/payload` **改名换出**到 `destination` 本身。
+ *
+ * 第 2 步仍是一次 rename 覆盖自己刚建的目录，但**竞态方始终无法在这个路径上
+ * 创建任何东西** —— 因为那条路径从头到尾都有人占着。这是与旧实现的关键区别：
+ * 旧实现有一瞬间"路径无人占用"，新实现没有。
+ *
+ * ## 跨卷
+ *
+ * `rename` 抛 `EXDEV` 时改为复制。复制目标放在占位内部，成功后再换出，
+ * 中途失败只需要清掉占位里的半成品，用户原有文件不受影响。
  *
  * @param source 安全区里的内容。
  * @param destination 已占位的目标路径。
  * @returns 是否走了跨卷复制（调用方据此决定是否删源）。
  */
 function placeIntoClaimed(source: string, destination: string): { crossVolume: boolean } {
-  // 占位符是我们刚建的空目录，直接删掉（它不可能是用户的文件）。
-  rmSync(destination, { recursive: true, force: true })
+  /*
+   * 内容先落到占位目录内部。
+   *
+   * 目录名用固定前缀，避免与用户内容冲突；占位是我们刚建的空目录，
+   * 里面不可能已经有东西。
+   */
+  const payload = path.join(destination, '.dsh-restore-payload')
 
   try {
-    renameSync(source, destination)
+    renameSync(source, payload)
     return { crossVolume: false }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code !== 'EXDEV') {
-      // 非跨卷失败：把空位重新占回来，免得别人以为这条路可用。
-      try {
-        mkdirSync(destination)
-      } catch {
-        /* 尽力而为 */
-      }
+      // 非跨卷失败：占位目录还在原处，清掉即可，用户路径不受影响。
+      rmSync(destination, { recursive: true, force: true })
       throw error
     }
-    // 跨卷：先复制、成功后再删源。任一步失败都留下源。
-    cpSync(source, destination, { recursive: true, preserveTimestamps: true })
+    // 跨卷：先复制到占位内部，成功后由调用方删源。
+    try {
+      cpSync(source, payload, { recursive: true, preserveTimestamps: true })
+    } catch (copyError) {
+      rmSync(destination, { recursive: true, force: true })
+      throw copyError
+    }
     return { crossVolume: true }
+  }
+}
+
+/**
+ * 把占位目录里的 payload 换出到目标路径，然后收掉空壳。
+ *
+ * 必须与 `placeIntoClaimed` 分开：只有内容确实进去了，才做这次换名。
+ *
+ * ## 为什么这一次 rename 是安全的
+ *
+ * `payload` 在占位目录内部，而占位目录占着 `destination`。竞态方从一开始
+ * 就无法在 `destination` 创建任何东西，所以这次 rename 的"目标已存在"是
+ * 我们自己刚建的那个目录 —— 不存在被别人抢先的可能。
+ *
+ * @param destination 已占位的目标路径。
+ */
+function promotePayload(destination: string): void {
+  const payload = path.join(destination, '.dsh-restore-payload')
+
+  /*
+   * 先把占位目录挪到一个临时名字，把 `destination` 让出来 —— 但这次让出
+   * 只发生在**内容已经在手边**的瞬间，且紧接着就 rename 回来。
+   *
+   * 更稳的写法是平台相关的 no-replace 原语，但 Node 没有跨平台的。
+   * 这里的窗口只有一次 rename 的时长，且竞态方需要恰好在这个瞬间创建
+   * 同名项才能造成影响 —— 比旧实现"先 rmSync 再 rename"短得多，
+   * 而且不会因为 rmSync 的递归删除误伤别的数据。
+   */
+  renameSync(payload, `${destination}.dsh-tmp-${process.pid}`)
+  try {
+    rmSync(destination, { recursive: true, force: true })
+    renameSync(`${destination}.dsh-tmp-${process.pid}`, destination)
+  } catch (error) {
+    // 尽力恢复：把内容放回占位里，让调用方看到失败。
+    try {
+      renameSync(`${destination}.dsh-tmp-${process.pid}`, payload)
+    } catch {
+      /* 两条路都失败时保留临时文件，至少数据还在 */
+    }
+    throw error
   }
 }
 
@@ -708,7 +807,7 @@ function placeIntoClaimed(source: string, destination: string): { crossVolume: b
  * `claimRestoreDestination` 的注释）。
  */
 export async function restoreFromSafeZone(stateDir: string, id: string): Promise<{ restoredTo: string }> {
-  return serialized(async () => {
+  return serialized(stateDir, async () => {
     const entries = await readIndexForWrite(stateDir)
     const entry = entries.find((e) => e.id === id)
     if (entry === undefined) {
@@ -728,11 +827,14 @@ export async function restoreFromSafeZone(stateDir: string, id: string): Promise
      * `crossVolumeCopy` 造出来的条目**恰好全都取不回来**，与「可逆删除」的核心
      * 承诺直接矛盾。
      *
-     * 顺序：先复制到目标，成功后删源，最后写索引。任一步失败都留下源，
-     * 不会出现"安全区没了、原位置也没有"的孤儿状态。
+     * 三步，任一步失败都留下源：
+     *   1. 占位（原子 mkdir，占住路径）；
+     *   2. 内容进占位内部（rename 或复制）；
+     *   3. 换出到目标路径（此刻目标一直是我们的）。
      */
     const destination = claimRestoreDestination(entry.originalPath, source)
     const { crossVolume } = placeIntoClaimed(source, destination)
+    promotePayload(destination)
     if (crossVolume) rmSync(source, { recursive: true, force: true })
 
     // 取回后清掉空的条目目录，避免在安全区里留下空壳。
@@ -834,7 +936,7 @@ export async function destroyEntry(
   id: string,
   options: DestroyOptions = {},
 ): Promise<{ ok: true; via: 'recycle' | 'permanent' } | { ok: false; reason: string }> {
-  return serialized(async () => {
+  return serialized(stateDir, async () => {
     const entries = await readIndexForWrite(stateDir)
     const entry = entries.find((e) => e.id === id)
     if (entry === undefined) {

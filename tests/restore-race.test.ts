@@ -30,8 +30,14 @@ import { scratchDir } from './support/tmpdir'
  *   1. 目标被占用时一定换名，且原目标内容一字不改；
  *   2. 反复还原到同一路径时，每一次都落到**不同**的落点，且之前所有内容
  *      都还在 —— 这等价于说"占用检测不会退化成覆盖"。
+ * ## 为什么显式给 30 秒超时
+ *
+ * 其中一条测试要连跑 50 轮「还原 → 占住落点」。索引写操作现在除了进程内
+ * 队列，还要抢跨进程文件锁（P1-03 的修复），每次争用失败会退避 5 ms 重试。
+ * 隔离运行 357 ms，全量并行套件下会超过默认的 5 秒 —— 失败形态是框架超时，
+ * 不是断言失败，容易被误读成逻辑回归。
  */
-describe('restore: never overwrites an existing target', () => {
+describe('restore: never overwrites an existing target', { timeout: 30_000 }, () => {
   /**
    * 造一条安全区条目，内容与名字都可控。
    *

@@ -15,6 +15,17 @@ function deps(): ToolDeps {
     env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
     requestApproval: async () => 'allowed-once',
     retentionDays: 7,
+    /*
+     * 关掉自动清理。
+     *
+     * 开启时每次工具调用都会 `spawn` 一个真实 worker 子进程，而它会去抢
+     * 同一个索引锁 —— 主进程此刻正持有那把锁。跨进程争用本身是**设计正确**
+     * 的行为（P1-03 的修复就是要它们互斥），但测试没准备好跑真实子进程，
+     * 于是表现为 5 秒超时。
+     *
+     * 需要验证清理行为的测试会显式打开它，并直接用 worker 执行体。
+     */
+    autoPrune: false,
   }
 }
 
