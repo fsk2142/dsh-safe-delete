@@ -770,6 +770,42 @@ function resolveStoredContent(stateDir: string, id: string): string | null {
 }
 
 /**
+ * 永久删除的显式授权。
+ *
+ * ## 为什么要一个对象而不是 `permanent: true`
+ *
+ * 一个布尔开关太容易顺手写上去。2026-10-30 我就这么干过：用户说"删掉"，
+ * 我理解成彻底删除，于是用 `permanent: true` 把 **1086 MB、30,198 个文件**
+ * 永久删除了 —— 那些都在保留期内、本该可恢复。用户的真实意图是"移进回收站"。
+ *
+ * 布尔参数让这件事没有任何摩擦，而它造成的后果不可逆。
+ *
+ * 现在永久删除要求同时给出：
+ *   - `reason`（进审计日志，事后能追）；
+ *   - `confirmedByUser: true`（调用方确认这是用户明确要求的）。
+ *
+ * 两项都写了，调用方显然是有意为之，而不是顺手选了个"更彻底"的选项。
+ */
+export interface PermanentDelete {
+  /** 为什么必须永久删除（进审计日志）。 */
+  reason: string
+  /** 调用方确认这是用户明确要求的永久删除。 */
+  confirmedByUser: true
+}
+
+/** `destroyEntry` 的选项。 */
+export interface DestroyOptions {
+  /**
+   * 永久删除授权。**不传就走系统回收站**（可恢复）。
+   *
+   * 类型是对象而非 `boolean` —— 见 `PermanentDelete` 的注释。
+   */
+  permanent?: PermanentDelete
+  /** 可替换的回收实现（测试用替身；生产路径不传）。 */
+  recycler?: Recycler
+}
+
+/**
  * 销毁一条：**优先移入系统回收站**，只有明确要求时才永久抹掉。
  *
  * ## 为什么不是直接 rmSync
@@ -790,14 +826,13 @@ function resolveStoredContent(stateDir: string, id: string): string | null {
  *
  * @param stateDir 安全区根目录。
  * @param id 条目 id。
- * @param options `permanent: true` 时才真正 rmSync（用于「清空安全区」这类明示操作）；
- *   `recycler` 可替换回收站实现（测试用替身，生产路径不传）。
+ * @param options 见 `DestroyOptions`。省略 `permanent` 时**走系统回收站**。
  * @returns 结果；失败时附带原因，条目未被删除。
  */
 export async function destroyEntry(
   stateDir: string,
   id: string,
-  options: { permanent?: boolean; recycler?: Recycler } = {},
+  options: DestroyOptions = {},
 ): Promise<{ ok: true; via: 'recycle' | 'permanent' } | { ok: false; reason: string }> {
   return serialized(async () => {
     const entries = await readIndexForWrite(stateDir)
@@ -817,8 +852,25 @@ export async function destroyEntry(
       return { ok: true, via: 'permanent' }
     }
 
+    /*
+     * 永久删除要显式授权。`reason` 与 `confirmedByUser` 缺一个就拒绝，
+     * 而不是"默认按更彻底的做"。
+     */
+    const permanent = options.permanent
+    if (permanent !== undefined) {
+      if (permanent.confirmedByUser !== true) {
+        throw new Error(
+          'permanent deletion requires `confirmedByUser: true` — ' +
+            'only pass it when the user explicitly asked for permanent deletion, not merely to free space',
+        )
+      }
+      if (typeof permanent.reason !== 'string' || permanent.reason.trim() === '') {
+        throw new Error('permanent deletion requires a non-empty `reason` (it is recorded in the audit log)')
+      }
+    }
+
     let via: 'recycle' | 'permanent' = 'permanent'
-    if (options.permanent !== true) {
+    if (permanent === undefined) {
       const recycler = options.recycler ?? moveToSystemRecycleBin
       // 包一层 try：recycler 自身抛错（假实现、平台 API 异常）也必须降级成
       // 「跳过这一条」，不能让异常冒出去中断整轮清理 —— 那样后面的条目连尝试

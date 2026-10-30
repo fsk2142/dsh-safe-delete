@@ -8,7 +8,8 @@
  * 命令：
  *   list                列出安全区内容
  *   undo <id>           把某条取回原位（原位被占用时落到 .restored-<时间戳>）
- *   prune [--dry-run]   按策略清理（时间 + 容量），--dry-run 只报告不动手
+ *   prune [--dry-run]   把过期条目移入系统回收站；--dry-run 只报告不动手
+ *   prune --permanent --yes   永久删除（不可恢复，需两个开关）
  *   check               只读体检（不写任何文件）
  *   status              安全区概况
  *   journal [n]         审计流水（拦截 / 删除 / 取回 / 清理），最新在前
@@ -24,7 +25,8 @@ Usage:
   dsh-safe-delete delete <path> [--preview]   Move a file or directory into the safe zone
   dsh-safe-delete list                 List what is in the safe zone
   dsh-safe-delete undo <id>            Restore one entry to where it came from
-  dsh-safe-delete prune [--dry-run]    Destroy expired / over-capacity entries
+  dsh-safe-delete prune [--dry-run]    Move expired entries to the recycle bin
+dsh-safe-delete prune --permanent --yes   Erase them irrecoverably
   dsh-safe-delete status               Show safe-zone size, retention and capacity
   dsh-safe-delete check                Read-only composition health check
   dsh-safe-delete journal [n]          Audit trail, newest first
@@ -199,6 +201,14 @@ async function main(argv) {
     case 'prune': {
       if (store === undefined) return missingBuild()
       const dryRun = rest.includes('--dry-run')
+      /*
+       * 永久删除必须**两个开关同时给**：`--permanent` 与 `--yes`。
+       *
+       * 一个够不够？不够。删掉的东西不可恢复，多敲一个 `--yes` 是让人在按下
+       * 回车前再想一秒 —— 2026-10-30 我正是"顺手"永久删了 1086 MB 才加的门。
+       */
+      const permanent = rest.includes('--permanent')
+      const alsoYes = rest.includes('--yes')
       const entries = await store.listSafeZone(stateDir())
       const { selectForPrune, safeZoneBytes } = await import('../lib/prune.js')
       const cfg = readConfigDefaults()
@@ -212,14 +222,25 @@ async function main(argv) {
       const totalSelectedBytes = safeZoneBytes(selected)
       if (dryRun) {
         for (const entry of selected) {
-          process.stdout.write(`would move to recycle bin ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+          process.stdout.write(
+            `would ${permanent ? 'PERMANENTLY DELETE' : 'move to recycle bin'} ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`,
+          )
         }
         process.stdout.write(
           `total: ${selected.length} entr(ies), ${humanBytes(totalSelectedBytes)} (dry run — nothing changed)\n`,
         )
         return 0
       }
-      // 移入系统回收站：失败的条目留在安全区，不永久删除。
+
+      if (permanent && !alsoYes) {
+        process.stderr.write(
+          'refusing: `--permanent` erases data irrecoverably; add `--yes` to confirm you really want that.\n' +
+            'Without `--permanent` the entries are moved to the system recycle bin instead.\n',
+        )
+        return 2
+      }
+
+      // 移入系统回收站（或按显式要求永久删除）：失败的条目留在安全区。
       //
       // 字节数只能累加**成功移动**的条目。在循环前统计总数会把被跳过的条目也算进
       // 「已释放」，而它其实还在盘上 —— 那是个会误导人的数字。
@@ -227,17 +248,24 @@ async function main(argv) {
       let failed = 0
       let movedBytes = 0
       for (const entry of selected) {
-        const result = await store.destroyEntry(stateDir(), entry.id)
+        const result = await store.destroyEntry(
+          stateDir(),
+          entry.id,
+          permanent ? { permanent: { reason: 'cli: prune --permanent --yes', confirmedByUser: true } } : {},
+        )
         if (result.ok) {
           moved += 1
           movedBytes += entry.bytes
-          process.stdout.write(`recycled ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
+          const verb = result.via === 'permanent' ? 'erased' : 'recycled'
+          process.stdout.write(`${verb} ${entry.id}  ${humanBytes(entry.bytes)}  ${entry.originalPath}\n`)
         } else {
           failed += 1
           process.stderr.write(`skipped ${entry.id} (${entry.originalPath}): ${result.reason}\n`)
         }
       }
-      process.stdout.write(`total: ${moved} entr(ies) moved to the recycle bin, ${humanBytes(movedBytes)}\n`)
+      process.stdout.write(
+        `total: ${moved} entr(ies) ${permanent ? 'permanently deleted' : 'moved to the recycle bin'}, ${humanBytes(movedBytes)}\n`,
+      )
       if (failed > 0) {
         process.stdout.write(
           `${failed} entr(ies) left in the safe zone because the recycle bin was unavailable.\n`,

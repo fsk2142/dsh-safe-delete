@@ -92,10 +92,69 @@ describe('destroyEntry routes through the recycle bin', () => {
     writeFileSync(file, 'x')
     const entry = await moveToSafeZone(state, file, { retentionDays: 7 })
 
-    const result = await destroyEntry(state, entry.id, { permanent: true })
+    const result = await destroyEntry(state, entry.id, {
+      permanent: { reason: 'test: explicit permanent deletion', confirmedByUser: true },
+    })
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.via).toBe('permanent')
     expect(existsSync(join(state, 'items', entry.id))).toBe(false)
+  })
+
+  it('rejects a permanent request without user confirmation', async () => {
+    /*
+     * 2026-10-30 的教训：`permanent: true` 这个布尔开关太容易顺手写上。
+     * 那次我用它把 1086 MB 永久删掉了，而用户的真实意图是"移进回收站"。
+     *
+     * 现在要求显式的 `confirmedByUser` 与 `reason` —— 缺一个就拒绝，
+     * 而不是"默认按更彻底的做"。
+     */
+    const { work, state } = setup()
+    const file = join(work, 'd.txt')
+    writeFileSync(file, 'x')
+    const entry = await moveToSafeZone(state, file, { retentionDays: 7 })
+
+    await expect(
+      destroyEntry(state, entry.id, {
+        // 类型上就不允许省略 confirmedByUser；这里强转模拟"忘了写"的调用方。
+        permanent: { reason: 'test' } as unknown as { reason: string; confirmedByUser: true },
+      }),
+    ).rejects.toThrow(/confirmedByUser/)
+
+    // 内容必须还在 —— 拒绝要发生在删除之前。
+    expect(existsSync(join(state, 'items', entry.id)), '拒绝时不该删内容').toBe(true)
+  })
+
+  it('rejects a permanent request without a reason', async () => {
+    const { work, state } = setup()
+    const file = join(work, 'e.txt')
+    writeFileSync(file, 'x')
+    const entry = await moveToSafeZone(state, file, { retentionDays: 7 })
+
+    await expect(
+      destroyEntry(state, entry.id, {
+        permanent: { reason: '   ', confirmedByUser: true },
+      }),
+    ).rejects.toThrow(/reason/)
+    expect(existsSync(join(state, 'items', entry.id))).toBe(true)
+  })
+
+  it('defaults to the recycle bin when permanent is omitted', async () => {
+    // 不传 permanent 就走回收站 —— 这是默认且可恢复的路径。
+    const { work, state } = setup()
+    const file = join(work, 'f.txt')
+    writeFileSync(file, 'x')
+    const entry = await moveToSafeZone(state, file, { retentionDays: 7 })
+
+    let called = 0
+    const result = await destroyEntry(state, entry.id, {
+      recycler: () => {
+        called += 1
+        return { ok: true }
+      },
+    })
+    expect(called, '不传 permanent 应调用回收站').toBe(1)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.via).toBe('recycle')
   })
 
   it('clears a stale index row when the content is already gone', async () => {
