@@ -103,23 +103,30 @@ export function classifyPath(absPath: string, env: ClassifyEnv): Classification 
   // 1. 安全区自身：永不允许被删除。
   if (isUnder(target, safeZone)) return 'protected'
 
-  // 2. 系统临时目录：豁免。
-  //
-  // Windows 上 `%TEMP%` 在 `C:\Users\<user>\AppData\Local\Temp`，也就是在家目录
-  // 内部。它是"可丢弃"区域的语义，不是"用户的东西"；不豁免就会让每次删临时文件
-  // 都弹卡。这一条必须排在"家目录 → confirm"之前。
-  const tmp = normalize(env.tmpdir ?? os.tmpdir())
-  if (isUnder(target, tmp)) return 'free'
-
-  // 3. 安装目录：改坏它 DSH 起不来。
+  /*
+   * 2. 安装目录与 node_modules：**必须在临时目录豁免之前**。
+   *
+   * 原来的顺序是"临时目录 → 安装目录 → node_modules"，于是只要安装目录或
+   * 某个 `node_modules` 恰好位于 `%TEMP%` 之下（便携安装、CI 容器、
+   * `npm install` 到临时目录都很常见），就会被前面的豁免短路成 `free`，
+   * 一次误删就能让 DSH 起不来。
+   *
+   * 保护规则优先于便利规则 —— 这个顺序没有取舍空间。
+   */
   if (env.installDir !== undefined && env.installDir !== '' && isUnder(target, env.installDir)) {
     return 'protected'
   }
-
-  // 4. node_modules：任意层级。
   if (hasNodeModulesSegment(target)) return 'protected'
 
-  // 5. profile 下的清单类文件。
+  // 3. 系统临时目录：豁免。
+  //
+  // Windows 上 `%TEMP%` 在 `C:\Users\<user>\AppData\Local\Temp`，也就是在家目录
+  // 内部。它是"可丢弃"区域的语义，不是"用户的东西"；不豁免就会让每次删临时文件
+  // 都弹卡。这一条仍然排在家目录 → confirm 之前。
+  const tmp = normalize(env.tmpdir ?? os.tmpdir())
+  if (isUnder(target, tmp)) return 'free'
+
+  // 4. profile 下的清单类文件。
   const profilesRoot = path.join(dshHome, 'profiles')
   if (isUnder(target, profilesRoot)) {
     const base = path.basename(target)

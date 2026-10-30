@@ -33,7 +33,7 @@
 
 import { readdirSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 /** 探针残留的目录名前缀。**只匹配这些，不碰用户目录。** */
 const PROBE_PATTERN = /^\.?dsd-/
@@ -162,17 +162,34 @@ function collect() {
     }
   }
 
+  /*
+   * 工作区里的探针与草稿。
+   *
+   * **不只看根目录**：我实际把探针写在 `scripts/`、`tests/`、`src/` 里。
+   * 只扫根目录会漏掉它们 —— 实测 `scripts/zz-race-proof.ts` 这类就一直
+   * 没被识别，直到手工发现。
+   */
   const workspace = resolve(process.cwd())
-  for (const e of readdirSync(workspace, { withFileTypes: true })) {
-    if (!e.isFile() || !WS_PATTERN.test(e.name)) continue
-    const full = join(workspace, e.name)
-    let bytes = 0
+  const scanDirs = [workspace, ...['scripts', 'tests', 'src', 'docs'].map((d) => join(workspace, d))]
+
+  for (const dir of scanDirs) {
+    let entries
     try {
-      bytes = statSync(full).size
+      entries = readdirSync(dir, { withFileTypes: true })
     } catch {
-      /* 读不到就当 0 */
+      continue
     }
-    items.push({ path: full, label: e.name, where: 'workspace', bytes })
+    for (const e of entries) {
+      if (!e.isFile() || !WS_PATTERN.test(e.name)) continue
+      const full = join(dir, e.name)
+      let bytes = 0
+      try {
+        bytes = statSync(full).size
+      } catch {
+        /* 读不到就当 0 */
+      }
+      items.push({ path: full, label: full.replace(workspace + `${sep}`, ''), where: 'workspace', bytes })
+    }
   }
 
   return items

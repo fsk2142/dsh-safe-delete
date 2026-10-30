@@ -315,8 +315,14 @@ async function main(argv) {
         }
         return 1
       }
+      /*
+       * 用**实际配置**的保留期，不写死。
+       *
+       * 这里原来硬编码 7，而默认保留期是 1 天 —— CLI 会向用户承诺"7 天内可
+       * 恢复"，实际第二天就进回收站了。用户可见的错误承诺，必须修。
+       */
       process.stdout.write(
-        `${result.kind === 'preview' ? describePreview(result, 7) : describeMoved(result, 7)}\n`,
+        `${result.kind === 'preview' ? describePreview(result, cfg.retentionDays) : describeMoved(result, cfg.retentionDays)}\n`,
       )
       return 0
     }

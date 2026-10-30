@@ -718,6 +718,11 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         retentionDays,
         confirmFileCount: numeric('confirmFileCount', 5000),
         confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
+        /*
+         * 必须传：否则用户在配置里打开了跨卷复制，`/safe-delete <跨卷路径>`
+         * 仍然按禁用处理 —— 同一个开关在模型工具与斜杠命令上行为不一致。
+         */
+        crossVolumeCopy: booleanOf('crossVolumeCopy', false),
         requestApproval,
         now: () => Date.now(),
       })

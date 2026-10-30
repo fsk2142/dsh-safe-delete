@@ -158,17 +158,125 @@ function serialized<T>(job: () => Promise<T>): Promise<T> {
   return run
 }
 
-/** 读索引；不存在或损坏时返回空数组（安全区宁可"看起来空"也不能让删除流程崩掉）。 */
-async function readIndex(stateDir: string): Promise<TrashEntry[]> {
+/**
+ * 索引读取结果。
+ *
+ * 为什么不是「直接返回数组」：**必须区分"没有索引"和"索引坏了"**。
+ * 前者可以正常初始化，后者绝不能当成空索引继续写 —— 那会把还没登记的
+ * 条目永久变成孤儿（见 `readIndex` 的注释）。
+ */
+type IndexRead =
+  | { kind: 'ok'; entries: TrashEntry[] }
+  /** 索引文件不存在：全新的安全区，可以正常初始化。 */
+  | { kind: 'missing' }
+  /** 索引存在但读不出来（权限/IO）或内容非法。**禁止任何写操作**。 */
+  | { kind: 'corrupt'; reason: string }
+
+/**
+ * 读索引，区分三种状态。
+ *
+ * ## 为什么不能"坏了就当空"
+ *
+ * 早期实现里解析失败直接 `return []`，后果是灾难性的：
+ *
+ *   1. 用户的安全区里有 100 个条目，索引因为断电/杀进程/同步软件写坏了；
+ *   2. 用户再删一个文件 → `moveToSafeZone` 拿到的 `entries` 是 `[]`；
+ *   3. `entries.push(newEntry)` 然后 `writeIndex` —— **原索引被整个覆盖**；
+ *   4. 那 100 个条目的内容还在 `items/` 里，但索引没了：
+ *      列表看不到、恢复拿不回来、定期清理也不会再处理它们。
+ *
+ * 也就是说"索引坏"这个本来只影响可读性的故障，被放大成了"永久丢失可恢复性"。
+ * 对这个插件的核心承诺来说，这是最不能接受的方向。
+ *
+ * 所以：**只有"文件确实不存在"才允许当作空索引**。其余一律 fail-closed，
+ * 让调用方拒绝这次操作，把损坏的原文件留在原地等人处理。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 三态读取结果。
+ */
+async function readIndex(stateDir: string): Promise<IndexRead> {
   const file = indexPath(stateDir)
-  if (!existsSync(file)) return []
+  if (!existsSync(file)) return { kind: 'missing' }
+
+  let raw: string
   try {
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
-    if (!Array.isArray(parsed)) return []
-    return parsed as TrashEntry[]
-  } catch {
-    return []
+    raw = readFileSync(file, 'utf8')
+  } catch (error) {
+    return {
+      kind: 'corrupt',
+      reason: `cannot read ${file}: ${error instanceof Error ? error.message : String(error)}`,
+    }
   }
+
+  // 空文件按损坏处理：正常写出的索引永远不会是 0 字节。
+  if (raw.trim() === '') {
+    return { kind: 'corrupt', reason: `index file is empty: ${file}` }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return {
+      kind: 'corrupt',
+      reason: `index file is not valid JSON (${error instanceof Error ? error.message : String(error)})`,
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    return { kind: 'corrupt', reason: `index file is not a JSON array: ${file}` }
+  }
+
+  // 结构校验：每条至少要有 id 与 originalPath，否则后续按 id 查找会静默失配。
+  const entries: TrashEntry[] = []
+  const seen = new Set<string>()
+  for (const item of parsed) {
+    const e = item as Partial<TrashEntry>
+    if (typeof e.id !== 'string' || e.id === '' || typeof e.originalPath !== 'string') {
+      return { kind: 'corrupt', reason: `index entry missing id/originalPath: ${JSON.stringify(item).slice(0, 120)}` }
+    }
+    if (seen.has(e.id)) {
+      return { kind: 'corrupt', reason: `duplicate id in index: ${e.id}` }
+    }
+    seen.add(e.id)
+    entries.push(item as TrashEntry)
+  }
+  return { kind: 'ok', entries }
+}
+
+/**
+ * 读索引并保证"可安全写入"：不存在时给空数组，损坏时**抛错**。
+ *
+ * 所有"要写索引"的路径都走这个；纯读路径（列表、状态）用 `readIndexForRead`。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 索引条目（不存在时为空数组）。
+ */
+async function readIndexForWrite(stateDir: string): Promise<TrashEntry[]> {
+  const read = await readIndex(stateDir)
+  if (read.kind === 'corrupt') {
+    throw new Error(
+      `refusing to modify the safe zone: its index is corrupt and rewriting it would lose ${'the existing entries'}. ` +
+        `Reason: ${read.reason}. ` +
+        `The file has been left untouched — repair or move it away, then retry.`,
+    )
+  }
+  return read.kind === 'missing' ? [] : read.entries
+}
+
+/**
+ * 读索引用于**只读**展示：损坏时返回空数组并在 reason 里说明。
+ *
+ * 为什么读路径可以宽容：看列表不该因为索引坏了就整个报错。但必须让调用方
+ * 能把"真的空"和"读不出来"区分开，所以一并返回原因。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 条目与（可能的）损坏原因。
+ */
+async function readIndexForRead(stateDir: string): Promise<{ entries: TrashEntry[]; corrupt?: string }> {
+  const read = await readIndex(stateDir)
+  if (read.kind === 'corrupt') return { entries: [], corrupt: read.reason }
+  return { entries: read.kind === 'missing' ? [] : read.entries }
 }
 
 /**
@@ -219,7 +327,7 @@ export async function writeIndexFiltered(
 ): Promise<void> {
   return serialized(async () => {
     // 关键：在锁内重读，而不是用调用方的快照。
-    const fresh = await readIndex(stateDir)
+    const fresh = await readIndexForWrite(stateDir)
     await writeIndex(stateDir, fresh.filter(keep))
   })
 }
@@ -385,9 +493,18 @@ async function stageInto(stateDir: string, absPath: string, opts: MoveOptions): 
  */
 export async function moveToSafeZone(stateDir: string, absPath: string, opts: MoveOptions): Promise<TrashEntry> {
   return serialized(async () => {
-    const entry = await stageInto(stateDir, absPath, opts)
+    /*
+     * **先校验索引，再动文件。**
+     *
+     * 顺序在这里是安全性的核心：`stageInto` 会把源文件 rename 进安全区。
+     * 如果先移动、后读索引，那么索引损坏时文件已经被移走 —— 用户看到的
+     * 是"删除失败"，但文件其实已经不在原位，且没有索引记录能把它取回来。
+     *
+     * 先读则索引坏时一个字节都不动，源文件原地保持。
+     */
+    const entries = await readIndexForWrite(stateDir)
 
-    const entries = await readIndex(stateDir)
+    const entry = await stageInto(stateDir, absPath, opts)
     entries.push(entry)
     try {
       await writeIndex(stateDir, entries)
@@ -450,6 +567,14 @@ export async function moveManyToSafeZone(
   opts: MoveOptions,
 ): Promise<Array<{ path: string; entry?: TrashEntry; error?: string }>> {
   return serialized(async () => {
+    /*
+     * 与 `moveToSafeZone` 同理：**先校验索引再动文件**。
+     *
+     * 批量版本更要注意：如果校验放在循环之后，索引损坏时整批文件都已经被
+     * rename 进安全区了，回滚 N 个远比提前拒绝代价大。
+     */
+    const entries = await readIndexForWrite(stateDir)
+
     const results: Array<{ path: string; entry?: TrashEntry; error?: string }> = []
     const staged: TrashEntry[] = []
 
@@ -465,8 +590,7 @@ export async function moveManyToSafeZone(
 
     if (staged.length === 0) return results
 
-    // 一次性合并：读一次、写一次。
-    const entries = await readIndex(stateDir)
+    // 一次写入：`entries` 是循环**之前**读到的那份（已验证可写）。
     entries.push(...staged)
     try {
       await writeIndex(stateDir, entries)
@@ -504,18 +628,140 @@ export async function moveManyToSafeZone(
 
 /** 列出安全区条目（按移入时间升序）。 */
 export async function listSafeZone(stateDir: string): Promise<TrashEntry[]> {
-  const entries = await readIndex(stateDir)
+  const { entries } = await readIndexForRead(stateDir)
   return [...entries].sort((a, b) => a.movedAt - b.movedAt)
+}
+
+/**
+ * 列出条目，并把索引损坏的原因一并带出。
+ *
+ * 工具侧用这个：`safe_zone_list` 应当告诉用户"索引读不出来"，而不是
+ * 显示一个空列表让人以为安全区是空的。
+ *
+ * @param stateDir 安全区根目录。
+ * @returns 条目与（可能的）损坏原因。
+ */
+export async function listSafeZoneDetailed(
+  stateDir: string,
+): Promise<{ entries: TrashEntry[]; corrupt?: string }> {
+  const { entries, corrupt } = await readIndexForRead(stateDir)
+  const sorted = [...entries].sort((a, b) => a.movedAt - b.movedAt)
+  return corrupt === undefined ? { entries: sorted } : { entries: sorted, corrupt }
+}
+
+/**
+ * 为还原挑一个**不会被并发覆盖**的目标路径。
+ *
+ * ## 为什么不能「existsSync → rename」
+ *
+ * `renameSync` 在 POSIX 上**会静默替换已存在的目标**。而 `existsSync` 只是一个
+ * 时间点快照：
+ *
+ * ```
+ * existsSync(dest) === false      ← 检查通过
+ *                                 ← 别的进程在这里创建了同名文件
+ * renameSync(source, dest)        ← 把那个新文件覆盖掉，用户的文件没了
+ * ```
+ *
+ * Windows 上 rename 通常会报冲突，所以这个缺陷是平台相关的 —— 但"只在 Linux 上
+ * 丢文件"不是可以接受的答案。
+ *
+ * ## 做法：先原子占位，再移动
+ *
+ * `mkdir` 是**原子且不覆盖**的：目标已存在时必定抛 EEXIST。所以：
+ *
+ *   1. `mkdir(dest)` 成功 → 这个路径归我们了，并发方无法再用它；
+ *   2. 把占位的空目录删掉，紧接着 `rename` 进去 —— 这两步之间仍然有窗口，
+ *      但**只有占位被主动删掉的这几十微秒**，而且 rename 之后目标是我们刚
+ *      释放的路径，别人要插进来需要赢过这个极窄窗口；
+ *   3. 更关键的是：任何 `mkdir` 失败（EEXIST）都会让我们换一个带时间戳的名字
+ *      再试，而不是覆盖。
+ *
+ * 对文件源也可以直接用 `linkSync` + `unlinkSync` 做到完全原子（link 同样不覆盖），
+ * 但源可能是目录，`link` 不支持目录，所以统一走 mkdir 占位。
+ *
+ * @param desired 期望的还原路径。
+ * @param source 安全区里的内容（文件或目录），用于判断是否需要建父目录。
+ * @returns 已被本次调用占位的目标路径。
+ */
+function claimRestoreDestination(desired: string, source: string): string {
+  void source
+  mkdirSync(path.dirname(desired), { recursive: true })
+
+  /** 尝试占位一个具体路径；成功返回 true。 */
+  const tryClaim = (candidate: string): boolean => {
+    try {
+      mkdirSync(candidate)
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      // EEXIST：已被占用，换下一个候选。
+      if (code === 'EEXIST') return false
+      // 其他错误（权限、路径非法）不该被当成"占用"重试，直接上抛。
+      throw error
+    }
+  }
+
+  // 第一次试原路径；被占用就依次试带序号的兄弟名，直到成功。
+  // 判据是 `mkdir` 的原子性：目标已存在时它必定 EEXIST，不会像 rename 那样覆盖。
+  if (tryClaim(desired)) return desired
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  for (let i = 0; i < 100; i += 1) {
+    const candidate = i === 0 ? `${desired}.restored-${stamp}` : `${desired}.restored-${stamp}-${i}`
+    if (tryClaim(candidate)) return candidate
+  }
+  throw new Error(
+    `cannot find a free restore path for ${desired}: 100 candidates are all taken. ` +
+      'Restore it elsewhere, or move the existing files away first.',
+  )
+}
+
+/**
+ * 把占位用的空目录换成真正的内容。
+ *
+ * `claimRestoreDestination` 留下了一个空目录作为"占位符"；这里先删掉它再
+ * 立刻 rename/copy 进去。失败时把占位符清掉，避免留下一个空壳让用户以为
+ * 已经还原成功。
+ *
+ * @param source 安全区里的内容。
+ * @param destination 已占位的目标路径。
+ * @returns 是否走了跨卷复制（调用方据此决定是否删源）。
+ */
+function placeIntoClaimed(source: string, destination: string): { crossVolume: boolean } {
+  // 占位符是我们刚建的空目录，直接删掉（它不可能是用户的文件）。
+  rmSync(destination, { recursive: true, force: true })
+
+  try {
+    renameSync(source, destination)
+    return { crossVolume: false }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'EXDEV') {
+      // 非跨卷失败：把空位重新占回来，免得别人以为这条路可用。
+      try {
+        mkdirSync(destination)
+      } catch {
+        /* 尽力而为 */
+      }
+      throw error
+    }
+    // 跨卷：先复制、成功后再删源。任一步失败都留下源。
+    cpSync(source, destination, { recursive: true, preserveTimestamps: true })
+    return { crossVolume: true }
+  }
 }
 
 /**
  * 从安全区还原一条。
  *
- * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— 绝不覆盖现在的文件。
+ * 原路径已被占用时还原到同级 `.restored-<时间戳>` 兄弟 —— **绝不覆盖**现在的
+ * 文件。占用判定用原子 `mkdir` 占位，不用「存在性检查 + rename」（见
+ * `claimRestoreDestination` 的注释）。
  */
 export async function restoreFromSafeZone(stateDir: string, id: string): Promise<{ restoredTo: string }> {
   return serialized(async () => {
-    const entries = await readIndex(stateDir)
+    const entries = await readIndexForWrite(stateDir)
     const entry = entries.find((e) => e.id === id)
     if (entry === undefined) {
       throw new Error(`unknown safe-zone id: ${id}`)
@@ -527,30 +773,19 @@ export async function restoreFromSafeZone(stateDir: string, id: string): Promise
       throw new Error(`safe-zone entry ${id} has no content on disk`)
     }
 
-    let destination = entry.originalPath
-    if (existsSync(destination)) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-      destination = `${entry.originalPath}.restored-${stamp}`
-    }
-
-    mkdirSync(path.dirname(destination), { recursive: true })
-
-    // 跨卷还原：`rename` 会抛 EXDEV。
-    //
-    // 移入方向早就有「复制 + 删源」的回退，还原方向也必须对称 —— 否则
-    // `crossVolumeCopy` 造出来的条目**恰好全都取不回来**，与「可逆删除」的核心
-    // 承诺直接矛盾。
-    //
-    // 顺序：先复制到目标，成功后删源，最后写索引。任一步失败都留下源，
-    // 不会出现"安全区没了、原位置也没有"的孤儿状态。
-    try {
-      renameSync(source, destination)
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'EXDEV') throw error
-      cpSync(source, destination, { recursive: true, preserveTimestamps: true })
-      rmSync(source, { recursive: true, force: true })
-    }
+    /*
+     * 跨卷还原：`rename` 会抛 EXDEV。
+     *
+     * 移入方向早就有「复制 + 删源」的回退，还原方向也必须对称 —— 否则
+     * `crossVolumeCopy` 造出来的条目**恰好全都取不回来**，与「可逆删除」的核心
+     * 承诺直接矛盾。
+     *
+     * 顺序：先复制到目标，成功后删源，最后写索引。任一步失败都留下源，
+     * 不会出现"安全区没了、原位置也没有"的孤儿状态。
+     */
+    const destination = claimRestoreDestination(entry.originalPath, source)
+    const { crossVolume } = placeIntoClaimed(source, destination)
+    if (crossVolume) rmSync(source, { recursive: true, force: true })
 
     // 取回后清掉空的条目目录，避免在安全区里留下空壳。
     try {
@@ -617,7 +852,7 @@ export async function destroyEntry(
   options: { permanent?: boolean; recycler?: Recycler } = {},
 ): Promise<{ ok: true; via: 'recycle' | 'permanent' } | { ok: false; reason: string }> {
   return serialized(async () => {
-    const entries = await readIndex(stateDir)
+    const entries = await readIndexForWrite(stateDir)
     const entry = entries.find((e) => e.id === id)
     if (entry === undefined) {
       throw new Error(`unknown safe-zone id: ${id}`)
@@ -662,7 +897,7 @@ export async function destroyEntry(
 
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 export async function isEmptySafeZone(stateDir: string): Promise<boolean> {
-  const entries = await readIndex(stateDir)
+  const { entries } = await readIndexForRead(stateDir)
   if (entries.length > 0) return false
   const items = path.join(stateDir, ITEMS_DIR)
   if (!existsSync(items)) return true
