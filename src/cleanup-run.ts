@@ -155,9 +155,26 @@ export async function pruneNowForWorker(
   let recycled = 0
   let skipped = 0
 
-  // 按批处理：每批聚合 → 回收 → 从索引移除。
-  for (let start = 0; start < expired.length; start += BATCH_SIZE) {
-    const slice = expired.slice(start, start + BATCH_SIZE)
+  /*
+   * 按批处理：每批聚合 → 回收 → 从索引移除。
+   *
+   * ## 为什么用游标而不是 `for (start += BATCH_SIZE)`（2026-10-30 复审 SD-N07）
+   *
+   * 第一版外层按 500 条切、内层再按 256 MiB 切，内层一旦截断就 `break`
+   * **整个外层循环**。
+   *
+   * 后果：10 条各 100 MiB 的过期条目，第一批只装得下 2 条，然后整轮结束 ——
+   * 剩下 8 条留给下一次自动调度（可能一小时后）。积压增长速度会超过
+   * Worker 的实际处理能力。
+   *
+   * 现在用游标：每批处理完 `cursor += batch.length`，继续下一批，
+   * 直到处理完本轮候选或达到预算。单条超过上限时也**至少推进一条**，
+   * 否则会无限自旋。
+   */
+  let cursor = 0
+  while (cursor < expired.length) {
+    // 按条数切
+    const slice = expired.slice(cursor, cursor + BATCH_SIZE)
 
     // 按字节上限再切一次，避免单批过大。
     const batch: typeof slice = []
@@ -166,6 +183,16 @@ export async function pruneNowForWorker(
       if (bytes + (e.bytes ?? 0) > BATCH_MAX_BYTES && batch.length > 0) break
       batch.push(e)
       bytes += e.bytes ?? 0
+    }
+
+    /*
+     * 防御：单条自身就超过字节上限时，上面那个 `batch.length > 0` 保证
+     * 它会单独成为一批（不会空转）。这里再兜一次底 —— 空批必须退出，
+     * 否则 `cursor` 不前进会死循环。
+     */
+    if (batch.length === 0) {
+      cursor += 1
+      continue
     }
 
     const outcome = await recycleBatch(stateDir, batch, recycler)
@@ -214,10 +241,13 @@ export async function pruneNowForWorker(
       await writeIndexFiltered(stateDir, (e) => !gone.has(e.id))
     }
 
-    if (batch.length < slice.length) {
-      // 字节上限提前截断：剩余的留给下一轮。
-      break
-    }
+    /*
+     * 推进游标 —— 这里**不再 `break` 整轮**（SD-N07 的修复点）。
+     *
+     * `batch.length` 可能小于 `slice.length`（被字节上限截断），
+     * 但剩下的条目仍在 `expired` 里，应当在同一轮继续处理。
+     */
+    cursor += batch.length
   }
 
   return { recycled, skipped }
