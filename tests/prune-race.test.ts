@@ -28,8 +28,17 @@ import { scratchDir } from './support/tmpdir'
  *
  * `writeIndexFiltered` 在串行块内**重读最新索引**再按谓词过滤。快照参数本来就
  * 只需要谓词，过滤新鲜索引在任何交错下都正确，且严格更安全。
+ *
+ * ## 为什么显式给 30 秒超时
+ *
+ * 清理改成后台子进程后，这里的测试直接驱动 worker 执行体，一次要走完
+ * 「恢复残留批次 → 写 manifest → 聚合 → 回收 → 写索引」整条链路，
+ * 而且要在 prune 进行中插入并发写入（靠 `setTimeout(0)` 抓窗口）。
+ *
+ * 隔离运行约 2 秒，但全量并行套件下实测超过默认的 5 秒而超时失败 ——
+ * 失败形态是框架超时，不是断言失败，很容易被误读成逻辑回归。
  */
-describe('prune: does not clobber concurrent writes', () => {
+describe('prune: does not clobber concurrent writes', { timeout: 30_000 }, () => {
   /**
    * 造一个已过期条目。
    *
@@ -81,7 +90,16 @@ describe('prune: does not clobber concurrent writes', () => {
     const status = createTools(deps).find((t) => t.name === 'safe_zone_status')
     if (status === undefined) throw new Error('no status')
 
-    const prunePromise = status.execute({})
+    /*
+     * 直接驱动 worker 的执行体，而不是走工具入口。
+     *
+     * 自动清理已改成独立子进程，工具调用不再同步执行清理 —— 所以从
+     * `safe_zone_status` 无法同步观察 prune 的过程。但这条测试要验的
+     * 正是**prune 执行期间并发移入的条目会不会被覆盖**，必须能控制时序，
+     * 因此直接调内部函数。
+     */
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    const prunePromise = pruneNowForWorker(state, 100, () => ({ ok: true }))
     // 让 prune 跑起来，进入处理内容的阶段。
     await new Promise((r) => setTimeout(r, 0))
     const target = raceTarget()
@@ -127,8 +145,9 @@ describe('prune: does not clobber concurrent writes', () => {
     const status = createTools(deps).find((t) => t.name === 'safe_zone_status')
     if (status === undefined) throw new Error('no status')
 
-    // 并发发起 3 次 move，与 prune 交错。
-    const prunePromise = status.execute({})
+    // 并发发起 3 次 move，与 prune 交错。同样直接驱动 worker 执行体。
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    const prunePromise = pruneNowForWorker(state, 100, () => ({ ok: true }))
     const moves: Array<Promise<unknown>> = []
     for (let i = 0; i < 3; i += 1) {
       const p = join(work, `c${i}.tmp`)

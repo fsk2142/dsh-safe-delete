@@ -105,7 +105,26 @@ for (const [file, text] of sources) {
     }
   }
 }
-const orphanFiles = srcFiles.filter((file) => !importedFiles.has(file) && !/(^|\/)index\.ts$/.test(rel(file)));
+/*
+ * **由子进程加载**的入口不算"无人导入"。
+ *
+ * `cleanup-worker.ts` 是被 `spawn(process.execPath, [workerPath, ...])` 执行的
+ * 独立入口 —— 没有任何文件 `import` 它，但它是必需的：tsdown 有一个独立
+ * entry，且 `src/cleanup.ts` 在运行时按路径找它。
+ *
+ * 除静态 import 之外，"被运行时按路径加载"也是真实的使用方式。扫描器不认识
+ * 这一种就会把它报成死文件，然后有人照着报告删掉 —— 清理会**静默失效**。
+ *
+ * 注意路径形态：`rel()` 返回相对仓库根的路径，带 `src/` 前缀。
+ */
+const RUNTIME_ENTRIES = new Set(['src/cleanup-worker.ts']);
+
+const orphanFiles = srcFiles.filter(
+  (file) =>
+    !importedFiles.has(file) &&
+    !/(^|\/)index\.ts$/.test(rel(file)) &&
+    !RUNTIME_ENTRIES.has(rel(file)),
+);
 
 console.log(`扫描 ${srcFiles.length} 个源文件、${exports.length} 个导出符号\n`);
 console.log(`=== 零引用的导出符号（${deadExports.length}） ===`);

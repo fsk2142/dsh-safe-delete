@@ -225,3 +225,5 @@ node scripts/clean-test-tmp.mjs   # 清测试遗留临时目录
 - [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) —— 配置页排查
 - [`docs/STARTUP-SAFETY.md`](docs/STARTUP-SAFETY.md) —— 启动安全性
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) —— 与其他插件的共存检查
+- [`docs/CLEANUP-ARCHITECTURE.md`](docs/CLEANUP-ARCHITECTURE.md) —— 清理架构（后台子进程 + 批量回收）
+- [`docs/INCIDENT-2026-10-30.md`](docs/INCIDENT-2026-10-30.md) —— 2026-10-30 卡顿事故记录

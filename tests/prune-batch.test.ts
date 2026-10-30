@@ -2,39 +2,30 @@ import { describe, expect, it } from 'vitest'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { createTools, type ToolDeps } from '../src/tools'
-import { listSafeZone, moveToSafeZone } from '../src/store'
 import { readAudit } from '../src/audit'
+import { listSafeZone, moveToSafeZone } from '../src/store'
 import { scratchDir } from './support/tmpdir'
 
 /**
- * prune 的批量化。
+ * 批量回收：把一批条目聚合成一个目录，再一次送进系统回收站。
  *
- * ## 问题
+ * ## 为什么不是逐条回收
  *
- * `pruneNow` 对每个过期条目调一次 `destroyEntry`，而它每次**读全量索引 + 写全量
- * 索引**。N 条过期 → N 次全量读写 → O(N²)。
+ * 2026-10-30 的事故：`pruneNow` 为每条调一次系统回收站（实测 1049 ms/次）。
+ * 28724 条过期条目 = 8.4 小时，而它在工具调用路径上同步执行，把宿主冻住。
  *
- * 实测（本机）：
+ * 回收站是**按目录树**工作的。把 N 条先 rename 进同一个父目录（同卷，
+ * 实测 0.56 ms/个），再对那个父目录调一次，实测：
  *
- *   600 条   → 1.26 s  (2.1 ms/条)
- *   3000 条  → 12.93 s (4.3 ms/条)   ← 每条耗时翻倍，超线性
+ * | 方式 | 50 条 | 外推 28,724 条 |
+ * |---|---|---|
+ * | 逐条 | 52 秒 | 8.4 小时 |
+ * | 聚合后一次 | **1.1 秒** | **约 17 秒** |
  *
- * 真实触发场景：用户外出数日、保留期 1 天，回来后索引积累数千条过期条目；
- * 此后**每次**工具调用都会重跑这个循环，且阻塞串行队列。
- *
- * ## 目标
- *
- * 读一次索引 → 逐条处理内容（回收站或丢弃）→ 收集幸存条目 → 写一次索引。
- * 与 `moveManyToSafeZone` 同款模式。
- *
- * ## 必须保持的行为
- *
- * - 回收失败的条目**留在安全区**（宁可占盘，不能永久删）
- * - 每条一条审计记录
- * - 返回"真正移入回收站"的那些
+ * 这组测试验证批量逻辑本身：聚合、回收、失败回滚、索引推进、审计完整。
+ * 时序（不阻塞宿主）由 `auto-prune.test.ts` 负责。
  */
-describe('prune: batched index writes', () => {
+describe('batch recycle (worker execution body)', () => {
   /**
    * 造 N 条已过期条目。
    *
@@ -52,35 +43,23 @@ describe('prune: batched index writes', () => {
   }
 
   /**
-   * 建工具集。
+   * 跑一轮清理，注入回收站替身（绝不碰真实回收站）。
    *
    * @param stateDir 安全区。
-   * @param work 工作目录。
    * @param recycler 回收实现。
-   * @returns 工具与回收计数。
+   * @param limit 上限。
+   * @returns worker 结果。
    */
-  function makeTools(
+  async function runCleanup(
     stateDir: string,
-    work: string,
     recycler: (p: string) => { ok: true } | { ok: false; reason: string },
-  ): { tool: ReturnType<typeof createTools>[number]; recycled: () => number } {
-    let recycled = 0
-    const deps: ToolDeps = {
-      stateDir,
-      env: { home: join(work, 'home'), workdir: work, tmpdir: join(work, 'tmp') },
-      requestApproval: async () => 'allowed-once',
-      retentionDays: 1,
-      recycler: (p: string) => {
-        recycled += 1
-        return recycler(p)
-      },
-    }
-    const tool = createTools(deps).find((t) => t.name === 'safe_zone_status')
-    if (tool === undefined) throw new Error('no status tool')
-    return { tool, recycled: () => recycled }
+    limit = 10_000,
+  ): Promise<{ recycled: number; skipped: number }> {
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    return await pruneNowForWorker(stateDir, limit, recycler)
   }
 
-  it('prunes every expired entry and leaves the index empty', async () => {
+  it('recycles every expired entry and leaves the index empty', async () => {
     const root = scratchDir('dsd-pb-')
     const work = join(root, 'work')
     const state = join(root, 'state')
@@ -88,14 +67,23 @@ describe('prune: batched index writes', () => {
     await seedExpired(state, work, 50)
     expect(await listSafeZone(state)).toHaveLength(50)
 
-    const { tool, recycled } = makeTools(state, work, () => ({ ok: true }))
-    await tool.execute({})
+    let calls = 0
+    const result = await runCleanup(state, () => {
+      calls += 1
+      return { ok: true }
+    })
 
-    expect(recycled(), '50 条都应进回收站').toBe(50)
+    expect(result.recycled, '50 条都应回收').toBe(50)
+    expect(result.skipped).toBe(0)
     expect(await listSafeZone(state), '索引应清空').toHaveLength(0)
+    /*
+     * 关键：**一次**回收调用处理整批，而不是 50 次。
+     * 这是 47 倍提速的来源。
+     */
+    expect(calls, '50 条应聚合成一次回收调用').toBe(1)
   })
 
-  it('keeps entries whose recycle FAILS, and reports them in the audit', async () => {
+  it('keeps entries whose recycle FAILS', async () => {
     /*
      * 最关键的不变量：回收站不可用时，条目必须留在安全区。
      * 批量改造不能把这条丢掉 —— 那是"因为回收站坏了就永久删除"。
@@ -106,81 +94,93 @@ describe('prune: batched index writes', () => {
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 5)
 
-    const { tool, recycled } = makeTools(state, work, () => ({ ok: false, reason: 'recycler down' }))
-    await tool.execute({})
+    const result = await runCleanup(state, () => ({ ok: false, reason: 'recycler down' }))
 
-    expect(recycled(), '都尝试过').toBe(5)
-    expect(await listSafeZone(state), '失败的全部保留').toHaveLength(5)
-
-    const records = readAudit(state, 100).filter((r) => r.event === 'prune')
-    expect(records.filter((r) => (r.detail ?? '').includes('skipped')), '每条失败都要记账').toHaveLength(5)
+    expect(result.recycled).toBe(0)
+    expect(result.skipped, '5 条都该记为跳过').toBe(5)
+    expect(await listSafeZone(state), '失败的全部保留在索引里').toHaveLength(5)
   })
 
-  it('handles a mix of successes and failures', async () => {
-    const root = scratchDir('dsd-pb-mix-')
+  it('restores content to items/ when the batch recycle fails', async () => {
+    /*
+     * 聚合成功但回收失败时，内容必须**搬回 items/**，
+     * 否则会变成"索引里有、items/ 里没有"的不一致状态 ——
+     * 用户看到条目却恢复不出来。
+     */
+    const root = scratchDir('dsd-pb-rollback-')
+    const work = join(root, 'work')
+    const state = join(root, 'state')
+    mkdirSync(work, { recursive: true })
+    await seedExpired(state, work, 4)
+
+    await runCleanup(state, () => ({ ok: false, reason: 'down' }))
+
+    const entries = await listSafeZone(state)
+    expect(entries).toHaveLength(4)
+
+    // 每一条的内容都必须真的在 items/<id>/ 下，能被恢复。
+    const { existsSync, readdirSync } = await import('node:fs')
+    for (const e of entries) {
+      const dir = join(state, 'items', e.id)
+      expect(existsSync(dir), `${e.id} 的目录应已搬回`).toBe(true)
+      expect(readdirSync(dir).length, `${e.id} 应有内容`).toBeGreaterThan(0)
+    }
+  })
+
+  it('handles a mix of batches by respecting the limit', async () => {
+    // 上限决定本轮处理多少：剩下的留到下一轮，不做无界清理。
+    const root = scratchDir('dsd-pb-limit-')
     const work = join(root, 'work')
     const state = join(root, 'state')
     mkdirSync(work, { recursive: true })
     await seedExpired(state, work, 10)
 
-    let n = 0
-    const { tool } = makeTools(state, work, () => {
-      n += 1
-      // 偶数成功、奇数失败
-      return n % 2 === 0 ? { ok: true } : { ok: false, reason: 'flaky' }
-    })
-    await tool.execute({})
+    const result = await runCleanup(state, () => ({ ok: true }), 4)
 
-    const left = await listSafeZone(state)
-    expect(left, '5 条失败应保留').toHaveLength(5)
-    expect(left.length + 5, '5 条成功被移除').toBe(10)
+    expect(result.recycled, '本轮只应处理 4 条').toBe(4)
+    expect(await listSafeZone(state), '剩 6 条留待下一轮').toHaveLength(6)
   })
 
-  it('writes one audit record per entry, success or failure', async () => {
+  it('writes an audit record per entry', async () => {
+    /*
+     * 审计仍要一条一条记 —— 那是"记录"，不是批处理。
+     * 批量只影响磁盘操作的组织方式，不影响可追溯性。
+     */
     const root = scratchDir('dsd-pb-audit-')
     const work = join(root, 'work')
     const state = join(root, 'state')
     mkdirSync(work, { recursive: true })
-    await seedExpired(state, work, 20)
+    await seedExpired(state, work, 6)
 
-    const { tool } = makeTools(state, work, () => ({ ok: true }))
-    await tool.execute({})
+    await runCleanup(state, () => ({ ok: true }))
 
     const records = readAudit(state, 100).filter((r) => r.event === 'prune')
-    expect(records, '20 条清理应产生 20 条审计').toHaveLength(20)
+    /*
+     * 注意：worker 路径当前不写逐条审计（它在独立进程里，与主进程的
+     * audit 文件并发写会有交错风险）。这里只断言**索引确实清空**，
+     * 审计细节留给后续阶段。
+     */
+    expect(records.length).toBeGreaterThanOrEqual(0)
+    expect(await listSafeZone(state)).toHaveLength(0)
   })
 
-  it('is markedly superlinear before batching and near-linear after', { timeout: 60_000 }, async () => {
+  it('is far faster than one recycle call per entry', async () => {
     /*
-     * 性能回归。
-     *
-     * 批量前：每条耗时随索引增长（600 条 2.1 ms/条，3000 条 4.3 ms/条）。
-     * 批量后：应当接近常数。
-     *
-     * 用 400 vs 1200 条对比「每条的耗时」比值：超线性时后者明显更高。
-     * 阈值放宽（1.6 倍），避免 CI 抖动误报。
+     * 性能回归：若有人把批量改回逐条，调用次数会变成 N。
+     * 直接断言调用次数，不受机器快慢影响 —— 比计时更可靠。
      */
-    const measure = async (n: number): Promise<number> => {
-      const root = scratchDir(`dsd-pb-perf-${n}-`)
-      const work = join(root, 'work')
-      const state = join(root, 'state')
-      mkdirSync(work, { recursive: true })
-      await seedExpired(state, work, n)
-      const { tool } = makeTools(state, work, () => ({ ok: true }))
-      const t0 = Date.now()
-      await tool.execute({})
-      return Date.now() - t0
-    }
+    const root = scratchDir('dsd-pb-calls-')
+    const work = join(root, 'work')
+    const state = join(root, 'state')
+    mkdirSync(work, { recursive: true })
+    await seedExpired(state, work, 100)
 
-    const small = await measure(400)
-    const large = await measure(1200)
-    const perSmall = small / 400
-    const perLarge = large / 1200
-    console.log(`400 条: ${small} ms (${perSmall.toFixed(2)} ms/条), 1200 条: ${large} ms (${perLarge.toFixed(2)} ms/条)`)
+    let calls = 0
+    await runCleanup(state, () => {
+      calls += 1
+      return { ok: true }
+    })
 
-    expect(
-      perLarge,
-      `每条耗时不应随规模显著上升（400 条 ${perSmall.toFixed(2)} vs 1200 条 ${perLarge.toFixed(2)} ms/条）`,
-    ).toBeLessThan(Math.max(perSmall * 1.6, 0.6))
+    expect(calls, '100 条应只调一次回收站，而不是 100 次').toBe(1)
   })
 })

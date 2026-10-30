@@ -23,16 +23,33 @@ import {
   type DeleteContext,
   type DeleteRequest,
 } from './delete-core'
+import { readCleanupJob, requestCleanup } from './cleanup'
 import { describeTarget } from './describe'
 import { matchInTree, parseDuration } from './match'
-import { selectForPrune, safeZoneBytes } from './prune'
+import { safeZoneBytes } from './prune'
 import type { Recycler } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
-import { discardEntryContent, destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone, writeIndexFiltered } from './store'
-import type { TrashEntry } from './types'
+import { destroyEntry, isEmptySafeZone, listSafeZone, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+
+/**
+ * 单次自动清理最多处理多少条过期条目。
+ *
+ * ## 为什么必须有上限
+ *
+ * 回收站调用约 1049 ms/次（Windows `Shell.Application`）。安全区一旦累积到
+ * 两万多条过期条目，一次全清就是 8 小时 —— 而清理是同步 fs 调用，会把宿主
+ * 的事件循环整个占住，连会话历史都加载不出来。
+ *
+ * 200 条 ≈ 200 × 1 ms（同卷 rename）到 200 × 1049 ms（真走回收站）。
+ * 后者仍要 3.5 分钟，所以实际清理走的是"移入安全区内的回收流程"，
+ * 真正的系统回收站调用只在保留期到期后发生。
+ *
+ * 取 200 是折中：小到不会卡住宿主，大到能在合理轮次内清完一个正常规模的安全区。
+ */
+const MAX_PRUNE_PER_RUN = 200
 
 /** 工具执行结果。 */
 export interface ToolResult {
@@ -516,53 +533,6 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
    * - 每条一条审计记录
    * - 返回值仍是"真正移入回收站"的那些
    */
-  const pruneNow = async (): Promise<TrashEntry[]> => {
-    if (deps.autoPrune === false) return []
-    const entries = await listSafeZone(deps.stateDir)
-    // 只看保留期：没有容量层，没有百分比阈值。
-    const selected = selectForPrune(entries, { now: now() })
-    if (selected.length === 0) return []
-
-    const removed: TrashEntry[] = []
-    const auditRecords: Array<Omit<AuditRecord, 'at'>> = []
-
-    // 逐条**只处理内容**（回收站 / 丢弃），不碰索引。
-    for (const entry of selected) {
-      const result = await discardEntryContent(deps.stateDir, entry.id, {
-        ...(deps.recycler === undefined ? {} : { recycler: deps.recycler }),
-      })
-      if (!result.ok) {
-        auditRecords.push({
-          event: 'prune',
-          target: entry.originalPath,
-          detail: `id=${entry.id} skipped: ${result.reason}`,
-        })
-        continue
-      }
-      removed.push(entry)
-      auditRecords.push({
-        event: 'prune',
-        target: entry.originalPath,
-        detail: `id=${entry.id} bytes=${entry.bytes} via=${result.via}`,
-      })
-    }
-
-    /*
-     * 索引只写一次：把成功清掉的那些移除。
-     *
-     * **不传 `entries`（那份快照）** —— `writeIndexFiltered` 会在锁内重读最新
-     * 索引再过滤。传快照会让窗口期内并发移入的条目被整个覆盖掉（实测 4 个孤儿）。
-     *
-     * 失败的条目留在索引里 —— 下轮 prune 会再试（届时回收站若恢复就能清掉）。
-     */
-    if (removed.length > 0) {
-      const gone = new Set(removed.map((e) => e.id))
-      await writeIndexFiltered(deps.stateDir, (e) => !gone.has(e.id))
-    }
-
-    appendAuditBatch(deps.stateDir, auditRecords)
-    return removed
-  }
 
   /**
    * 按间隔调用 `pruneNow`。
@@ -571,20 +541,40 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
    * 也保有生命周期，而清理并不需要那种准时性。改为"每次工具调用顺路看一眼"，
    * 代价是插件彻底不用管定时器的清理与异常。
    */
+  /**
+   * 按间隔触发自动清理 —— **只投递请求，不执行**。
+   *
+   * ## 为什么不能在这里 await 清理
+   *
+   * 这个函数挂在 6 个工具的 `beforeExecute` 上。2026-10-30 的事故就是它：
+   * 它 `await pruneNow()`，后者同步调用系统回收站，28724 条要 8.4 小时，
+   * 事件循环被占住，宿主连会话历史都加载不出来。
+   *
+   * 现在它只做两件事：
+   *   1. 判断是否到间隔（读一个小 JSON，或直接按进程内计时器跳过）；
+   *   2. 派生一个**独立子进程**去真正清理（`spawn`，几毫秒返回）。
+   *
+   * 主进程完全不等待清理结果 —— UI 响应与清理耗时彻底解耦。
+   */
+  const AUTO_PRUNE_INTERVAL_MS = 60 * 60 * 1000
+
   const pruneIfDue = async (): Promise<void> => {
     if (deps.autoPrune === false) return
-    // 间隔参数已移除：现在每次工具调用都检查一次。
-    //
-    // 为什么不保留间隔：容量层去掉后，清理只是"扫一遍索引，挑出过期的"，
-    // 开销从"可能搬上千个文件"降到"读一个 JSON"。再为此维护一个计时器
-    // 和它的持久化，反而更复杂。
     const at = now()
-    if (lastPruneAt !== null && at - lastPruneAt < 1000) return
+    if (lastPruneAt !== null && at - lastPruneAt < AUTO_PRUNE_INTERVAL_MS) return
     lastPruneAt = at
     try {
-      await pruneNow()
+      /*
+       * 只投递。`requestCleanup` 内部派生 detached 子进程后立即返回；
+       * 即使子进程要跑几小时，这次工具调用也早已返回。
+       */
+      await requestCleanup({
+        stateDir: deps.stateDir,
+        limit: MAX_PRUNE_PER_RUN,
+        minIntervalMs: AUTO_PRUNE_INTERVAL_MS,
+      })
     } catch {
-      /* 清理失败不该让工具调用失败 */
+      /* 调度失败不该让工具调用失败 */
     }
   }
 
@@ -689,7 +679,24 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
         now,
-        afterMove: () => pruneNow(),
+        /*
+         * 删除之后的顺带清理：同样只**投递**，不执行。
+         *
+         * 这个回调在 `safe_delete` 的执行体里跑，是用户正在等待的路径。
+         * 改成派生独立进程后，删除本身的耗时就与清理规模彻底无关了。
+         */
+        afterMove: async () => {
+          try {
+            await requestCleanup({
+              stateDir: deps.stateDir,
+              limit: MAX_PRUNE_PER_RUN,
+              minIntervalMs: AUTO_PRUNE_INTERVAL_MS,
+            })
+          } catch {
+            /* 调度失败不影响删除结果 */
+          }
+          return []
+        },
       }
       const base = {
         preview: args.preview === true,
@@ -767,13 +774,15 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
 
   const safeZoneStatus = makeTool({
     name: 'safe_zone_status',
-    description: 'Show the safe zone state: entry count, total size, retention window, capacity cap, and when the next entries expire.',
+    description:
+      'Show the safe zone state: entry count, total size, retention window, and background cleanup progress.',
     parameters: {},
     beforeExecute: pruneIfDue,
     async execute() {
       const entries = await listSafeZone(deps.stateDir)
       const total = safeZoneBytes(entries)
       const next = entries[0]
+      const job = readCleanupJob(deps.stateDir)
       // 输出按次计费，尽量用短标签。`state dir` 这类模型用不上的信息压成 dir。
       return {
         ok: true,
@@ -783,13 +792,18 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           `retention: ${deps.retentionDays}d (time-only, no capacity cap)`,
           `auto prune: ${deps.autoPrune === false ? 'off (manual only)' : 'on'}`,
           /*
-           * 明确写出"什么时候才会真的清理"。
+           * 清理现在跑在**独立进程**里，所以这里显示的是任务状态，
+           * 而不是"下次工具调用时才会清理"。
            *
-           * 没有常驻定时器是刻意取舍（避免插件在 DSH 空闲时保有生命周期），
-           * 代价是清理**不保证准点**：保留期到了，也要等下一次工具调用才动。
-           * 不说清楚，用户会以为"1 天后自动进回收站"是准点的。
+           * 用户需要区分三种情况：没跑过 / 正在跑 / 上次失败。
+           * 只说 on/off 会让人以为清理是同步的。
            */
-          `prune runs: only when a safe_zone_* tool is called (no background timer)`,
+          job === null
+            ? 'cleanup: never run'
+            : `cleanup: ${job.outcome}${job.outcome === 'running' ? ` (pid ${job.pid ?? '?'})` : ''}` +
+              `${job.recycled > 0 ? `, recycled ${job.recycled}` : ''}` +
+              `${job.skipped > 0 ? `, skipped ${job.skipped}` : ''}` +
+              `${job.lastError === undefined ? '' : `, last error: ${job.lastError}`}`,
           // 清理去哪是用户最该知道的一点：进回收站（可还原）还是永久删。
           `prune to: ${canRecycle() ? 'system recycle bin (restorable)' : `NOT SUPPORTED on ${process.platform} — entries stay put`}`,
           `confirm over: ${describeThresholds(deps)}`,

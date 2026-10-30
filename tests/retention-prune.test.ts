@@ -126,9 +126,17 @@ describe('prune timing', () => {
     expect(await listSafeZone(d.stateDir), '未到期应保留').toHaveLength(1)
 
     clock += 2 * DAY
-    const status2 = createTools(d).find((t) => t.name === 'safe_zone_status')
-    if (status2 === undefined) throw new Error('missing status')
-    await status2.execute({})
+
+    /*
+     * 到期后的清理现在跑在独立子进程里，工具调用不再同步等它完成。
+     * 这里直接驱动 worker 执行体验证清理逻辑本身。
+     *
+     * 必须显式传时钟与回收替身：
+     *   - 不传 `now` 会用真实时间，条目"刚移入"不算过期；
+     *   - 不传 recycler 会真的往系统回收站扔东西。
+     */
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    await pruneNowForWorker(d.stateDir, 100, () => ({ ok: true }), () => clock)
     expect(await listSafeZone(d.stateDir), '到期后应已移入回收站').toHaveLength(0)
   })
 
@@ -147,13 +155,13 @@ describe('prune timing', () => {
   })
 
   it('states the timing honestly in status output', async () => {
-    // 用户必须知道"1 天"不是准点：清理只在工具调用时发生。
+    // 用户必须知道清理不是准点同步的，而是后台任务。
     const tools = createTools(deps())
     const status = tools.find((t) => t.name === 'safe_zone_status')
     if (status === undefined) throw new Error('missing status')
     const r = await status.execute({})
     expect(r.text).toContain('time-only, no capacity cap')
-    expect(r.text).toContain('only when a safe_zone_* tool is called')
+    expect(r.text).toContain('cleanup:')
     expect(r.text).toContain('recycle bin')
   })
 })

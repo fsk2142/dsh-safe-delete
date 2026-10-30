@@ -168,8 +168,23 @@ describe('auto-prune keeps entries it cannot recycle', () => {
     await moveToSafeZone(d.stateDir, dir, { retentionDays: 1, now: 0 })
 
     clock = 2 * DAY
-    await toolOf(createTools(d), 'safe_zone_status').execute({})
 
-    expect(await listSafeZone(d.stateDir)).toHaveLength(0)
+    /*
+     * 直接驱动 worker 的执行体。
+     *
+     * 自动清理现在跑在独立子进程里，从工具调用入口无法同步观察结果 ——
+     * 那正是修掉事故的关键（工具调用不再等清理）。所以这里测的是
+     * **worker 内部逻辑**：给定过期条目，它确实回收并把索引清干净。
+     */
+    const { pruneNowForWorker } = await import('../src/cleanup-run')
+    /*
+     * 必须传 recycler 替身：省略它会走真实 `moveToSystemRecycleBin`
+     * （PowerShell，约 1 秒/次），既慢、又真的往系统回收站扔东西。
+     */
+    const result = await pruneNowForWorker(d.stateDir, 100, () => ({ ok: true }))
+
+    expect(result.recycled, '应回收 1 条').toBe(1)
+    expect(result.skipped).toBe(0)
+    expect(await listSafeZone(d.stateDir), '索引应清空').toHaveLength(0)
   })
 })

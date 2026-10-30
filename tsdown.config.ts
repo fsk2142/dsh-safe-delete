@@ -44,6 +44,17 @@ const hostConfig: UserConfig = {
     tools: 'src/tools.ts',
     audit: 'src/audit.ts',
     'delete-core': 'src/delete-core.ts',
+    /*
+     * `cleanup-worker` **必须是独立入口**。
+     *
+     * `src/cleanup.ts` 用 `spawn(process.execPath, [workerPath, ...])` 派生它，
+     * 路径是 `lib/cleanup-worker.js`。若它被打包进 `index.js`，运行时找不到
+     * 那个文件 —— 清理会静默不执行，而宿主看起来一切正常。
+     *
+     * 这也是为什么"构建通过"不能当作验证：bundle 成功不代表那个文件
+     * 作为独立模块存在。
+     */
+    'cleanup-worker': 'src/cleanup-worker.ts',
   },
   outDir: 'lib',
   format: 'esm',

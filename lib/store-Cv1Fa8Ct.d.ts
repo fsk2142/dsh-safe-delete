@@ -95,33 +95,6 @@ interface MoveOptions {
  */
 declare function writeIndexFiltered(stateDir: string, keep: (entry: TrashEntry) => boolean): Promise<void>;
 /**
- * 只处理一个条目的**内容**（回收站或丢弃），不碰索引。
- *
- * 与 `destroyEntry` 的区别：那个连索引一起改，所以每条都要读全量 + 写全量。
- * 批量清理只在这一步逐条调用，索引由调用方最后写一次。
- *
- * ## 安全约束照旧
- *
- * 路径必须落在 `items/` 之下（双保险，即使索引被篡改也不越界）；
- * 内容已经不存在时视为成功（只差清索引）；
- * recycler 抛错或失败时**保留内容**并返回原因 —— 绝不因为回收站坏了就永久删。
- *
- * @param stateDir 安全区根目录。
- * @param id 条目 id。
- * @param options 是否永久删除、替换的回收实现。
- * @returns 成功时给出方式；失败时给出原因（内容仍在磁盘上）。
- */
-declare function discardEntryContent(stateDir: string, id: string, options?: {
-  permanent?: boolean;
-  recycler?: Recycler;
-}): Promise<{
-  ok: true;
-  via: 'recycle' | 'permanent';
-} | {
-  ok: false;
-  reason: string;
-}>;
-/**
  * 把一个路径移入安全区。
  *
  * @param stateDir 安全区根目录。
@@ -222,4 +195,4 @@ declare function destroyEntry(stateDir: string, id: string, options?: {
 /** 安全区是否为空（含磁盘上无残留条目）。 */
 declare function isEmptySafeZone(stateDir: string): Promise<boolean>;
 //#endregion
-export { listSafeZone as a, moveToSafeZone as c, Recycler as d, moveToSystemRecycleBin as f, isEmptySafeZone as i, restoreFromSafeZone as l, destroyEntry as n, listSafeZoneDetailed as o, discardEntryContent as r, moveManyToSafeZone as s, MoveOptions as t, writeIndexFiltered as u };
+export { listSafeZoneDetailed as a, restoreFromSafeZone as c, moveToSystemRecycleBin as d, listSafeZone as i, writeIndexFiltered as l, destroyEntry as n, moveManyToSafeZone as o, isEmptySafeZone as r, moveToSafeZone as s, MoveOptions as t, Recycler as u };

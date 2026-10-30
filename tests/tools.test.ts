@@ -153,8 +153,11 @@ describe('safe_zone_status', () => {
     // 保留期来自 deps（测试里是 7 天）；容量上限已从产品移除。
     expect(result.text).toMatch(/retention: 7d/)
     expect(result.text).toContain('no capacity cap')
-    // 必须说清"清理只在工具调用时发生"，否则保留期会被误解成准点。
-    expect(result.text).toContain('only when a safe_zone_* tool is called')
+    /*
+     * 清理改成独立子进程后，文案不再说"只在工具调用时清理"，
+     * 而是报**任务状态**。这里断言的是"用户能看出清理不是准点同步的"。
+     */
+    expect(result.text).toContain('cleanup:')
   })
 })
 

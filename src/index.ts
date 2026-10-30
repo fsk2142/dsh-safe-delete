@@ -26,11 +26,12 @@ import type { ClassifyEnv } from './classify'
 import { classifyPath } from './classify'
 import { isUnresolvableTarget, parseCommand } from './command'
 import { runCommand } from './commands'
+import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, humanBytes } from './delete-core'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
-import { destroyEntry, listSafeZone, restoreFromSafeZone } from './store'
+import { listSafeZone, restoreFromSafeZone } from './store'
 import { createTools, normaliseDeleteTargets, type ApprovalOutcome, type ToolDefinition } from './tools'
 
 export const name = 'dsh-safe-delete'
@@ -753,20 +754,41 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           freedBytes: selected.reduce((sum, entry) => sum + entry.bytes, 0),
         }
       }
-      // 移入**系统回收站**，不是永久删除。失败的条目留在安全区并计入 failures。
-      const removed: string[] = []
-      const failures: string[] = []
-      let movedBytes = 0
-      for (const entry of selected) {
-        const result = await destroyEntry(stateDir, entry.id)
-        if (!result.ok) {
-          failures.push(`${entry.originalPath}: ${result.reason}`)
-          continue
+
+      /*
+       * **不在这次调用里同步回收。**
+       *
+       * 原来这里是 `for (const entry of selected) await destroyEntry(...)` ——
+       * 每条一次系统回收站调用（约 1049 ms）。两万多条就是 8 小时，
+       * 而这段代码在用户的斜杠命令上同步执行，等于把宿主冻住。
+       *
+       * 现在只提交一个后台任务，立即返回任务 id。
+       */
+      const submitted = await requestCleanup({
+        stateDir,
+        limit: selected.length,
+        minIntervalMs: 0,
+      })
+
+      if (!submitted.started) {
+        return {
+          removed: [],
+          freedBytes: 0,
+          failures: [],
+          note:
+            `cleanup was not started (${submitted.reason ?? 'unknown reason'}); ` +
+            `${selected.length} item(s) are still in the safe zone. Try again in a moment.`,
         }
-        removed.push(`${entry.originalPath} (${entry.id})`)
-        movedBytes += entry.bytes
       }
-      return { removed, freedBytes: movedBytes, failures }
+
+      return {
+        removed: [],
+        freedBytes: 0,
+        failures: [],
+        note:
+          `cleanup started in the background for ${selected.length} item(s) — ` +
+          'it does not block the UI. Check progress with /safe-delete status.',
+      }
     },
     readConfig: async () => {
       // 合并：schema 默认值 + 宿主里已存的值。
@@ -798,12 +820,24 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     status: async () => {
       const entries = await listSafeZone(stateDir)
       const total = entries.reduce((sum, entry) => sum + entry.bytes, 0)
+      const job = readCleanupJob(stateDir)
+      /*
+       * 清理现在跑在独立进程里，所以这里报的是**任务状态**，不是
+       * "下次调用工具时会清一次"。原来的说法在改成后台调度后已不准确。
+       */
+      const cleanup =
+        job === null
+          ? '从未运行'
+          : `${job.outcome}${job.recycled > 0 ? `，已回收 ${job.recycled} 条` : ''}` +
+            `${job.skipped > 0 ? `，跳过 ${job.skipped} 条` : ''}` +
+            `${job.lastError === undefined ? '' : `，上次错误：${job.lastError}`}`
       return [
         `安全区目录：${stateDir}`,
         `条目数：${entries.length}`,
         `占用：${humanBytes(total)}`,
         `保留期：${retentionDays} 天（到期移入系统回收站，不是永久删除）`,
-        `自动清理：${booleanOf('autoPrune', true) ? '开（在调用工具时顺路检查一次）' : '关'}`,
+        `自动清理：${booleanOf('autoPrune', true) ? '开（后台独立进程，不阻塞界面）' : '关'}`,
+        `上次清理：${cleanup}`,
       ].join('\n')
     },
   }
@@ -1036,29 +1070,28 @@ async function maybeRunRequestedClean(
       // 不该受保留期过滤。所以直接取全部（按移入时间升序，最旧优先）。
       const selected = [...entries].sort((a, b) => a.movedAt - b.movedAt)
 
-      let moved = 0
-      for (const entry of selected) {
-        const result = await destroyEntry(opts.stateDir, entry.id)
-        if (result.ok) {
-          moved += 1
-          appendAudit(opts.stateDir, {
-            event: 'prune',
-            target: entry.originalPath,
-            detail: `id=${entry.id} bytes=${entry.bytes} via=panel-request/${result.via}`,
-          })
-        } else {
-          appendAudit(opts.stateDir, {
-            event: 'prune',
-            target: entry.originalPath,
-            detail: `id=${entry.id} skipped: ${result.reason}`,
-          })
-        }
-      }
+      /*
+       * **不同步回收**：只提交后台任务。
+       *
+       * 原来这里是 `for (const entry of selected) await destroyEntry(...)` ——
+       * 每条一次系统回收站调用（约 1049 ms）。这一轮在「点击面板按钮」的
+       * 同步路径上，几万条就等于把宿主冻住几小时。
+       *
+       * 现在交给独立子进程，这次调用只花几毫秒。
+       */
+      const submitted =
+        selected.length === 0
+          ? { started: false, reason: 'nothing to clean' }
+          : await requestCleanup({ stateDir: opts.stateDir, limit: selected.length, minIntervalMs: 0 })
 
-      // 只有真正跑过（无论移走几条）才记下已消费，避免失败时下次重试被吞掉。
-      await fs.promises.writeFile(markerPath, JSON.stringify({ consumedAt: opts.requestedAt, moved }), 'utf8')
+      // 只有真正提交过才记下已消费，避免失败时下次重试被吞掉。
+      await fs.promises.writeFile(
+        markerPath,
+        JSON.stringify({ consumedAt: opts.requestedAt, submitted: submitted.started, count: selected.length }),
+        'utf8',
+      )
       ;(ctx as { logger?: { info?: (msg: string) => void } }).logger?.info?.(
-        `[dsh-safe-delete] panel clean request: moved ${moved} entr(ies) to the recycle bin`,
+        `[dsh-safe-delete] panel clean request: ${submitted.started ? 'started background cleanup' : `not started (${submitted.reason ?? 'unknown'})`} for ${selected.length} entr(ies)`,
       )
     } finally {
       // 无论成功失败都必须释放，否则后续 apply 会一直被锁在外。
