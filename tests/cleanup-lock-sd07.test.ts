@@ -6,38 +6,47 @@ import { cleanupLockHolder, tryAcquireLock } from '../src/cleanup'
 import { scratchDir } from './support/tmpdir'
 
 /**
- * SD-07（2026-11-01 审查）：陈旧锁用 rename 接管时，仍可能搬走别人的**新**锁。
+ * RV-03 / 定版复核第 5 项：清理锁**不再自动接管**陈旧锁。
  *
- * ## 缺陷
+ * ## 为什么撤销接管
  *
- * `renameSync(lockPath, tombstone)` 不校验 inode —— 它搬走的是**当前在那个
- * 路径上的东西**。交错：
+ * 两轮审查各找出一个反例，而定版复核用真实时序证明这套协议
+ * **无法保证互斥**：
  *
  * ```
- * A: 读到旧锁，判定可接管
- * B: 读到旧锁，判定可接管
- * A: rename 走旧锁 → 建新锁 ✓，A 开始清理
- * B: rename(lockPath, tombstoneB) ← 搬走的是 A 的新锁
- * B: 建新锁 ✓，B 也开始清理
- * → 两个 worker 并行
+ * B: 读到陈旧锁，判定可接管
+ * A: 接管成功，建活锁，开始工作
+ * B: rename(lockPath, tombstoneB)   ← 搬走 A 的活锁
+ * B: token 不符 → 退出，但锁路径已经空了
+ * C: write(wx) 成功 → C 也进入工作体
+ * → A 从未被停止；A/C 同时改索引，实测 C 的更新丢失
  * ```
  *
- * ## 修复
+ * 事后比对 token 只能让 B 退出，不能让 A 恢复所有权。`renameSync` 不校验
+ * inode，"原子 rename"保证的是"只有一个能改名"，不是"只有一个能工作"。
  *
- * 改名之后读 tombstone 里的 token：
- *   - 与判读时一致 → 是我们判定过的陈旧锁，可以接管；
- *   - 不一致 → 搬走的是别人的活锁，**放弃**；
- *   - 并且**不把它放回去** —— 放回是又一次 rename，会再开一个窗口。
+ * 要真正解决需要 OS 级锁句柄（`fcntl` / `LockFileEx`），本插件零运行时
+ * 依赖做不到。
+ *
+ * ## 现在的契约
+ *
+ * | 情况 | 行为 |
+ * |---|---|
+ * | 无锁 | 建锁成功 |
+ * | 活锁（持有者活着） | 失败，锁原样保留 |
+ * | 陈旧锁（过期 + 持有者已死） | **失败**，给出原因与恢复办法 |
+ *
+ * 取舍是明确的：清理可能停摆到人工删锁，但索引不会丢更新。
  */
-describe('SD-07: stale-lock takeover verifies what it actually captured', () => {
+describe('RV-03: the cleanup lock does not take over stale locks', () => {
   /**
    * 写一把陈旧锁。
    *
    * @param state 安全区。
    * @param token 持有者 token。
-   * @param ageMs 多久以前的时间戳。
+   * @param ageMs 时间戳距今多久。
    */
-  function writeStaleLock(state: string, token: string, ageMs = 11 * 60 * 1000): void {
+  function writeStaleLock(state: string, token: string, ageMs = 60 * 60 * 1000): void {
     mkdirSync(state, { recursive: true })
     writeFileSync(
       join(state, 'cleanup.lock'),
@@ -45,113 +54,114 @@ describe('SD-07: stale-lock takeover verifies what it actually captured', () => 
     )
   }
 
-  it('takes over a genuinely stale lock', () => {
-    // 基线：真正陈旧的锁仍能接管。
-    const state = scratchDir('dsd-sd07-stale-')
-    writeStaleLock(state, 'dead-holder')
+  it('acquires an unheld lock', () => {
+    // 基线：没有锁时正常拿到。
+    const state = scratchDir('dsd-rv03-free-')
+    mkdirSync(state, { recursive: true })
 
-    expect(tryAcquireLock(state, 10 * 60 * 1000, 'new-owner'), '陈旧锁应可接管').toBe(true)
-
-    const holder = cleanupLockHolder(state)
-    expect(holder, '接管后应有锁').not.toBeNull()
+    expect(tryAcquireLock(state, 10 * 60 * 1000, 'mine'), '空锁应拿到').toBe(true)
+    expect(existsSync(join(state, 'cleanup.lock')), '应写下锁文件').toBe(true)
   })
 
-  it('refuses to take over when the captured lock is not the one judged stale', () => {
+  it('refuses a stale lock and explains how to recover', () => {
     /*
-     * 核心：模拟"判读之后、rename 之前锁被刷新"。
+     * 核心变更：陈旧锁**不再**被接管。
      *
-     * 单进程里无法精确制造那个交错，但可以直接验证结论：
-     * **改名拿到的东西 token 不符时，必须放弃。**
-     *
-     * 构造方式：写一把陈旧锁（token=old），读出内容后**立即**换成新锁
-     * （token=new、活的 pid、新时间戳）—— 此时 `tryAcquireLock` 读到的
-     * 是新的，liveness 判定会说"活着，不能接管"，直接返回 false。
-     *
-     * 这条测的是"活锁不会被抢"这一半。
+     * 必须给出原因和可操作的恢复步骤 —— 否则用户面对一个永远失败、
+     * 却不知道怎么办的状态。
      */
-    const state = scratchDir('dsd-sd07-live-')
+    const state = scratchDir('dsd-rv03-stale-')
+    writeStaleLock(state, 'dead-holder')
+
+    let reason = ''
+    const got = tryAcquireLock(state, 10 * 60 * 1000, 'new-owner', (r) => {
+      reason = r
+    })
+
+    expect(got, '陈旧锁不再自动接管').toBe(false)
+    expect(reason, '应说明持有者已不在').toMatch(/no longer running/)
+    expect(reason, '应给出删锁的恢复办法').toMatch(/delete .*cleanup\.lock/)
+    expect(reason, '应说明为什么不接管').toMatch(/cannot be proven safe|proven safe/)
+  })
+
+  it('leaves the lock file in place when refusing', () => {
+    /*
+     * **关键不变量**：拒绝时绝不能把锁搬走或删除。
+     *
+     * 旧实现的缺陷正是"搬走 A 的活锁后留下空路径"，第三者能趁机进入。
+     * 锁原样保留意味着没有这个窗口。
+     */
+    const state = scratchDir('dsd-rv03-keep-')
+    writeStaleLock(state, 'dead-holder')
+    const before = readFileSync(join(state, 'cleanup.lock'), 'utf8')
+
+    tryAcquireLock(state, 10 * 60 * 1000, 'new-owner')
+
+    expect(existsSync(join(state, 'cleanup.lock')), '锁文件必须保留').toBe(true)
+    expect(readFileSync(join(state, 'cleanup.lock'), 'utf8'), '锁内容不能变').toBe(before)
+    // 不能留下 tombstone 之类的残留。
+    const leftovers = readdirSync(state).filter((n) => n.includes('.stale-'))
+    expect(leftovers, '不该留下 tombstone').toHaveLength(0)
+  })
+
+  it('refuses a live lock without touching it', () => {
+    // 活锁：与陈旧锁一样拒绝，但不改动。
+    const state = scratchDir('dsd-rv03-live-')
+    mkdirSync(state, { recursive: true })
+    const original = JSON.stringify({ pid: process.pid, at: Date.now(), token: 'live-holder' })
+    writeFileSync(join(state, 'cleanup.lock'), original)
+
+    expect(tryAcquireLock(state, 10 * 60 * 1000, 'thief'), '活锁不能被抢').toBe(false)
+    expect(readFileSync(join(state, 'cleanup.lock'), 'utf8'), '活锁内容不能变').toBe(original)
+  })
+
+  it('does not report a stale reason for an ordinary busy lock', () => {
+    /*
+     * 回调只在"陈旧但未接管"时触发。
+     *
+     * 普通竞争（活锁被占）不该给出"删锁文件"的建议 —— 那会让用户
+     * 删掉别人正在用的锁。
+     */
+    const state = scratchDir('dsd-rv03-busy-')
     mkdirSync(state, { recursive: true })
     writeFileSync(
       join(state, 'cleanup.lock'),
-      JSON.stringify({ pid: process.pid, at: Date.now(), token: 'live-holder' }),
+      JSON.stringify({ pid: process.pid, at: Date.now(), token: 'busy' }),
     )
 
-    expect(tryAcquireLock(state, 10 * 60 * 1000, 'thief'), '活锁不能被抢').toBe(false)
+    let reason = ''
+    tryAcquireLock(state, 10 * 60 * 1000, 'other', (r) => {
+      reason = r
+    })
 
-    // 锁必须原样保留。
-    const raw = JSON.parse(readFileSync(join(state, 'cleanup.lock'), 'utf8')) as { token?: string }
-    expect(raw.token, '锁的所有者不能被改').toBe('live-holder')
-  })
-
-  it('does not leave tombstones behind after a successful takeover', () => {
-    // 成功后必须清掉 tombstone 凭证。
-    const state = scratchDir('dsd-sd07-clean-')
-    writeStaleLock(state, 'dead')
-
-    tryAcquireLock(state, 10 * 60 * 1000, 'new-owner')
-
-    const junk = readdirSync(state).filter((n) => n.includes('.stale-'))
-    expect(junk, '不该留下 stale 凭证').toHaveLength(0)
-  })
-
-  it('verifies the captured token (structural, code-level)', () => {
-    /*
-     * ## 为什么用结构断言
-     *
-     * 这是**跨进程**交错，单进程里 `tryAcquireLock` 是顺序调用的，
-     * 交错不会发生 —— 行为测试打不到（我在 index-lock 上已经踩过这个坑，
-     * 改回缺陷版本测试仍然全绿）。
-     *
-     * 所以检查代码形状：rename 之后必须读 tombstone 并比对 token。
-     */
-    const src = readFileSync('src/cleanup.ts', 'utf8')
-
-    const at = src.indexOf('const tombstone =')
-    expect(at, '应有 tombstone 接管方案').toBeGreaterThan(0)
-
-    const tail = src.slice(at, at + 2000)
-
-    // 必须读回 tombstone 并比对 token。
-    expect(tail, '必须读回 tombstone 核验 token').toMatch(/readFileSync\(tombstone/)
-    expect(tail, '必须与判读的 token 比对').toMatch(/takenToken !== holder\.token/)
-
-    /*
-     * 不许把锁 rename 放回去 —— 那会再开一个窗口（与 index-lock 的 SD-N04 同一教训）。
-     */
-    const codeOnly = tail
-      .split('\n')
-      .filter((l) => !/^\s*(\*|\/\/)/.test(l))
-      .join('\n')
-    expect(codeOnly, '不许把锁 rename 放回去').not.toMatch(/renameSync\(tombstone,\s*lockPath\)/)
-  })
-
-  it('keeps the lock file intact after a refused takeover', () => {
-    /*
-     * 拒绝接管时不能破坏现有锁 —— 否则持有者会莫名丢失锁。
-     */
-    const state = scratchDir('dsd-sd07-intact-')
-    mkdirSync(state, { recursive: true })
-    const original = JSON.stringify({ pid: process.pid, at: Date.now(), token: 'keep-me' })
-    writeFileSync(join(state, 'cleanup.lock'), original)
-
-    expect(tryAcquireLock(state, 10 * 60 * 1000, 'other')).toBe(false)
-
-    expect(readFileSync(join(state, 'cleanup.lock'), 'utf8'), '锁内容不能变').toBe(original)
+    expect(reason, '活锁不触发陈旧提示').toBe('')
   })
 
   it('reports the holder for diagnosis', () => {
-    // 诊断可见性：能查到当前持有者与判活用的 pid。
-    const state = scratchDir('dsd-sd07-diag-')
-    writeStaleLock(state, 'dead')
+    // 诊断可见性：能查到当前持有者与判活结果。
+    const state = scratchDir('dsd-rv03-diag-')
+    writeStaleLock(state, 'dead-holder')
 
-    const before = cleanupLockHolder(state)
-    expect(before?.alive, '死持有者应报 alive=false').toBe(false)
+    const holder = cleanupLockHolder(state)
+    expect(holder, '应能读到持有者').not.toBeNull()
+    expect(holder?.alive, '已死持有者应报 alive=false').toBe(false)
+  })
 
-    tryAcquireLock(state, 10 * 60 * 1000, 'new-owner')
+  it('does not move the lock anywhere (no tombstone strategy at all)', () => {
+    /*
+     * 结构性：源码里不该再出现"把锁 rename 到 tombstone"的接管方案。
+     *
+     * 这不是形状洁癖 —— 那段代码本身就是被证明不成立的协议，留着它就
+     * 会有下一个反例。这里钉住"它已经不存在"。
+     */
+    const readSrc = readFileSync
+    const src = readSrc('src/cleanup.ts', 'utf8')
+    const codeOnly = src
+      .split('\n')
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n')
 
-    const after = cleanupLockHolder(state)
-    expect(after, '接管后应有持有者').not.toBeNull()
-    expect(after?.alive, '新持有者是本进程，应活着').toBe(true)
-    expect(existsSync(join(state, 'cleanup.lock'))).toBe(true)
+    expect(codeOnly, '不该再把锁 rename 走').not.toMatch(/renameSync\(lockPath/)
+    expect(codeOnly, '不该用 tombstone 接管').not.toMatch(/\.stale-\$\{process\.pid\}/)
   })
 })

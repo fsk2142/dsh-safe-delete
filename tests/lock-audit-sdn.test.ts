@@ -44,38 +44,50 @@ describe('SD-N03: cleanup.lock takeover is atomic', () => {
     )
   }
 
-  it('takes over via rename, not delete-then-recreate (source-level check)', () => {
+  it('has no rename-based takeover left at all (source-level check)', () => {
     /*
-     * ## 为什么这是结构断言而不是行为测试
+     * ## 行为变更（2026-11-01 定版复核第 5 项）
      *
-     * 缺陷是**跨进程**交错。单进程里两次 `tryAcquireLock` 调用是顺序执行的，
-     * 交错不会发生 —— 写行为测试会得到"全绿但毫无覆盖"的结果
-     * （我在 `index-lock` 上已经踩过这个坑）。
+     * 这条原来断言"接管必须用 `renameSync` 抢占，不许删除重建"。
      *
-     * 所以检查源码形状：接管分支必须用 `renameSync` 抢占，
-     * 不得出现"rmSync(锁) 紧跟 writeFileSync(wx)"的删除重建模式。
+     * 定版复核证明 **rename 方案本身不成立**：`renameSync` 不校验 inode，
+     * 保证的是"只有一个进程能改名"，不是"只有一个能工作"。搬走活锁后
+     * 留下的空路径会让第三者 `write(wx)` 进入（详见 `cleanup.ts` 的注释）。
+     *
+     * 现在撤销了自动接管，所以这条改为钉住"那段代码已经不存在"——
+     * 留着它就会有下一个反例。
      */
     const src = readFileSync('src/cleanup.ts', 'utf8')
+    const codeOnly = src
+      .split('\n')
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n')
 
-    const at = src.indexOf('const tombstone =')
-    expect(at, '接管应使用 tombstone(rename) 方案').toBeGreaterThan(0)
-
-    const tail = src.slice(at, at + 1500)
-    expect(tail, '接管必须用 renameSync 抢占').toMatch(/renameSync\(lockPath, tombstone\)/)
-    expect(tail, '不许用 rmSync(lockPath) 做接管').not.toMatch(
-      /rmSync\(lockPath[^)]*\)[\s\S]{0,80}writeFileSync\(lockPath/,
-    )
+    expect(codeOnly, '不该再把锁 rename 走').not.toMatch(/renameSync\(lockPath/)
+    expect(codeOnly, '不该有 tombstone 接管').not.toMatch(/const tombstone =/)
   })
 
-  it('still takes over a stale lock held by a dead process', () => {
-    // 基本能力不受影响。
+  it('refuses a stale lock held by a dead process instead of taking it over', () => {
+    /*
+     * 定版复核第 5 项：陈旧锁不再自动接管。
+     *
+     * 代价是清理可能停摆到人工删锁；收益是不会有两个工作体同时改索引。
+     */
     const state = scratchDir('dsd-sdn03-takeover-')
     writeStaleLock(state, 'dead-holder')
 
-    expect(tryAcquireLock(state, 10 * 60 * 1000, 'new-owner'), '过期且持有者已死应可接管').toBe(true)
+    let reason = ''
+    expect(
+      tryAcquireLock(state, 10 * 60 * 1000, 'new-owner', (r) => {
+        reason = r
+      }),
+      '不再自动接管',
+    ).toBe(false)
 
+    // 原锁必须原样保留（没有被新持有者替换）。
     const raw = JSON.parse(readFileSync(join(state, 'cleanup.lock'), 'utf8')) as { token?: string }
-    expect(raw.token, '新锁应属于接管者').toBe('new-owner')
+    expect(raw.token, '旧锁不能被替换').toBe('dead-holder')
+    expect(reason, '应给出恢复办法').toMatch(/delete .*cleanup\.lock/)
   })
 
   it('does not leave tombstone files behind', () => {

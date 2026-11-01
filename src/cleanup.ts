@@ -149,10 +149,23 @@ function isAlive(pid: number): boolean {
  * @param stateDir 安全区目录。
  * @param staleMs 多久算过期。
  * @param token 本次要写入锁的 owner token。
+ * @param onStale 检测到"过期但持有者已死"时收到原因说明（本轮**不接管**）。
  * @returns 拿到锁返回 true。
  */
-function tryAcquireLock(stateDir: string, staleMs: number, token: string): boolean {
+function tryAcquireLock(
+  stateDir: string,
+  staleMs: number,
+  token: string,
+  onStale?: (reason: string) => void,
+): boolean {
   const lockPath = join(stateDir, LOCK_FILE)
+  /*
+   * 检测到"陈旧但无法安全接管"时把原因交出去。
+   *
+   * 为什么用回调而不是返回值对象：调用点（`requestCleanup`）把它转成
+   * `scheduled.reason`，用户能看到"为什么没开始清理、怎么恢复"。
+   */
+  let staleLockReason: string | undefined
   try {
     // `wx` 是原子的：文件已存在就失败。
     writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' })
@@ -177,89 +190,56 @@ function tryAcquireLock(stateDir: string, staleMs: number, token: string): boole
       const holderAlive = typeof livenessPid === 'number' && isAlive(livenessPid)
       if (age > staleMs && !holderAlive) {
         /*
-         * 过期且持有者已死：接管。
+         * ## 不再自动接管陈旧锁（2026-11-01 定版复核第 5 项）
          *
-         * ## 必须用 rename 抢占，不能"删了再建"（2026-10-30 复审 SD-N03）
+         * ## 为什么停止
          *
-         * `rmSync(lock) → writeFileSync(wx)` 是两步：
+         * 前两版的接管协议是 `renameSync(lock, tombstone)` + 事后比对 token。
+         * 两轮审查各找出一个反例，而第三个反例证明**这套协议本身无法证明
+         * 互斥**。定版复核实测的完整交错：
          *
          * ```
-         * A: 读到旧锁，判定可接管
-         * B: 读到旧锁，判定可接管
-         * A: rmSync(旧锁) → write(wx) 成功，A 派发 Worker
-         * B: rmSync(锁路径) —— 删掉的是 A 刚建的新锁！
-         * B: write(wx) 成功，B 也派发 Worker
-         * → 两个 Worker 并行清理
+         * B: 读到陈旧锁，判定可接管
+         * A: 接管成功，建了活锁，开始工作
+         * B: rename(lockPath, tombstoneB)  ← 搬走的是 A 的活锁
+         * B: 读 token，发现不符 → 退出
+         *    但锁路径已经空了 ← 这是关键
+         * C: write(wx) 成功 → C 也进入工作体
+         * → A 从未被停止，A/C 同时运行
          * ```
          *
-         * `renameSync(lock, tombstone)` 是原子的：只有一个进程能把它改走，
-         * 另一个拿到 ENOENT。这与 `index-lock.ts` 用的是同一套方案 ——
-         * 那里已经修过，这里当时漏了。
+         * 复核用真实 `withIndexLock` 两个工作体验证：`overlap=true`，
+         * 两者读同一初值后分别写入，最终只剩 A，**C 的更新丢失**。
+         *
+         * 事后比对 token 只能让 B 退出，不能让 A 恢复对锁的所有权。
+         *
+         * ## 现在的行为
+         *
+         * 检测到"过期 + 持有者已死"时，**不接管**，返回失败并给出可操作的
+         * 说明。代价是清理可能停摆到人工介入；收益是不会有两个工作体同时
+         * 改索引。**宁可停下，也不能丢数据。**
+         *
+         * 恢复办法见 `staleLockMessage()`。
          */
-        const tombstone = `${lockPath}.stale-${process.pid}-${Date.now().toString(36)}`
-        try {
-          renameSync(lockPath, tombstone)
-        } catch {
-          // 文件已不在原名：别人抢先接管了。
-          return false
-        }
-        /*
-         * ## 必须核验"搬走的到底是不是我们判定过的那把锁"
-         * （2026-11-01 审查 SD-07）
-         *
-         * `renameSync` 不校验 inode —— 它只是把**当前在那个路径上的东西**
-         * 改走。于是这个交错仍然成立：
-         *
-         * ```
-         * A: 读到旧锁，判定可接管
-         * B: 读到旧锁，判定可接管
-         * A: rename 走旧锁 → 建新锁 ✓，A 开始清理
-         * B: rename(lockPath, tombstoneB) ← 搬走的是 **A 的新锁**
-         * B: 建新锁 ✓，B 也开始清理
-         * → 两个 worker 并行
-         * ```
-         *
-         * 所以改名之后要读一下 tombstone 里的 token：
-         *   - 与判读时一致 → 确实是我们判定过的那把陈旧锁，可以接管；
-         *   - 不一致 → 搬走的是别人刚建的活锁。**放弃**，并且**不要**
-         *     把它放回去 —— 放回是又一次 rename，期间锁路径空出来，
-         *     第三方能趁机拿锁（这与 index-lock 的 SD-N04 是同一个教训）。
-         */
-        let takenToken: string | undefined
-        try {
-          const captured = JSON.parse(readFileSync(tombstone, 'utf8')) as { token?: string }
-          takenToken = captured.token
-        } catch {
-          /* 内容读不出来：它本来就是坏的，继续接管 */
-        }
-        if (takenToken !== undefined && takenToken !== holder.token) {
-          /*
-           * 搬走的是别人的活锁。放弃本轮。
-           *
-           * 不把它放回去：放回的 rename 会再开一个窗口。
-           * 让它留在 tombstone 里，那个持有者会发现锁不见了 ——
-           * 比"锁还在但内容被换过"更容易诊断。
-           */
-          return false
-        }
-        try {
-          writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' })
-          rmSync(tombstone, { force: true })
-          return true
-        } catch {
-          // 新锁建不出来（别人抢先了）：清掉凭证并让出。
-          try {
-            rmSync(tombstone, { force: true })
-          } catch {
-            /* 无所谓，它本来就是陈旧的 */
-          }
-          return false
-        }
+        staleLockReason =
+          `the cleanup lock is held by a process that is no longer running ` +
+          `(pid ${String(livenessPid)}, ${Math.round(age / 1000)}s old). ` +
+          'Automatic takeover is disabled because it cannot be proven safe: ' +
+          'a taker can move a live lock away, leaving the path empty for a third process. ' +
+          `To clear it, delete ${lockPath} and retry.`
+        return false
       }
     } catch {
       /* 锁文件损坏，当作被占用 */
     }
     return false
+  } finally {
+    /*
+     * 把"陈旧但未接管"的原因交给调用方。
+     *
+     * 只在真的检测到这种情况时回调，正常竞争（活锁）不触发。
+     */
+    if (staleLockReason !== undefined) onStale?.(staleLockReason)
   }
 }
 
@@ -416,8 +396,21 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
    */
   const ownerToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
-  if (!tryAcquireLock(stateDir, 10 * 60 * 1000, ownerToken)) {
-    return { started: false, reason: 'another cleanup holds the lock' }
+  /*
+   * 锁拿不到时把**具体原因**带给用户（2026-11-01 定版复核第 5 项）。
+   *
+   * "另一个清理持有锁"和"锁陈旧但无法安全接管"是完全不同的处境：
+   * 前者等一会儿就好，后者需要人工删除锁文件。混成一句话会让用户
+   * 一直重试一个永远不会自己恢复的状态。
+   */
+  let staleReason: string | undefined
+  if (!tryAcquireLock(stateDir, 10 * 60 * 1000, ownerToken, (reason) => {
+    staleReason = reason
+  })) {
+    return {
+      started: false,
+      reason: staleReason ?? 'another cleanup holds the lock',
+    }
   }
 
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`

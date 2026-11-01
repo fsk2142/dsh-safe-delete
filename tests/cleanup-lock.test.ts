@@ -77,11 +77,27 @@ describe('cleanup lock ownership', () => {
     releaseCleanupLock(state, 'tok-xyz')
   })
 
-  it('takes over a stale lock whose holder is dead', () => {
+  it('refuses to take over a stale lock whose holder is dead, and says why', () => {
     /*
-     * 崩溃恢复：持有者已死且锁过期 → 新任务可以接管。
+     * ## 行为变更（2026-11-01 定版复核第 5 项）
      *
-     * 用一个几乎不可能是真实进程的 pid 模拟"持有者已死"。
+     * 这条原来断言"过期且持有者已死 → 可以接管"。
+     *
+     * 定版复核用真实时序证明接管协议**无法保证互斥**：
+     *
+     * ```
+     * B: 读到陈旧锁，判定可接管
+     * A: 接管成功，建活锁，开始工作
+     * B: rename(lockPath, tombstoneB)   ← 搬走 A 的活锁
+     * B: token 不符 → 退出，但锁路径已经空了
+     * C: write(wx) 成功 → C 也进入工作体
+     * → A 从未被停止，A/C 同时改索引，实测 C 的更新丢失
+     * ```
+     *
+     * 事后比对 token 只能让 B 退出，不能让 A 恢复所有权。
+     *
+     * 所以现在**不接管**，返回 false 并把恢复办法交出来。代价是清理可能
+     * 停摆到人工介入；收益是不会丢索引数据。
      */
     const state = scratchDir('dsd-lock-stale-')
     mkdirSync(state, { recursive: true })
@@ -90,8 +106,16 @@ describe('cleanup lock ownership', () => {
       JSON.stringify({ pid: 999_999_999, at: Date.now() - 60 * 60 * 1000, token: 'dead' }),
     )
 
-    expect(tryAcquireLock(state, 1000, 'tok-new'), '过期且持有者已死应可接管').toBe(true)
-    expect(releaseCleanupLock(state, 'tok-new')).toBe(true)
+    let reason = ''
+    const got = tryAcquireLock(state, 1000, 'tok-new', (r) => {
+      reason = r
+    })
+
+    expect(got, '不再自动接管陈旧锁').toBe(false)
+    expect(reason, '必须说明原因与恢复办法').toMatch(/no longer running/)
+    expect(reason, '必须给出可操作的恢复步骤').toMatch(/delete .*cleanup\.lock/)
+    // 锁必须原样保留（不能被搬走、不能留空路径给第三者）。
+    expect(existsSync(join(state, 'cleanup.lock')), '锁文件不能被移走').toBe(true)
   })
 
   it('does not steal a fresh lock from a live holder', () => {

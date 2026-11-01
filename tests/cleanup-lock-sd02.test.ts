@@ -59,12 +59,17 @@ describe('SD-02: cleanup lock survives a crashed worker', () => {
     expect(took, '没有 workerPid 时按 pid 判存活（此处活着，不该接管）').toBe(false)
   })
 
-  it('takes over when the worker pid is dead, even though the dispatcher is alive', () => {
+  it('detects a dead worker but no longer takes the lock over', () => {
     /*
-     * SD-02 的核心修复：workerPid 已死 + 锁过期 → 必须能接管，
-     * 即使创建锁的主进程仍然活着。
+     * ## 行为变更（2026-11-01 定版复核第 5 项）
      *
-     * 用一个几乎不可能存在的 pid 模拟"worker 已经死了"。
+     * 这条原来断言"worker 已死 + 锁过期 → 必须能接管"。
+     *
+     * SD-02 的**存活判定**修复仍然有效且必要（`workerPid` 已死时不能因为
+     * 主进程活着就认为锁还活着）—— 那段逻辑保留并继续测。但检测到"陈旧"
+     * 之后**不再自动接管**，因为接管协议本身无法保证互斥（见 `cleanup.ts`）。
+     *
+     * 所以这里验证两件事：判活仍然正确；据此拒绝接管并给出恢复办法。
      */
     const state = scratchDir('dsd-sd02-deadworker-')
     writeLock(state, {
@@ -74,13 +79,24 @@ describe('SD-02: cleanup lock survives a crashed worker', () => {
       token: 'crashed-worker',
     })
 
-    const took = tryAcquireLock(state, 10 * 60 * 1000, 'new-owner')
-    expect(took, 'worker 已死且锁过期，必须能接管').toBe(true)
+    /*
+     * 判活仍正确：主进程活着但 worker 已死 → 锁算陈旧。
+     * 这正是 SD-02 要修的点，必须保留。
+     */
+    const holderBefore = cleanupLockHolder(state)
+    expect(holderBefore?.alive, '应识别出 worker 已死（SD-02 的修复保留）').toBe(false)
 
-    // 接管后锁属于新持有者。
-    const holder = cleanupLockHolder(state)
-    expect(holder, '接管后应有锁').not.toBeNull()
-    expect(holder?.workerPid, '新锁尚未绑定 worker').toBeNull()
+    let reason = ''
+    const took = tryAcquireLock(state, 10 * 60 * 1000, 'new-owner', (r) => {
+      reason = r
+    })
+    expect(took, '陈旧锁不再自动接管').toBe(false)
+    expect(reason, '应说明持有者已不在').toMatch(/no longer running/)
+    expect(reason, '应给出恢复办法').toMatch(/delete .*cleanup\.lock/)
+
+    // 原锁保留，没有被替换。
+    const raw = JSON.parse(readFileSync(join(state, 'cleanup.lock'), 'utf8')) as { token?: string }
+    expect(raw.token, '旧锁不能被替换').toBe('crashed-worker')
   })
 
   it('does not steal the lock while the worker is alive', () => {
