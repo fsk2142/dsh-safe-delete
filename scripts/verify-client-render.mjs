@@ -40,10 +40,21 @@ const requireImpl = (name) => {
 }
 
 let registeredComponent = null
+/*
+ * ## 真正的导出必须**存下来**（2026-11-01 审查 SD-19）
+ *
+ * 客户端 bundle 是 UMD 形态：`__ModuleLoader__.load({ factory })` 的
+ * factory 返回值才是模块导出。而脚本里 `moduleShim.exports` 是个独立的
+ * 空对象 —— 依赖它的检查因此永远拿不到组件，然后静默跳过。
+ *
+ * 这里把 factory 的返回值留住，供后面的字段检查使用。
+ */
+let clientModuleExports = null
 const fakeWindow = {
   __ModuleLoader__: {
     load: (definition) => {
       const exports = definition.factory(requireImpl)
+      clientModuleExports = exports
       const ctx = {
         slots: {
           inject: (name, factory) => factory(),
@@ -180,20 +191,58 @@ if (typeof registeredComponent === 'function') {
     const text = describeTree(tree)
     console.log(`  首次渲染（loading 状态）内容: ${JSON.stringify(text.slice(0, 40))}`)
 
-    // 直接渲染表单组件本体，绕过 loading 判断 —— 验证字段标签存在于源码树里。
-    const moduleExports = moduleShim.exports
+    /*
+     * ## 这一段原本是"假绿"（2026-11-01 审查 SD-19）
+     *
+     * 三个问题：
+     *
+     * 1. `moduleShim.exports` 是**空对象** —— 真正的导出由 loader factory
+     *    返回，所以 `moduleExports['SafeZoneSettings']` 永远是 undefined，
+     *    `typeof Form === 'function'` 直接跳过整段检查，**不报错**。
+     * 2. `expectedLabels` 里还写着已删除的容量字段（最大安全区容量、
+     *    提前清理阈值、定时清理间隔）—— 那三项早已从产品移除。
+     * 3. 字段"检查"退化成 `readFileSync(...).includes(label)` ——
+     *    源码里有这个字符串就算通过，与"渲染出字段"无关。
+     *
+     * 现在：拿不到组件就**明确失败**，只检查**当前真实存在**的字段，
+     * 且只认渲染树里的文案。
+     */
+    const moduleExports = clientModuleExports ?? moduleShim.exports
     const Form = moduleExports['SafeZoneSettings']
-    if (typeof Form === 'function') {
-      const formTree = Form({})
-      const formText = collect(formTree, 0, new Set())
-      const expectedLabels = ['最大安全区容量', '提前清理阈值', '定时清理间隔', '单次删除条目数确认', '单次删除大小确认']
-      console.log('\n=== 字段是否都在元素树里 ===')
-      for (const label of expectedLabels) {
-        // loading 状态下字段还没渲染，这里检查的是源码里的文案存在性
-        const found = formText.includes(label) || readFileSync('src/client/index.tsx', 'utf8').includes(label)
-        console.log(`${found ? 'ok  ' : 'MISSING'}  ${label}`)
-        if (!found) problems.push(`表单里找不到字段「${label}」`)
+    if (typeof Form !== 'function') {
+      // 不能静默跳过 —— 那正是这段脚本一直在"通过"的原因。
+      problems.push(
+        '拿不到 SafeZoneSettings 组件：模块导出里没有它。' +
+          '（这是验证脚本自身的问题，不是组件缺失。）',
+      )
+    } else {
+      /*
+       * ## 这个脚本**不做**字段渲染验证（2026-11-01 审查 SD-19 的结论）
+       *
+       * 我最初想在这里"直接调用组件、检查字段标签"。实测行不通：
+       * 组件首帧是 loading 壳，`Form({})` 只会返回"正在读取配置…"，
+       * 字段要等 `describe()` 异步回填后才出现 —— 而那需要真实 React
+       * 生命周期（useEffect/useState），这个 fake React 不提供。
+       *
+       * 所以这里只做**编译器层面的确认**：组件是函数、能无参调用而不抛。
+       * 字段是否真的渲染，由 `tests/client-interaction.test.ts` 和
+       * `tests/bytes-unit-sd09.test.ts` 用 jsdom + 真实 react-dom 验证 ——
+       * 那才是能证伪的测法。
+       *
+       * 明确写出这条边界，比让脚本"看起来在检查字段"更有用。
+       */
+      let callable = false
+      try {
+        Form({})
+        callable = true
+      } catch (error) {
+        problems.push(`组件无法无参调用: ${error instanceof Error ? error.message : String(error)}`)
       }
+      console.log('\n=== 组件可调用性 ===')
+      console.log(`${callable ? 'ok  ' : 'FAIL'}  SafeZoneSettings 可无参调用`)
+      console.log(
+        '(字段渲染验证见 tests/client-interaction.test.ts —— 需要真实 React 生命周期)',
+      )
     }
   } catch (error) {
     problems.push(`字段检查失败: ${error instanceof Error ? error.message : String(error)}`)

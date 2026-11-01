@@ -41,6 +41,46 @@ function codeDefault(key) {
   return null
 }
 
+/**
+ * 去掉 Markdown/引号装饰。
+ *
+ * @param {string} text 原始文本。
+ * @returns 规范化后的文本。
+ */
+function normalizeText(text) {
+  return text
+    .replace(/[`'"]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * 把"默认值"尽力求值成数字。
+ *
+ * 两侧的形态不同：文档里是 `` `5000` ``，代码里可能是
+ * `2 * 1024 * 1024 * 1024` 这样的**表达式**。粗略字符串比较会假失败，
+ * 所以先求值。
+ *
+ * 只接受由数字、空白和 `* + - / ( )` 组成的表达式 —— 不 eval 任意代码。
+ *
+ * @param {string | null} text 原文。
+ * @returns 数字；求不出来时 null。
+ */
+function toNumber(text) {
+  if (text === null) return null
+  const cleaned = normalizeText(text)
+  if (cleaned === '') return null
+  // 只允许数字与算术符号，其余一律不求值。
+  if (!/^[0-9\s*+\-/().]+$/.test(cleaned)) return null
+  try {
+    // 上面已限制字符集，这里不存在注入面。
+    const value = Function(`"use strict"; return (${cleaned})`)()
+    return typeof value === 'number' && Number.isFinite(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
 const documentedKeys = [
   // 容量相关的三个字段（maxBytes / pruneAtPercent / autoPruneIntervalMs）
   // 已从产品移除，不再要求文档列出。
@@ -51,11 +91,37 @@ const documentedKeys = [
 
 console.log('=== README 配置表 vs 实现默认值 ===')
 for (const key of documentedKeys) {
-  const doc = docDefault(key)
-  const code = codeDefault(key)
-  console.log(`${doc !== null ? 'ok  ' : 'CHECK'}  ${key.padEnd(20)} 文档=${doc ?? '(未列出)'}  代码=${code ?? '(未找到)'}`)
-  if (doc === null) mismatches.push(`${key}: 文档未列出`)
-  if (code === null) mismatches.push(`${key}: 实现里找不到默认值`)
+  const rawDoc = docDefault(key)
+  const rawCode = codeDefault(key)
+  /*
+   * ## 必须比较**数值**，不能只看"是否存在"（2026-11-01 审查 SD-20）
+   *
+   * 第一版只在 `doc === null` 时记不匹配 —— 于是文档写 99、代码是 1，
+   * 打印出 `文档=99 代码=1` 却仍然算 `ok` 并报告"文档与实现一致"。
+   *
+   * 一个只检查"有没有这个字段"的校验，对"字段值对不对"完全无感。
+   *
+   * ## 两边都要规范化再比
+   *
+   * 文档侧取到的是 Markdown 表格单元格（可能带反引号、空格），
+   * 代码侧可能是 `2 * 1024 * 1024 * 1024` 这样的**表达式**。
+   * 粗略字符串比较会把它们判成不同 —— 那是假失败。
+   *
+   * 这里把两边都求值成数字再比；求不出来就退回字符串比较。
+   */
+  const docNum = toNumber(rawDoc)
+  const codeNum = toNumber(rawCode)
+  const same =
+    docNum !== null && codeNum !== null
+      ? docNum === codeNum
+      : rawDoc !== null && rawCode !== null && normalizeText(rawDoc) === normalizeText(rawCode)
+
+  console.log(
+    `${same ? 'ok  ' : 'CHECK'}  ${key.padEnd(20)} 文档=${rawDoc ?? '(未列出)'}  代码=${rawCode ?? '(未找到)'}`,
+  )
+  if (rawDoc === null) mismatches.push(`${key}: 文档未列出`)
+  else if (rawCode === null) mismatches.push(`${key}: 实现里找不到默认值`)
+  else if (!same) mismatches.push(`${key}: 文档写 ${rawDoc}，实现是 ${rawCode}`)
 }
 
 // schema 里声明了 volatile 的字段，必须都能在 README 表里找到 ——
