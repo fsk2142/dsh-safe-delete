@@ -318,12 +318,34 @@ export function recoverBatch(stateDir: string, batchId: string): BatchRecovery {
   }
 
   /*
-   * 只有全部条目都有确定归属时才删批次目录：
-   * 还有内容躺在里面就不能删（那是用户数据）。
+   * ## 只有**确认**批次里没有内容时才删（2026-11-01 审查 SD-01）
+   *
+   * 第一版是：
+   *
+   * ```
+   * const leftovers = existsSync(staged) ? listDirSafe(staged) : []
+   * if (leftovers.length === 0) rmSync(bDir, { recursive: true })
+   * ```
+   *
+   * 而 `listDirSafe` 遇到**任何**读取错误都返回 `[]`。于是"读不出来"
+   * 被当成了"里面是空的"，随后递归删除 —— 把唯一的用户副本删掉。
+   *
+   * **读取失败不是空目录的证明。** 读与删是不同系统调用，权限与瞬时错误
+   * 可以不同：枚举遇到瞬时 EIO，删除却仍能成功。
+   *
+   * 现在用三态结果：`readDirState` 明确区分
+   *   - `empty`：确实读到了、且是空的 → 可以删；
+   *   - `nonempty`：有内容 → 不能删；
+   *   - `error`：读失败 → **不确定，一律保留**。
+   *
+   * 另外：只要有任何一条恢复结果不是确定归宿（`recovery-failed` / `missing`），
+   * 也一律保留批次目录。内容可能还在里面，我们只是没能搬回去。
    */
-  const leftovers = existsSync(staged) ? listDirSafe(staged) : []
+  const stagedState = readDirState(staged)
+  const allResolved = results.every((r) => r.outcome === 'moved-back' || r.outcome === 'left-in-place')
   let batchRemoved = false
-  if (leftovers.length === 0) {
+
+  if (stagedState.kind === 'empty' && allResolved) {
     try {
       rmSync(bDir, { recursive: true, force: true })
       batchRemoved = true
@@ -336,18 +358,35 @@ export function recoverBatch(stateDir: string, batchId: string): BatchRecovery {
 }
 
 /**
- * 安全地列目录。
+ * 读目录的三种结果。
+ *
+ * 为什么不是 `string[]`：调用方需要区分"空了"和"读不到"。
+ * 前者可以删，后者必须保留 —— 把两者混成 `[]` 是 SD-01 的成因。
+ */
+type DirState = { kind: 'empty' } | { kind: 'nonempty'; names: string[] } | { kind: 'error'; reason: string }
+
+/**
+ * 读一个目录，明确区分空 / 非空 / 读失败。
  *
  * @param dir 目录。
- * @returns 条目名；读不到时为空数组。
+ * @returns 三态结果。
  */
-function listDirSafe(dir: string): string[] {
+function readDirState(dir: string): DirState {
+  let names: string[]
   try {
-    return readdirSync(dir)
-  } catch {
-    return []
+    names = readdirSync(dir)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    /*
+     * ENOENT：目录确实不存在 —— 那可以当作"没有内容"。
+     * 其他错误（EACCES、EIO、EPERM…）是"不知道"，必须当非空处理。
+     */
+    if (code === 'ENOENT') return { kind: 'empty' }
+    return { kind: 'error', reason: error instanceof Error ? error.message : String(error) }
   }
+  return names.length === 0 ? { kind: 'empty' } : { kind: 'nonempty', names }
 }
+
 
 /**
  * 判断某个路径是否存在**且是目录**。

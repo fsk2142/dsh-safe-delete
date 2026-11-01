@@ -1050,25 +1050,70 @@ function placeNoReplace(
       throw openError
     }
     try {
+      /*
+       * ## 必须循环写，并检查实际写入长度（2026-11-01 审查 SD-02）
+       *
+       * 第一版是 `writeSync(fd, data, 0, data.length, 0)` —— 一次调用，
+       * **不检查返回值**。而 `writeSync` 返回的是**实际写入**的字节数，
+       * 不保证一次写完整块（磁盘满、信号中断、文件系统限制）。
+       *
+       * 后果：短写时目标只落进去一部分，代码却认为成功 → 关闭 fd →
+       * **删除安全区里的完整源** → 用户拿到截断的文件，唯一副本已没了。
+       *
+       * 现在循环推进 offset 直到写完。任何一次零进展都视为失败。
+       */
       const data = readFileSync(source)
-      writeSync(fd, data, 0, data.length, 0)
+      let written = 0
+      while (written < data.length) {
+        const n = writeSync(fd, data, written, data.length - written, written)
+        if (n <= 0) {
+          /*
+           * 零/负进展：底层没有接受任何字节。继续循环会死循环，
+           * 必须失败 —— 内容仍在 source，调用方不会删它。
+           */
+          throw new Error(
+            `short write while restoring: ${written} of ${data.length} bytes written, then no progress`,
+          )
+        }
+        written += n
+      }
       closeSync(fd)
     } catch (writeError) {
+      /*
+       * ## 失败时**不做任何清理**（2026-11-01 审查 SD-04）
+       *
+       * 第一版在关闭 fd 后执行 `writeFileSync(candidate, '')` 把目标清空，
+       * 注释理由是"空文件里没有别人的数据可丢"。
+       *
+       * 那个理由不成立：关闭 fd 之后，`candidate` 这个**路径**可能已经被
+       * 另一个进程替换成它自己的文件。按路径清零清掉的就是别人的内容。
+       *
+       * ## 为什么连 ftruncate 也不做
+       *
+       * 我一开始改成 `ftruncateSync(fd, 0)`，理由是"fd 指向我们自己的 inode"。
+       * 隔离实验证明这**只对一种情况安全**：
+       *
+       * | 竞争者的动作 | ftruncate 的后果 |
+       * |---|---|
+       * | `unlink` 后新建（真正的替换） | 作用在已摘链的旧 inode 上，安全 |
+       * | 直接写同一个文件（`writeFileSync`） | **清空对方刚写的内容** |
+       *
+       * 第二种情况下 `writeFileSync` 打开的就是我们 `open(wx)` 创建的那个
+       * inode —— ftruncate 截断的正是它。所以 ftruncate 并不安全。
+       *
+       * ## 现在的做法：什么都不做
+       *
+       * - 关掉 fd，让可能的半成品留在目标路径上（用户能看到，也能删）；
+       * - **不碰那个路径**；
+       * - 安全区的源完整保留（删源只发生在成功路径上）；
+       * - 把错误抛上去，调用方会换下一个候选。
+       *
+       * 宁可留下一个不完整的文件让用户判断，也不去动可能是别人的东西。
+       */
       try {
         closeSync(fd)
       } catch {
         /* 已经关了 */
-      }
-      /*
-       * 写入失败：把目标清成 0 字节而不是删除。
-       *
-       * 删除会留下"路径空出来"的窗口；留一个空文件则保持路径被占，
-       * 且空文件里没有别人的数据可丢。
-       */
-      try {
-        writeFileSync(candidate, '')
-      } catch {
-        /* 尽力而为 */
       }
       throw writeError
     }
