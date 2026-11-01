@@ -948,8 +948,9 @@ export async function listSafeZoneUnordered(
  *
  * @param source 源目录。
  * @param target 已由我们 `mkdir` 创建的空目标目录。
+ * @param keepSource 保留源（递归层传 true；顶层提交时用默认 false）。
  */
-function mergeDirectoryNoOverwrite(source: string, target: string): void {
+function mergeDirectoryNoOverwrite(source: string, target: string, keepSource = false): void {
   let names: string[]
   try {
     names = readdirSync(source)
@@ -1068,7 +1069,8 @@ function mergeDirectoryNoOverwrite(source: string, target: string): void {
         throw error
       }
       // 递归；子层冲突同样冒泡成 claim-polluted。
-      mergeDirectoryNoOverwrite(from, to)
+      // `keepSource = true`：递归层**不删**源（RV-02），由顶层统一提交。
+      mergeDirectoryNoOverwrite(from, to, true)
       continue
     }
 
@@ -1118,11 +1120,127 @@ function mergeDirectoryNoOverwrite(source: string, target: string): void {
   }
 
   /*
-   * 全部搬完 —— 现在才删源。
+   * ## 递归层**不得**删源（2026-11-01 定版复核第 2 项，RV-02）
    *
-   * 中途失败时源保持完整（上面的 throw 都不会执行到这里）。
+   * 第一版在这里无条件 `rmSync(source, {recursive:true})` —— 每次递归返回
+   * 都删掉那一层在安全区里的源。于是这个交错会拆散内容：
+   *
+   * ```
+   * 源树：[a-dir/only.txt, z.txt]
+   * 1. 合并 a-dir → 成功 → 删掉源里的 a-dir    ← 已经不可逆
+   * 2. 合并 z.txt → 竞争者在那个名字上放了东西 → claim-polluted → 换候选
+   * 3. 新候选里只剩 z.txt（a-dir 已从安全区消失）
+   * 4. 返回成功，索引清空
+   * ```
+   *
+   * 用户拿到的 `restoredTo` 只有 z.txt，a-dir 却留在**另一个**候选目录里
+   * 与竞争者共存。报告的位置不是完整结果，重试也救不回来。
+   *
+   * 现在：`keepSource` 为 true 时只复制/建链，**不删源**。调用方在整个
+   * 顶层候选确认完整后，统一删一次顶层源。
+   *
+   * 注意这个 `rmSync` 只对**顶层**执行（`keepSource === false`）。
    */
-  rmSync(source, { recursive: true, force: true })
+  if (!keepSource) {
+    rmSync(source, { recursive: true, force: true })
+  }
+}
+
+/**
+ * 判断重建一个链接该用什么类型。
+ *
+ * ## Windows 的类型陷阱（本轮实测）
+ *
+ * - `'junction'`：**不要求**目标存在 → 断链只能用它重建；
+ * - `'file'`：要求目标存在，否则 `EPERM`。
+ *
+ * 所以：能 `stat` 到 → 按目标是目录还是文件选；`stat` 失败（断链）→ junction。
+ *
+ * POSIX 上类型参数无意义，统一返回 `'file'`（Node 只在 Windows 解释它）。
+ *
+ * @param linkPath 链接本身（`stat` 会跟随到目标）。
+ * @returns 传给 `symlinkSync` 的类型。
+ */
+function linkTypeOf(linkPath: string): 'junction' | 'file' {
+  if (process.platform !== 'win32') return 'file'
+  try {
+    return statSync(linkPath).isDirectory() ? 'junction' : 'file'
+  } catch {
+    // 断链：junction 不要求目标存在。
+    return 'junction'
+  }
+}
+
+/**
+ * 把"顶层就是链接"的内容以 no-replace 方式放回原位置。
+ *
+ * 与 `placeNoReplace` 的区别：那个处理文件/目录的搬移；链接既不能用
+ * `linkSync`（硬链接改变语义），也不该跨卷复制目标内容。所以单独一条路径。
+ *
+ * @param desired 期望落点。
+ * @param source 安全区里的源链接。
+ * @param linkTarget 原链接的目标（原样写回）。
+ * @param stamp 候选后缀用的时间戳。
+ * @returns 实际落点。
+ */
+function placeLinkNoReplace(
+  desired: string,
+  source: string,
+  linkTarget: string,
+  stamp: string,
+): string {
+  let lastError: unknown
+
+  for (let i = 0; i < 100; i += 1) {
+    const candidate = restoreCandidate(desired, i, stamp)
+    try {
+      mkdirSync(path.dirname(candidate), { recursive: true })
+    } catch (error) {
+      lastError = error
+      continue
+    }
+
+    const primary = linkTypeOf(source)
+    try {
+      symlinkSync(linkTarget, candidate, primary)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') continue // 候选被占，换下一个
+      /*
+       * 类型不匹配（断链 vs 普通链接）：换另一种再试同一个候选。
+       */
+      if (code === 'EPERM' || code === 'EINVAL') {
+        const alt = primary === 'junction' ? 'file' : 'junction'
+        try {
+          symlinkSync(linkTarget, candidate, alt)
+        } catch (retryError) {
+          const retryCode = (retryError as NodeJS.ErrnoException).code
+          if (retryCode === 'EEXIST') continue
+          throw new Error(`cannot recreate the link ${candidate}: ${String(retryError)}`)
+        }
+      } else {
+        throw new Error(`cannot recreate the link ${candidate}: ${String(error)}`)
+      }
+    }
+
+    /*
+     * 链接建好 —— 删掉安全区里的源**链接本身**。
+     *
+     * `rmSync(path, {force:true})` 对符号链接只删链接，不跟随目标。
+     * 目标目录完全不受影响。
+     */
+    try {
+      rmSync(source, { force: true })
+    } catch {
+      /* 删不掉就留着；索引随后移除，内容已在用户能看到的位置 */
+    }
+    return candidate
+  }
+
+  throw new Error(
+    `cannot restore the link ${desired}: no free candidate path among 100 attempts` +
+      (lastError === undefined ? '' : `; last error: ${String(lastError)}`),
+  )
 }
 
 /**
@@ -1219,14 +1337,47 @@ function placeNoReplace(
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
 
   let isDir: boolean
+  /*
+   * ## 顶层也必须用 lstat（2026-11-01 定版复核第 1 项）
+   *
+   * 上一轮的 RV-01 修复只改了**子节点**的类型判定，入口这里仍是
+   * `statSync` —— 它跟随链接。于是"被删除对象本身就是 junction"时：
+   *
+   * ```
+   * items/<id>/pkg        ← 实际是 junction，指向 external
+   * stat(source).isDirectory() → true
+   * → 走目录合并 → readdirSync(source) 枚举的是 **external 的内容**
+   * → 递归结束时把 external 的子树删掉
+   * ```
+   *
+   * 实测：恢复成功、索引清空，但 junction 变成普通目录，且
+   * `external/outside-sub` 从外部原位置消失。
+   *
+   * 现在：顶层先 `lstat`；是链接就只重建这一个链接，不进目录合并。
+   */
+  let sourceIsLink = false
+  let sourceLinkTarget = ''
   try {
-    isDir = statSync(source).isDirectory()
+    const sourceStat = lstatSync(source)
+    sourceIsLink = sourceStat.isSymbolicLink()
+    if (sourceIsLink) sourceLinkTarget = readlinkSync(source)
+    isDir = sourceIsLink ? false : sourceStat.isDirectory()
   } catch {
     /*
      * 内容可能刚被清理 worker 搬进批次目录 —— 用能说清楚的诊断，
      * 而不是让用户以为数据丢了（SD-05.2）。
      */
     throw contentMissingError(stateDir, id)
+  }
+
+  /*
+   * 顶层是链接：只重建，不进入（定版复核第 1 项）。
+   *
+   * 不能落到下面的"文件"分支 —— 那里用 `linkSync` 建**硬链接**，
+   * 对符号链接语义是错的。索引移除仍由 `restoreFromSafeZone` 统一做。
+   */
+  if (sourceIsLink) {
+    return placeLinkNoReplace(desired, source, sourceLinkTarget, stamp)
   }
 
   /**
