@@ -37,10 +37,10 @@ describe('SD-23: ancestors of protected roots are protected too', () => {
     dshHome: string
   } {
     return {
-      home: 'C:\\Users\\u',
+      home: 'C:\\home-dir',
       workdir: 'C:\\work',
       installDir: 'C:\\work\\application\\bin',
-      dshHome: 'C:\\Users\\u\\.dsh',
+      dshHome: 'C:\\home-dir\\.dsh',
       ...over,
     }
   }
@@ -76,8 +76,9 @@ describe('SD-23: ancestors of protected roots are protected too', () => {
      * 一起消失。
      */
     const e = { ...env(), workdir: 'D:\\other' }
-    expect(classifyPath('C:\\Users\\u', e), 'dshHome 的父目录应受保护').toBe('protected')
-    expect(classifyPath('C:\\Users', e), '更高层也应受保护').toBe('protected')
+    expect(classifyPath('C:\\home-dir', e), 'dshHome 的父目录应受保护').toBe('protected')
+    // 更上层同样是祖先。用盘根表示"再往上一级"。
+    expect(classifyPath('C:\\', e), '更高层也应受保护').toBe('protected')
   })
 
   it('does not over-protect unrelated siblings', () => {
@@ -106,7 +107,7 @@ describe('SD-23: ancestors of protected roots are protected too', () => {
     /*
      * `installDir` 可选。没配时不能因为它的缺失而误判或崩溃。
      */
-    const e = { home: 'C:\\Users\\u', workdir: 'C:\\work', installDir: '', dshHome: '' }
+    const e = { home: 'C:\\home-dir', workdir: 'C:\\work', installDir: '', dshHome: '' }
     expect(classifyPath('C:\\work\\anything', e)).toBe('free')
   })
 })

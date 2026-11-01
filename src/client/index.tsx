@@ -527,6 +527,19 @@ export function SafeZoneSettings(): ReactElement {
     // 第二步：拿**换算后**的值和边界比较。
     if (spec.min !== undefined && value < spec.min) return undefined
     if (spec.max !== undefined && value > spec.max) return undefined
+    /*
+     * ## bytes 的额外下限：0 或 ≥1 MB（2026-11-01 审查 SD-22）
+     *
+     * `spec.min` 对 bytes 是 0（"0 表示关闭"），所以 0.5 MB 也能通过 ——
+     * 而斜杠入口与 README 的契约是"0 或至少 1 MB"。
+     *
+     * 结果：同一份配置 UI 能存、斜杠拒绝，规则不一致；而小于 1 MB 的阈值
+     * 几乎必然触发确认，等于制造审批噪音。
+     *
+     * 这里按契约拒绝：非 0 但小于 1 MB → 不合法。
+     * 不能简单把 `min` 设成 MB —— 那会连 `0`（关闭）一起拒掉。
+     */
+    if (spec.kind === 'bytes' && value !== 0 && value < MB) return undefined
     return value
   }, [values])
 

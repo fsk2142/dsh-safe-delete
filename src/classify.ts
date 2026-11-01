@@ -81,7 +81,20 @@ function isUnder(child: string, parent: string): boolean {
   const c = normalize(child)
   const p = normalize(parent)
   if (c === p) return true
-  return c.startsWith(p + path.sep)
+  /*
+   * ## 盘根要去掉重复的分隔符（2026-11-01 审查 SD-23 时发现）
+   *
+   * `path.resolve('C:\\')` 是 `C:\`（**已带**尾分隔符）。直接拼
+   * `p + path.sep` 得到 `C:\\`，于是 `C:\home-dir` 不以它开头 ——
+   * 盘根被判成"不包含任何东西"。
+   *
+   * 实测：`isUnder('C:\home-dir', 'C:\')` 为 false，
+   * 所以删整个 C 盘不会被判为包含安装目录/家目录。
+   *
+   * 现在先归一化尾分隔符再拼。
+   */
+  const prefix = p.endsWith(path.sep) ? p : p + path.sep
+  return c.startsWith(prefix)
 }
 
 /**
