@@ -406,20 +406,58 @@ async function deleteMany(
   }
 
   // 3. 需要确认的项：合并成**一次**审批。
+  /*
+   * ## 合计阈值（2026-11-01 审查 SD-05）
+   *
+   * `decideGate` 只看**单项**是否超过 count/bytes 上限。于是"三项各 1 字节、
+   * 阈值 2"时每项都不超，全部放行 —— 而它们合计已经超过用户设的门槛。
+   *
+   * 用户设阈值的意思是"超过这个量的删除，先问我"。三个文件合计 3 字节
+   * 就是他想要被问的情形，只是它分散在三个路径上。
+   *
+   * 这里在单项判定之外再看一次合计：只要合计超过阈值，整批就要求确认。
+   */
+  const allBytes = plans.reduce((sum, p) => sum + p.description.bytes, 0)
+  const allFiles = plans.reduce((sum, p) => sum + p.description.fileCount, 0)
+  const aggregateReasons: string[] = []
+  if (ctx.confirmFileCount > 0 && allFiles > ctx.confirmFileCount) {
+    aggregateReasons.push(
+      `the batch totals ${allFiles} entries, exceeding the limit of ${ctx.confirmFileCount}`,
+    )
+  }
+  if (ctx.confirmBytes > 0 && allBytes > ctx.confirmBytes) {
+    aggregateReasons.push(
+      `the batch totals ${allBytes} bytes, exceeding the limit of ${ctx.confirmBytes}`,
+    )
+  }
+
   const needing = plans.filter((p) => p.gate.needsApproval)
-  if (needing.length > 0) {
+  const needsAggregateApproval = aggregateReasons.length > 0 && plans.length > 0
+
+  if (needing.length > 0 || needsAggregateApproval) {
     const totalBytes = needing.reduce((sum, p) => sum + p.description.bytes, 0)
     const totalFiles = needing.reduce((sum, p) => sum + p.description.fileCount, 0)
-    const reasons = [...new Set(needing.flatMap((p) => p.gate.reasons))]
-    const sample = needing.slice(0, 5).map((p) => p.target)
-    const more = needing.length > sample.length ? `\n  …and ${needing.length - sample.length} more` : ''
+    const reasons = [
+      ...new Set(needing.flatMap((p) => p.gate.reasons).concat(aggregateReasons)),
+    ]
+    /*
+     * 审批文本列出全部（最多 5 条），而不是只列"需要确认的那几项"。
+     *
+     * 合计超限时 `needing` 可能是空的 —— 但用户需要看到**整批**都有什么，
+     * 否则他批准的是一个看不见内容的集合。
+     */
+    const listed = plans.length > needing.length ? plans : needing
+    const sample = listed.slice(0, 5).map((p) => p.target)
+    const more = listed.length > sample.length ? `\n  …and ${listed.length - sample.length} more` : ''
     const text =
-      `Delete ${needing.length} item(s) in one batch? ` +
-      `Total ${totalFiles} entries, ${humanBytes(totalBytes)}.\n` +
+      `Delete ${listed.length} item(s) in one batch? ` +
+      `Total ${allFiles} entries, ${humanBytes(allBytes)}.\n` +
       `Why this needs your OK: ${reasons.join('; ')}.\n` +
       `Items:\n  ${sample.join('\n  ')}${more}\n\n` +
       `Approving covers the whole batch. Everything goes into the safe zone and can be restored ` +
       `with safe_zone_restore for ${ctx.retentionDays} day(s).`
+    void totalBytes
+    void totalFiles
 
     const outcome = await ctx.requestApproval(text)
     if (outcome !== 'allowed-once') {

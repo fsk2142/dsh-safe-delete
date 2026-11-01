@@ -443,25 +443,54 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
        * `describeTarget(root)`，就会把整棵树遍历一遍 —— 实测 3000 个文件 27 ms、
        * 6000 个文件 529 ms。钩子对**每次工具调用**都跑，这个开销会传染到所有工具。
        *
-       * 所以模式形态只做纯路径分类（`classifyPath`，0 ms）：
-       *   - root 落在保护区/家目录 → 直接 ask（保守，不枚举也知道该问）
-       *   - root 在工作区 → 在这里放行，交给工具内部按**实际命中数**判定阈值
+       * 所以模式形态只做纯路径分类（`classifyPath`，0 ms）。
        *
-       * 为什么这样不漏：工具执行体（`resolveMatchedTargets` → `deleteMany`）
-       * 会对每个命中项做完整分级与合并阈值判定，一次合并审批。钩子这一层的
-       * 作用是"危险 root 先拦下"，它不需要知道具体有多少文件。
+       * ## 但 free 的 root **也**要 ask（2026-11-01 审查 SD-05）
+       *
+       * 第一版是"root 为 free 就 `next()`，交给工具内部按实际命中数判定"。
+       * 那个推理有个洞：**生产环境的工具侧 `requestApproval` 恒返回
+       * `allowed-once`**（见第 271 行的说明 —— 它假定"管线已经问过了"）。
+       * 钩子一旦 `next()`，就**没有任何人问过**：工具内部算出 `needing`
+       * 之后，那个审批回调直接放行。
+       *
+       * 实测：`root=工作区` + 一个递归 match，命中了 `node_modules/`，
+       * 工具内部确实把它识别为 protected，那次"审批"却是无声通过的。
+       *
+       * 现在的规则：
+       *   - root 在保护区/敏感区 → ask（root 本身可疑）
+       *   - root 在 free → **也 ask**（子孙可能有 protected 项，钩子不枚举
+       *     就不知道 —— 不确定就问）
+       *
+       * 代价：工作区里的模式删除每次都会问一次。这是有意的取舍 ——
+       * "先确认"是核心承诺，不能因为 root 看起来安全就跳过。
+       *
+       * `never` 策略仍然直接放行：那不是漏审，而是用户明确选择了不问。
        */
       const isPatternForm = typeof args.root === 'string' && args.root.trim() !== ''
       if (isPatternForm) {
         const rootPath = path.resolve(String(args.root))
         const classification = classifyPath(rootPath, env)
-        if (classification === 'free') return next()
+
+        /*
+         * `never`：用户明确表示"不要问我"。
+         *
+         * 保留这个分支 —— 切到 never 的人正是想不被打断地干活，
+         * 强制 ask 会让删除能力被无声废掉。
+         */
         if (approvalPolicy(session) === 'never') return next()
 
         const bits: string[] = [`root ${rootPath}`]
         if (typeof args.match === 'string') bits.push(`match "${args.match}"`)
         if (typeof args.olderThan === 'string') bits.push(`older than ${args.olderThan}`)
-        if (classification === 'protected') bits.push('the root is a protected path')
+        if (classification === 'protected') {
+          bits.push('the root is a protected path')
+        } else {
+          /*
+           * free / sensitive：说明为什么仍然要问 —— 钩子不枚举，
+           * 所以"里面有没有 protected 项"是未知的。
+           */
+          bits.push('the matched items are not known until execution, and may include protected paths')
+        }
         const text =
           `Delete files matched under this path? ` +
           bits.join('; ') +
