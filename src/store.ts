@@ -576,7 +576,44 @@ async function stageInto(stateDir: string, absPath: string, opts: MoveOptions): 
   // 文件名必须认得出原本是什么。`items/<id>` 永远是目录，不随目标是文件而变。
   const entryRoot = entryDir(stateDir, id)
   const dest = path.join(entryRoot, path.basename(target))
-  mkdirSync(entryRoot, { recursive: true })
+  /*
+   * ## 独占创建条目目录（2026-11-01 审查 SD-21）
+   *
+   * 第一版是 `mkdirSync(entryRoot, { recursive: true })` —— 目录已存在时
+   * **不报错**。ID 由秒级时间戳 + 6 位 `Math.random` 组成，随机后缀不是
+   * 唯一性约束；一旦碰撞：
+   *
+   * ```
+   * items/<id>/same.txt  已有内容（第一个文件的唯一副本）
+   * renameSync(target, items/<id>/same.txt)   ← 覆盖它
+   * ```
+   *
+   * 隔离验证（固定时间与随机值强制碰撞）：第一个文件的唯一副本被第二个
+   * 覆盖，索引里还出现重复 id。
+   *
+   * 现在改为**非递归的独占创建**：`mkdirSync(entryRoot)` 在目录已存在时
+   * 抛 EEXIST，据此拒绝覆盖。`recursive: true` 只用于 `items/` 这一层。
+   */
+  mkdirSync(path.dirname(entryRoot), { recursive: true })
+  try {
+    mkdirSync(entryRoot)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EEXIST') {
+      /*
+       * 碰撞：这个 id 的目录已经存在。
+       *
+       * 绝不能沿用 —— 那会覆盖别人的内容。抛出可识别的错误，
+       * 让上层重新生成 id 并重试。
+       */
+      const collision = new Error(
+        `duplicate entry id: ${id} — refusing to overwrite an existing entry`,
+      ) as Error & { code?: string }
+      collision.code = 'ENTRY_ID_COLLISION'
+      throw collision
+    }
+    throw error
+  }
 
   let crossVolume = false
   try {
@@ -663,7 +700,33 @@ export async function moveToSafeZone(stateDir: string, absPath: string, opts: Mo
      */
     const entries = await readIndexForWrite(stateDir)
 
-    const entry = await stageInto(stateDir, absPath, opts)
+    /*
+     * ## id 碰撞时重试（2026-11-01 审查 SD-21）
+     *
+     * `stageInto` 现在用非递归 `mkdir` 独占创建条目目录，碰撞时抛
+     * `ENTRY_ID_COLLISION`。这里重新生成 id 再试 —— 用户不该看到
+     * "duplicate entry id" 这种内部错误。
+     *
+     * 重试次数有限：连续 5 次碰撞意味着时钟或随机源出了问题，
+     * 那时应当明确失败而不是无限重试。
+     */
+    let entry: TrashEntry | undefined
+    let lastError: unknown
+    for (let attempt = 0; attempt < 5 && entry === undefined; attempt += 1) {
+      try {
+        entry = await stageInto(stateDir, absPath, opts)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code !== 'ENTRY_ID_COLLISION') throw error
+        lastError = error
+      }
+    }
+    if (entry === undefined) {
+      throw new Error(
+        `could not allocate a unique safe-zone id after 5 attempts: ` +
+          `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+      )
+    }
     entries.push(entry)
     try {
       await writeIndex(stateDir, entries)
