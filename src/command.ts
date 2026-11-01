@@ -359,28 +359,37 @@ function mentionsOnly(command: string): boolean {
 
   // 除第一段外，任何一段自己就是删除命令，就不算"仅提及"。
   for (const segment of segments.slice(1)) {
-    const segTokens = tokenize(segment)
-    const head = segTokens[0]?.toLowerCase()
-    if (head === undefined) continue
-    // `cat list | xargs rm -rf`：管道的下游是 `xargs rm ...`，动词在参数里。
-    if (DELETES_VIA_ARGUMENT.has(head) && segTokens.some((t) => isDeleteVerb(t))) return false
-    if (isDeleteVerb(head)) return false
     /*
-     * ## 参数位置的删除标记（2026-11-01 审查 SD-10）
+     * ## 复用**完整**检测，不用缩水的 marker 表（2026-11-01 定版复核第 6 项）
      *
-     * `find /tmp/x -delete` 与 `(Get-Item x).Delete()` 的动词**不在段首**：
+     * 前两版这里是手写的一串简化判断（段首动词 + 参数级 marker）。
+     * 每补一种形态就要加一条，而 `containsDeleteCommand` 早就有完整逻辑
+     * （命令位判定、包装器解包、`DELETES_VIA_ARGUMENT`）。
+     *
+     * 结果是"已经支持的删除"加了只读前缀就失效：
      *
      * ```
-     * echo ready; find /tmp/x -delete            ← 段首是 find
-     * echo ready; (Get-Item C:\x).Delete()       ← 段首是 (Get-Item
+     * sh -c "rm -rf /tmp/x"                         → true
+     * echo ready; sh -c "rm -rf /tmp/x"             → false   ← 漏
+     * sudo rm -rf /tmp/x                            → true
+     * echo ready; sudo rm -rf /tmp/x                → false   ← 漏
+     * node -e "require('fs').unlinkSync('x')"       → true
+     * echo ready; node -e "...unlinkSync('x')"      → false   ← 漏
      * ```
      *
-     * 上面两行只查段首，于是被当作"仅提及"放行。而同样的删除**去掉只读前缀**
-     * 就能被别处的整串正则抓到 —— 加个 `echo` 就豁免了。
+     * 现在直接对每一段调用同一套检测 —— 判据不再有两条路径，也就不会漂移。
      *
-     * 这里补一道：整段里出现参数级删除标记，就不算"仅提及"。
+     * ## 但完整检测本身也不覆盖"参数级"删除（实测）
+     *
+     * `containsDeleteCommand` 只看**命令位**的动词。`find /tmp/x -delete`
+     * 与 `rsync --delete` 的动词在参数里，它不认。
+     *
+     * 所以这里两道都要：完整检测（管包装器、命令位）+ 参数级 marker
+     * （管 `-delete` / `--delete` / `.Delete()`）。缺任何一道都会漏。
      */
-    if (segTokens.some((t) => isDeleteArgumentMarker(t))) return false
+
+    if (containsDeleteCommand(segment)) return false
+    if (tokenize(segment).some((t) => isDeleteArgumentMarker(t))) return false
   }
 
   // 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与 `echo \`rm -rf /tmp/x\``
@@ -618,6 +627,21 @@ function containsDeleteCommand(text: string): boolean {
   for (const inner of commandSubstitutions(text)) {
     if (containsDeleteCommand(inner) && innerHasCommandVerb(inner)) return true
   }
+
+  /*
+   * 3) "把后面的字符串当命令执行"的包装器（2026-11-01 定版复核第 6 项）。
+   *
+   * 上面只查**命令位**的动词。而 `sh -c "rm -rf /tmp/x"` 里 `rm` 位于字符串
+   * 参数中，不在命令位 —— 所以这里原本返回 false。
+   *
+   * 单独解析整条命令时 `parseCommand` 会先 `unwrapExecutedCommand`，能识别；
+   * 但 `mentionsOnly` 只做切段、没做解包，于是"已经是真删除的命令 + 只读
+   * 前缀"就漏掉了。
+   *
+   * 这里补上解包：把包装器里的那段代码按命令再判一次。
+   */
+  const unwrapped = unwrapExecutedCommand(text)
+  if (unwrapped !== null && containsDeleteCommand(unwrapped)) return true
 
   return false
 }
@@ -1252,6 +1276,28 @@ export function parseCommand(command: string): CommandVerdict {
     if (containsDeleteCommand(text)) {
       return { destructive: true, kind: 'delete', recursive: false, target: null }
     }
+
+    /*
+     * ## 逐段递归判定（2026-11-01 定版复核第 6 项）
+     *
+     * `containsDeleteCommand` 只在**整串以包装器开头**时解包，而
+     * `echo ready; sh -c "rm -rf /tmp/x"` 的包装器在第二段。
+     *
+     * `unwrapExecutedCommand` 也不认 `node -e` / `python -c` 这类
+     * （它的正则只覆盖 shell 包装器），所以手写解包总会漏一种。
+     *
+     * 这里直接对该段再调一次 `parseCommand` —— 段内不含顶层分隔符，
+     * 所以它的兜底循环里 `slice(1)` 为空，不会无限递归。好处是**复用全部
+     * 既有判定**（包装器解包、`node -e`、不透明执行、参数级删除等），
+     * 不再有"第二套缩水规则"。
+     */
+    for (const segment of splitOutsideQuotes(text).slice(1)) {
+      if (segment.trim() === '') continue
+      if (parseCommand(segment).destructive) {
+        return { destructive: true, kind: 'delete', recursive: false, target: null }
+      }
+    }
+
     return { destructive: false }
   }
 
