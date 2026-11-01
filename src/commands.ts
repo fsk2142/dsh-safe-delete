@@ -114,6 +114,48 @@ export function renderConfigDetail(guide: SettingGuide, values: Record<string, u
 const SUBCOMMANDS = new Set(['list', 'restore', 'clean', 'config', 'status', 'help', '--help', '-h'])
 
 /**
+ * 按空白切分参数，**尊重引号**（2026-11-01 审查 SD-12）。
+ *
+ * 为什么不用 `rest.split(/\s+/)`：带空格的路径（`"C:\My Files\x"`）会被
+ * 切成两段，拼回去时引号和空格都可能丢失。而路径会直接用于删除 ——
+ * 拼错一个字就是在删别的东西。
+ *
+ * 规则很简单：引号外的空白是分隔符；引号内的空白是内容；引号本身保留
+ * （下游按原样当路径用）。
+ *
+ * @param text 参数串。
+ * @returns 分段列表。
+ */
+function splitArgs(text: string): string[] {
+  const out: string[] = []
+  let current = ''
+  let quote: "'" | '"' | null = null
+
+  for (const ch of text) {
+    if (quote !== null) {
+      current += ch
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (current !== '') {
+        out.push(current)
+        current = ''
+      }
+      continue
+    }
+    current += ch
+  }
+  if (current !== '') out.push(current)
+  return out
+}
+
+/**
  * 判断输入是子命令还是路径。
  *
  * 为什么不能简单取第一个词：路径本身可以带空格（`C:\My Files\x`），
@@ -233,15 +275,35 @@ export async function runCommand(rawInput: string, deps: CommandDeps): Promise<C
     }
   }
 
-  // 其余一律当作路径。
-  const preview = rest.split(/\s+/).includes('--preview')
-  const pathText = rest.replace(/--preview/g, '').trim()
+  /*
+   * 其余一律当作路径。
+   *
+   * ## 只移除**独立的** `--preview` token（2026-11-01 审查 SD-12）
+   *
+   * 第一版是 `rest.replace(/--preview/g, '')` —— **全局字符串替换**，
+   * 于是文件名里的同样子串也被抹掉：
+   *
+   * ```
+   * /safe-delete C:\Work\foo--previewbar
+   *   → 路径变成 C:\Work\foobar
+   *   → 删掉的是用户**没有指定**的对象
+   * ```
+   *
+   * 这比"没生效"严重得多：目标是错的，而且用户看到的输入是对的。
+   *
+   * 现在按空白分词，只丢弃**恰好等于** `--preview` 的那一段，
+   * 其余字节原样拼回。带引号的路径也不会被破坏（引号内的空格不切分）。
+   */
+  const tokens = splitArgs(rest)
+  const preview = tokens.includes('--preview')
+  const pathText = tokens.filter((t) => t !== '--preview').join(' ').trim()
   if (pathText === '') {
     return {
       kind: 'error',
       text: `要删除什么？用法：/safe-delete <路径>\n例如：/safe-delete C:\\Work\\proj\\build`,
     }
   }
+  void rest
   const result = await deps.delete(pathText, { preview })
   return { kind: result.ok ? 'success' : 'error', text: result.text }
 }
