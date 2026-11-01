@@ -479,17 +479,31 @@ export function SafeZoneSettings(): ReactElement {
     // 第一步：把显示数值换算成真实单位（字节 / 毫秒）。
     let value: number
     if (spec.kind === 'bytes') {
-      // 单位跟着输入框一起存在 values 里（`<key>.unit`），由用户切换。
-      const unit = values[`${spec.key}.unit`] === 'MB' ? MB : GB
-      value = Math.round(amount * unit)
+      /*
+       * ## 缺省单位必须与显示侧一致（2026-11-01 审查 SD-09）
+       *
+       * 第一版是 `values[key.unit] === 'MB' ? MB : GB` —— 没有单位时按 **GB**
+       * 算。而显示侧 `toBytesInput` 按值的自然量级选单位：500 MB 显示成
+       * "500"，保存时按 GB 解释 → **放大 1024 倍**。
+       *
+       * 现在缺省时用 `naturalBytesUnit(current)` —— 与显示侧同一个判定。
+       * 用户显式切换过单位时仍以 `values` 为准。
+       */
+      const chosenBytesUnit = values[`${spec.key}.unit`]
+      const currentBytes = numericOf(values, spec.key, spec.fallback)
+      const bytesUnit =
+        chosenBytesUnit === 'MB' || chosenBytesUnit === 'GB'
+          ? chosenBytesUnit
+          : naturalBytesUnit(currentBytes)
+      value = Math.round(amount * (bytesUnit === 'MB' ? MB : GB))
     } else if (spec.kind === 'duration') {
       // 单位来自独立的 `.unit` 键（用户在下拉里选）。
       //
       // 兜底必须与**显示侧**用同一个判定，否则会出现「显示 24 小时、保存成 24 天」
       // 这种静默错位。显示侧用 `naturalDurationUnit(current)`，即"当前值能被整天
       // 整除就用天"；输入框里没有当前值时按小时（更保守：小时不会放大 24 倍）。
-      const chosen = values[`${spec.key}.unit`]
       const day = 24 * 60 * 60 * 1000
+      const chosen = values[`${spec.key}.unit`]
       const unit =
         chosen === 'day'
           ? day
@@ -528,6 +542,20 @@ export function SafeZoneSettings(): ReactElement {
    */
   function displayValueOf(spec: FieldSpec, source: Record<string, unknown>): string {
     const current = numericOf(source, spec.key, spec.fallback)
+    /*
+     * ## bytes 必须返回**与单位匹配**的数值（2026-11-01 审查 SD-09）
+     *
+     * 第一版只返回 `toBytesInput(current).amount`，把 `unit` 丢掉了。
+     * 而保存侧读的是 `values[`${key}.unit`]`，缺省时按 **GB** 算：
+     *
+     * ```
+     * 配置 500 MB → 显示 "500"（unit 丢失）
+     *            → 保存时按 GB 解释 → 500 GB，放大 1024 倍
+     * ```
+     *
+     * 现在显示侧把 `unit` 一起写进 values，保存侧再按它换算 ——
+     * 与 `duration` 用的是同一套"显示与保存共用单位状态"的做法。
+     */
     if (spec.kind === 'bytes') return toBytesInput(current).amount
     if (spec.kind === 'duration') {
       const chosen = source[`${spec.key}.unit`]
@@ -535,6 +563,18 @@ export function SafeZoneSettings(): ReactElement {
       return toDurationInput(current, unit)
     }
     return String(current)
+  }
+
+  /**
+   * bytes 字段的**自然单位** —— 与 `toBytesInput` 的决策保持一致。
+   *
+   * 保存侧在没有显式单位时用它兜底，避免"显示 MB、保存按 GB"的静默放大。
+   *
+   * @param bytes 字节数。
+   * @returns `'MB'` 或 `'GB'`。
+   */
+  function naturalBytesUnit(bytes: number): 'MB' | 'GB' {
+    return bytes >= GB ? 'GB' : 'MB'
   }
 
   const save = useCallback(async (): Promise<void> => {
@@ -909,9 +949,34 @@ export function SafeZoneSettings(): ReactElement {
                   style={fieldStyle(errors[spec.key] !== undefined)}
                 />
                 {spec.kind === 'bytes' ? (
+                  /*
+                   * ## 单位下拉的缺省值必须与显示值一致（2026-11-01 审查 SD-09）
+                   *
+                   * 第一版是 `values[key.unit] === 'MB' ? 'MB' : 'GB'` —— 没有
+                   * 单位时**默认 GB**。而数字框的显示值来自 `toBytesInput`，
+                   * 它按自然量级选单位：500 MB 显示成 "500"。
+                   *
+                   * 于是界面出现自相矛盾的一行：
+                   *
+                   * ```
+                   * [ 500 ] [GB ▾]     ← 数字看起来是 500 GB
+                   * ```
+                   *
+                   * 用户把 500 改成 501 并保存，得到 501 GB —— **放大 1024 倍**，
+                   * 而他的本意是 501 MB。
+                   *
+                   * 现在缺省时用 `naturalBytesUnit(current)` —— 与显示侧同一个
+                   * 判定。`duration` 分支一直是这么做的（见下面几行），
+                   * bytes 当时漏了。
+                   */
                   <select
                     aria-label={`${spec.label}单位`}
-                    value={values[`${spec.key}.unit`] === 'MB' ? 'MB' : 'GB'}
+                    value={
+                      values[`${spec.key}.unit`] === 'MB' ||
+                      values[`${spec.key}.unit`] === 'GB'
+                        ? (values[`${spec.key}.unit`] as string)
+                        : naturalBytesUnit(current)
+                    }
                     onChange={(event) => setFieldUnit(spec.key, event.target.value)}
                     style={{ ...fieldStyle(false), width: '76px' }}
                   >
