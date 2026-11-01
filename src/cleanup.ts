@@ -164,6 +164,7 @@ function tryAcquireLock(stateDir: string, staleMs: number, token: string): boole
         pid?: number
         workerPid?: number | null
         at?: number
+        token?: string
       }
       const age = Date.now() - (holder.at ?? 0)
       /*
@@ -200,6 +201,45 @@ function tryAcquireLock(stateDir: string, staleMs: number, token: string): boole
           renameSync(lockPath, tombstone)
         } catch {
           // 文件已不在原名：别人抢先接管了。
+          return false
+        }
+        /*
+         * ## 必须核验"搬走的到底是不是我们判定过的那把锁"
+         * （2026-11-01 审查 SD-07）
+         *
+         * `renameSync` 不校验 inode —— 它只是把**当前在那个路径上的东西**
+         * 改走。于是这个交错仍然成立：
+         *
+         * ```
+         * A: 读到旧锁，判定可接管
+         * B: 读到旧锁，判定可接管
+         * A: rename 走旧锁 → 建新锁 ✓，A 开始清理
+         * B: rename(lockPath, tombstoneB) ← 搬走的是 **A 的新锁**
+         * B: 建新锁 ✓，B 也开始清理
+         * → 两个 worker 并行
+         * ```
+         *
+         * 所以改名之后要读一下 tombstone 里的 token：
+         *   - 与判读时一致 → 确实是我们判定过的那把陈旧锁，可以接管；
+         *   - 不一致 → 搬走的是别人刚建的活锁。**放弃**，并且**不要**
+         *     把它放回去 —— 放回是又一次 rename，期间锁路径空出来，
+         *     第三方能趁机拿锁（这与 index-lock 的 SD-N04 是同一个教训）。
+         */
+        let takenToken: string | undefined
+        try {
+          const captured = JSON.parse(readFileSync(tombstone, 'utf8')) as { token?: string }
+          takenToken = captured.token
+        } catch {
+          /* 内容读不出来：它本来就是坏的，继续接管 */
+        }
+        if (takenToken !== undefined && takenToken !== holder.token) {
+          /*
+           * 搬走的是别人的活锁。放弃本轮。
+           *
+           * 不把它放回去：放回的 rename 会再开一个窗口。
+           * 让它留在 tombstone 里，那个持有者会发现锁不见了 ——
+           * 比"锁还在但内容被换过"更容易诊断。
+           */
           return false
         }
         try {
