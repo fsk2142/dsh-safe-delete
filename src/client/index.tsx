@@ -679,8 +679,42 @@ export function SafeZoneSettings(): ReactElement {
                 : actual === expected
             })
           if (confirmed) {
-            // 读到了新值：清掉草稿，界面与磁盘一致。
-            setValues(Object.fromEntries(Object.entries(view.value).filter(([key]) => !key.endsWith('.draft'))))
+            /*
+             * ## 回填时不能覆盖用户正在输入的内容（2026-11-01 审查 SD-15）
+             *
+             * 第一版是 `setValues(回读值)` —— **整体替换**。保存是异步的
+             * （要等 mutate + describe 往返），用户完全可能在这期间继续打字：
+             *
+             * ```
+             * 用户改 A = 10，点保存
+             *   → 请求在飞
+             * 用户改 B = 20（此时还没返回）
+             *   → 回填把 B 改回磁盘上的旧值
+             * → 用户的第二次编辑**静默消失**
+             * ```
+             *
+             * 现在：回填只影响"用户没在编辑的字段"。
+             *
+             * 判定"正在编辑"用 `.draft` 键 —— 那是输入框在用户改动后写入的
+             * 草稿标记（见下面的渲染分支）。有草稿就保留草稿，没有才用回读值。
+             *
+             * 保存按钮此时是 disabled，但输入框不是 —— 保持输入可用是好的，
+             * 前提是回填不踩它。
+             */
+            setValues((prev) => {
+              const fromServer = Object.fromEntries(
+                Object.entries(view.value).filter(([key]) => !key.endsWith('.draft')),
+              )
+              const merged: Record<string, unknown> = { ...fromServer }
+              for (const [key, value] of Object.entries(prev)) {
+                // 草稿与它的单位一起保留 —— 否则会出现"数字是新的、单位是旧的"。
+                if (key.endsWith('.draft')) merged[key] = value
+                else if (key.endsWith('.unit') && prev[`${key.slice(0, -5)}.draft`] !== undefined) {
+                  merged[key] = value
+                }
+              }
+              return merged
+            })
             setMessage('已保存。重启 DSH 生效。')
           } else {
             // 没读到新值：保留用户输入，并如实说明「已写入但未能回读确认」。
