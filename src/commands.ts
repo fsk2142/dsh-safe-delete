@@ -131,46 +131,77 @@ export function renderConfigDetail(guide: SettingGuide, values: Record<string, u
 /** 已知的子命令。 */
 const SUBCOMMANDS = new Set(['list', 'restore', 'clean', 'config', 'status', 'help', '--help', '-h'])
 
-/**
- * 按空白切分参数，**尊重引号**（2026-11-01 审查 SD-12）。
- *
- * 为什么不用 `rest.split(/\s+/)`：带空格的路径（`"C:\My Files\x"`）会被
- * 切成两段，拼回去时引号和空格都可能丢失。而路径会直接用于删除 ——
- * 拼错一个字就是在删别的东西。
- *
- * 规则很简单：引号外的空白是分隔符；引号内的空白是内容；引号本身保留
- * （下游按原样当路径用）。
- *
- * @param text 参数串。
- * @returns 分段列表。
- */
-function splitArgs(text: string): string[] {
-  const out: string[] = []
-  let current = ''
-  let quote: "'" | '"' | null = null
 
-  for (const ch of text) {
+/**
+ * 从原文里删掉**恰好独立成段**的某个 flag，保留其余字节一一对应。
+ *
+ * ## 为什么不能用"分词 → 过滤 → join"（2026-11-01 定版复核第 4 项）
+ *
+ * 那条路径会把连续空格压成一个：`C:\My  Files\x` 变成 `C:\My Files\x`。
+ * 若两个目录都存在，被操作的是用户**没有指定**的那个 —— 这是"路径保真"
+ * 问题，不是格式化问题。
+ *
+ * ## 做法
+ *
+ * 扫描原文，记录引号外的空白分段边界。只有当某一段**完全等于** flag 时，
+ * 才把它连同**一侧**的空白删掉（选它前面那段，避免影响后续偏移）。
+ * 其余所有字节（含重复空格、制表符、引号）原样保留。
+ *
+ * @param text 原始参数串。
+ * @param flag 要移除的 flag（如 `--preview`）。
+ * @returns 处理后的文本与是否移除过。
+ */
+function stripStandaloneFlag(text: string, flag: string): { text: string; removed: boolean } {
+  /** 每一段的 [start, end) —— 只记录引号外的空白切分。 */
+  const spans: Array<{ start: number; end: number }> = []
+  let quote: "'" | '"' | null = null
+  let segStart = -1
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i] as string
     if (quote !== null) {
-      current += ch
       if (ch === quote) quote = null
       continue
     }
     if (ch === "'" || ch === '"') {
+      if (segStart === -1) segStart = i
       quote = ch
-      current += ch
       continue
     }
     if (/\s/.test(ch)) {
-      if (current !== '') {
-        out.push(current)
-        current = ''
+      if (segStart !== -1) {
+        spans.push({ start: segStart, end: i })
+        segStart = -1
       }
       continue
     }
-    current += ch
+    if (segStart === -1) segStart = i
   }
-  if (current !== '') out.push(current)
-  return out
+  if (segStart !== -1) spans.push({ start: segStart, end: text.length })
+
+  // 从后往前删，避免偏移失效。
+  let out = text
+  let removed = false
+  for (let k = spans.length - 1; k >= 0; k -= 1) {
+    const span = spans[k] as { start: number; end: number }
+    if (out.slice(span.start, span.end) !== flag) continue
+    /*
+     * 连同**前面**的空白一起删（若有），否则删后面的。
+     *
+     * 只删一侧：路径内部的重复空格在另一侧，不受影响。
+     */
+    let cutFrom = span.start
+    while (cutFrom > 0 && /\s/.test(out[cutFrom - 1] as string)) cutFrom -= 1
+    let cutTo = span.end
+    if (cutFrom === span.start) {
+      // 前面没有空白（flag 在开头）—— 删后面的空白。
+      while (cutTo < out.length && /\s/.test(out[cutTo] as string)) cutTo += 1
+    }
+    out = out.slice(0, cutFrom) + out.slice(cutTo)
+    removed = true
+  }
+
+  return { text: out, removed }
 }
 
 /**
@@ -351,16 +382,31 @@ export async function runCommand(rawInput: string, deps: CommandDeps): Promise<C
    * 现在按空白分词，只丢弃**恰好等于** `--preview` 的那一段，
    * 其余字节原样拼回。带引号的路径也不会被破坏（引号内的空格不切分）。
    */
-  const tokens = splitArgs(rest)
-  const preview = tokens.includes('--preview')
-  const pathText = tokens.filter((t) => t !== '--preview').join(' ').trim()
+  /*
+   * ## 路径必须按**原文位置**保留（2026-11-01 定版复核第 4 项）
+   *
+   * 第一版是 `tokens.filter(t => t !== '--preview').join(' ')` —— 分词再拼回。
+   * 那个 `join(' ')` 把**连续空格压成一个**：
+   *
+   * ```
+   * 输入  C:\My  Files\x     （My 后两个空格）
+   * 实际  C:\My Files\x      （一个空格）
+   * ```
+   *
+   * 若两个目录都存在，被移走的是用户**没有指定**的那个。
+   *
+   * 现在：扫描原文，只把"恰好是 `--preview` 的那一段"连同它一侧多余空白
+   * 删掉，其余字节原样保留。没有选项时 `rest` 原样使用（`trim` 只去首尾）。
+   */
+  const stripped = stripStandaloneFlag(rest, '--preview')
+  const preview = stripped.removed
+  const pathText = stripped.text.trim()
   if (pathText === '') {
     return {
       kind: 'error',
       text: `要删除什么？用法：/safe-delete <路径>\n例如：/safe-delete C:\\Work\\proj\\build`,
     }
   }
-  void rest
   const result = await deps.delete(pathText, { preview })
   return { kind: result.ok ? 'success' : 'error', text: result.text }
 }
