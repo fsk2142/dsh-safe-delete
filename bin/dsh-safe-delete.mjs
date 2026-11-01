@@ -46,8 +46,44 @@ function dshHome() {
   return path.join(os.homedir(), '.dsh')
 }
 
-/** 状态目录。 */
+/**
+ * 状态目录（安全区）。
+ *
+ * ## 优先级（2026-11-01 审查 SD-13）
+ *
+ * 1. `--state-dir <路径>` 显式覆盖 —— 救援时最可靠，不依赖配置能否读到；
+ * 2. 插件配置里的 `stateDir`；
+ * 3. `<DSH_HOME>/.dsh-safe-delete`。
+ *
+ * 第一版只有第 3 条。用户在插件里改过安全区位置后，CLI 会指向一个
+ * **完全不同的目录**：`list` 说"空"、`delete` 往别处写。
+ * DSH 起不来时 CLI 是唯一救援通道 —— 指错地方等于救援失效。
+ *
+ * @returns 安全区绝对路径。
+ */
 function stateDir() {
+  // 1. 显式覆盖：从 argv 里找 `--state-dir <path>` 或 `--state-dir=<path>`。
+  const argv = process.argv.slice(2)
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]
+    if (arg === '--state-dir') {
+      const next = argv[i + 1]
+      if (typeof next === 'string' && next !== '') return path.resolve(next)
+    } else if (typeof arg === 'string' && arg.startsWith('--state-dir=')) {
+      const value = arg.slice('--state-dir='.length)
+      if (value !== '') return path.resolve(value)
+    }
+  }
+
+  // 2. 配置里的 stateDir。
+  try {
+    const configured = readConfigDefaults().stateDir
+    if (typeof configured === 'string' && configured !== '') return path.resolve(configured)
+  } catch {
+    /* 读配置失败就退回默认 —— 下面会明确打印用的是哪个目录 */
+  }
+
+  // 3. 默认位置。
   return path.join(dshHome(), '.dsh-safe-delete')
 }
 
@@ -103,12 +139,49 @@ function readConfigDefaults() {
       if (raw === 'false' || raw === 'off' || raw === 'no') return false
       return fallbackValue
     }
+    /**
+     * 读一个**字符串**配置项（2026-11-01 审查 SD-13）。
+     *
+     * 为什么不复用 `pick`：那个只接受数字，`stateDir` 是路径字符串。
+     * 去掉行尾注释与包裹的引号，其余原样保留 —— 路径里的空格、反斜杠
+     * 都不能动。
+     *
+     * @param key 配置键。
+     * @param fallbackValue 缺省值。
+     * @returns 配置值或缺省值。
+     */
+    const pickString = (key, fallbackValue) => {
+      const m = new RegExp(`^\\s+${key}:\\s*(.+?)\\s*$`, 'm').exec(block)
+      if (m === null) return fallbackValue
+      let raw = m[1].replace(/#.*$/, '').trim()
+      if (
+        (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) ||
+        (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2)
+      ) {
+        raw = raw.slice(1, -1)
+      }
+      return raw === '' ? fallbackValue : raw
+    }
 
     return {
       retentionDays: pick('retentionDays', fallback.retentionDays),
       confirmFileCount: pick('confirmFileCount', fallback.confirmFileCount),
       confirmBytes: pick('confirmBytes', fallback.confirmBytes),
       crossVolumeCopy: pickFlag('crossVolumeCopy', fallback.crossVolumeCopy),
+      /*
+       * `stateDir` 必须读出来（2026-11-01 审查 SD-13）。
+       *
+       * 第一版只读四个数字/布尔项，`stateDir` 用固定默认值。于是用户在插件
+       * 里改了安全区位置后：
+       *
+       * ```
+       * CLI list/undo  → 看默认安全区（空的）→ "没有可恢复的条目"
+       * CLI delete     → 往默认安全区写 → 与插件用的那个完全不是一处
+       * ```
+       *
+       * DSH 起不来时 CLI 是唯一能救数据的东西。它指向错误目录等于救援通道失效。
+       */
+      stateDir: pickString('stateDir', undefined),
       source: 'file',
       note: `read from ${patchFile}`,
     }
@@ -126,15 +199,59 @@ function readConfigDefaults() {
  */
 function extractPluginBlock(text, name) {
   const lines = text.split(/\r?\n/)
-  const start = lines.findIndex((line) => new RegExp(`^\\s*-\\s*id:\\s*${name}\\s*$`).test(line))
-  if (start === -1) return null
-  const out = [lines[start]]
-  for (let i = start + 1; i < lines.length; i += 1) {
-    // 下一行的 `- id:` 表示换了一个插件。
-    if (/^\s*-\s*id:/.test(lines[i])) break
-    out.push(lines[i])
+
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  /*
+   * 支持两种形态（2026-11-01 审查 SD-13 时补第二种）：
+   *
+   * 1. 列表项：
+   *    ```yaml
+   *    plugins:
+   *      - id: dsh-safe-delete
+   *        config:
+   *          retentionDays: 1
+   *    ```
+   * 2. 映射键：
+   *    ```yaml
+   *    plugins:
+   *      dsh-safe-delete:
+   *        config:
+   *          retentionDays: 1
+   *    ```
+   *
+   * 第一版只认第一种。用第二种写法配了 `stateDir` 的用户，CLI 读不到，
+   * 于是回到默认安全区 —— 正是 SD-13 要修的那种"指错地方"。
+   */
+  const listStart = lines.findIndex((line) => new RegExp(`^\\s*-\\s*id:\\s*${escaped}\\s*$`).test(line))
+  if (listStart !== -1) {
+    const out = [lines[listStart]]
+    for (let i = listStart + 1; i < lines.length; i += 1) {
+      if (/^\s*-\s*id:/.test(lines[i])) break
+      out.push(lines[i])
+    }
+    return out.join('\n')
   }
-  return out.join('\n')
+
+  const keyStart = lines.findIndex((line) => new RegExp(`^\\s+${escaped}:\\s*$`).test(line))
+  if (keyStart !== -1) {
+    const baseIndent = (lines[keyStart].match(/^\s*/) ?? [''])[0].length
+    const out = [lines[keyStart]]
+    for (let i = keyStart + 1; i < lines.length; i += 1) {
+      const line = lines[i]
+      if (line.trim() === '') {
+        out.push(line)
+        continue
+      }
+      const indent = (line.match(/^\s*/) ?? [''])[0].length
+      // 缩进回到同级或更浅 → 这个插件的块结束了。
+      if (indent <= baseIndent) break
+      out.push(line)
+    }
+    return out.join('\n')
+  }
+
+  return null
 }
 
 function humanBytes(bytes) {
