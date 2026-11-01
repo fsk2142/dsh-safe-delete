@@ -330,10 +330,31 @@ export function SafeZoneSettings(): ReactElement {
    */
   const savingRef = useRef(false)
 
+  /**
+   * 最新的表单状态（`values` 的镜像）。
+   *
+   * ## 为什么需要它（定版复核第 3 项实测）
+   *
+   * `save` 里有 `await`（mutate + describe 两次往返）。`await` 之后，
+   * 闭包里的 `values` 仍是**保存开始时**的快照 —— 用户在这期间的输入
+   * 不在里面。用它判断"是否还有未提交的编辑"永远得到 false。
+   *
+   * ref 每帧更新，`await` 之后读到的就是用户此刻的输入。
+   */
+  const valuesRef = useRef<Record<string, unknown>>({})
+
   // remote 由 `apply` 里的 `ctx.inject(['remote.settings'], …)` 异步填入，
   // 可能在首次渲染之后才就绪。所以这里不用 `useMemo`（它只算一次），
   // 而是在 effect 里读，必要时短暂重试。
   const remote = currentRemote()
+
+  /*
+   * 每次渲染把最新的表单状态同步到 ref。
+   *
+   * `save` 里有 `await`，之后闭包里的 `values` 已经过期；提示与合并判断
+   * 都要看"用户此刻的输入"，所以读这个 ref。
+   */
+  valuesRef.current = values
 
   useEffect(() => {
     let alive = true
@@ -431,7 +452,20 @@ export function SafeZoneSettings(): ReactElement {
   const setField = useCallback((key: string, raw: string): void => {
     // 用 `<key>.draft` 保存用户的原始输入：不要覆盖从配置读到的真实值，
     // 否则下一次渲染就没法再换算回显示单位了。
-    setValues((prev) => ({ ...prev, [`${key}.draft`]: raw }))
+    setValues((prev) => {
+      const next = { ...prev, [`${key}.draft`]: raw }
+      /*
+       * 同步镜像到 ref。
+       *
+       * `save` 里有 `await`，之后才判断"是否还有未提交的编辑"。那时闭包
+       * 里的 `values` 是保存开始时的快照，看不到用户在等待期间的输入。
+       *
+       * 只靠渲染时同步（`valuesRef.current = values`）不够：输入事件与
+       * 保存回填可能在同一批更新里，中间没有渲染。
+       */
+      valuesRef.current = next
+      return next
+    })
     setSaved(false)
     setErrors((prev) => {
       const next = { ...prev }
@@ -592,6 +626,35 @@ export function SafeZoneSettings(): ReactElement {
 
   const save = useCallback(async (): Promise<void> => {
     if (remote?.mutate === undefined) return
+    /*
+     * ## 提交快照（2026-11-01 定版复核第 3 项）
+     *
+     * 保存是异步的。要区分两种草稿：
+     *
+     *   - **本次提交的那个** —— 保存成功后必须清掉，否则它会与回读值配错；
+     *   - **保存期间新编辑的** —— 必须保留。
+     *
+     * 第一版（我上一轮的 SD-15 修复）无差别保留所有草稿。于是：
+     *
+     * ```
+     * 配置 500MB，显示 [500] [MB]
+     * 数字改 1024 → 保存 → 正确写入 1GB
+     * 回读把底值变成 1GB，但代码**保留了已提交的草稿 1024**
+     * 自然单位随底值从 MB 变成 GB → 界面显示 [1024] [GB]
+     * 不再编辑，再点保存 → 写入 1099511627776 = 1TB   ← 放大 1024 倍
+     * ```
+     *
+     * 现在：这里记下每个字段**提交时**的显示值与单位。回填时只有与快照
+     * **不同**的草稿才保留（那是用户在保存期间新编辑的）。
+     */
+    const submittedDrafts: Record<string, string> = {}
+    const submittedUnits: Record<string, string> = {}
+    for (const spec of FIELDS) {
+      const d = values[`${spec.key}.draft`]
+      if (typeof d === 'string') submittedDrafts[spec.key] = d
+      const u = values[`${spec.key}.unit`]
+      if (typeof u === 'string') submittedUnits[spec.key] = u
+    }
     const nextErrors: Record<string, string> = {}
     const payload: Record<string, unknown> = {}
     for (const spec of FIELDS) {
@@ -701,21 +764,79 @@ export function SafeZoneSettings(): ReactElement {
              * 保存按钮此时是 disabled，但输入框不是 —— 保持输入可用是好的，
              * 前提是回填不踩它。
              */
+            /*
+             * ## 提示用**合并结果**判断，不依赖 updater 的执行时机
+             *
+             * 我试过两种在 updater 内部记录结果的方式（局部变量、ref），
+             * 实测都不可靠：React 可能重放 updater（StrictMode、并发渲染），
+             * 第二次的 `prev` 已经是合并后的值，记录就丢了。
+             *
+             * 改为在 `setValues` **之前**算：提交快照 vs **当前**表单状态。
+             * 与提交快照不同即说明保存期间有新编辑。
+             *
+             * 必须读 `valuesRef.current` 而不是闭包里的 `values`：
+             * 这里有 `await`（mutate + describe），`values` 在那时已经过期，
+             * 看不到用户等待期间的输入。
+             */
+            const liveValues = valuesRef.current
+            const hasNewerEdit = Object.entries(submittedDrafts).some(([fieldKey, submitted]) => {
+              const live = liveValues[`${fieldKey}.draft`]
+              return typeof live === 'string' && live !== submitted
+            })
+            const hasNewerUnit = Object.entries(submittedUnits).some(([fieldKey, submitted]) => {
+              const live = liveValues[`${fieldKey}.unit`]
+              return typeof live === 'string' && live !== submitted
+            })
+
             setValues((prev) => {
               const fromServer = Object.fromEntries(
                 Object.entries(view.value).filter(([key]) => !key.endsWith('.draft')),
               )
               const merged: Record<string, unknown> = { ...fromServer }
+              /*
+               * ## 只保留**保存期间新编辑**的草稿（定版复核第 3 项）
+               *
+               * 上一版无差别保留所有草稿 —— 已提交的那个也留着，于是它
+               * 与回读后的新自然单位配错，界面显示 1024 GB，再存一次
+               * 就写入 1 TB（放大 1024 倍）。
+               *
+               * 现在的判据：
+               *   - 草稿与**提交时**的值相同 → 那是本次提交的，清掉
+               *     （界面回到回读值 + 自然单位）；
+               *   - 草稿不同 → 用户在保存期间改过，保留。
+               */
               for (const [key, value] of Object.entries(prev)) {
-                // 草稿与它的单位一起保留 —— 否则会出现"数字是新的、单位是旧的"。
-                if (key.endsWith('.draft')) merged[key] = value
-                else if (key.endsWith('.unit') && prev[`${key.slice(0, -5)}.draft`] !== undefined) {
-                  merged[key] = value
+                if (key.endsWith('.draft')) {
+                  const fieldKey = key.slice(0, -'.draft'.length)
+                  const submitted = submittedDrafts[fieldKey]
+                  // 与提交时不同 → 用户新改了 → 保留。
+                  if (typeof value === 'string' && value !== submitted) merged[key] = value
+                  continue
+                }
+                if (key.endsWith('.unit')) {
+                  const fieldKey = key.slice(0, -'.unit'.length)
+                  const submittedUnit = submittedUnits[fieldKey]
+                  /*
+                   * ## 单位的判据与数字**独立**（定版复核第 3 项的后半）
+                   *
+                   * 第一版要求"同字段有仍在编辑的草稿"才保留单位。于是
+                   * "保存期间只切单位、数字不动"时新单位被丢弃，界面显示
+                   * 已保存但实际没生效。
+                   *
+                   * 现在：单位与**提交时**不同就保留。
+                   */
+                  if (typeof value === 'string' && value !== submittedUnit) merged[key] = value
+                  continue
                 }
               }
               return merged
             })
-            setMessage('已保存。重启 DSH 生效。')
+
+            setMessage(
+              hasNewerEdit || hasNewerUnit
+                ? '已保存。保存期间还有新的修改尚未提交。重启 DSH 生效。'
+                : '已保存。重启 DSH 生效。',
+            )
           } else {
             // 没读到新值：保留用户输入，并如实说明「已写入但未能回读确认」。
             setMessage('已提交保存，但宿主回读到的仍是旧值。重启 DSH 后再确认。')

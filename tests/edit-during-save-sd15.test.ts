@@ -285,13 +285,22 @@ describe('SD-15: edits made during a save are not discarded', () => {
     /*
      * 单位的边界：数字是草稿、单位也是用户刚选的 —— 两者要一起保留，
      * 否则会出现"数字是新的、单位是旧的"。
+     *
+     * 注意这段现在只做**结构性补充**：真正的行为验证在
+     * `tests/save-drafts-rv05.test.ts`（"keeps a unit change made while the
+     * save was in flight"）。定版复核第 3 项把单位的判据改成了"与提交快照
+     * 比较"，不再依赖"同字段有草稿"，所以这里按新判据断言。
      */
     const { readFileSync } = await import('node:fs')
     const src = readFileSync('src/client/index.tsx', 'utf8')
 
-    const at = src.indexOf("if (confirmed) {")
-    const body = src.slice(at, at + 2200)
-    expect(body, '草稿的字段单位也要保留').toMatch(/endsWith\('\.unit'\)/)
+    const at = src.indexOf('if (confirmed) {')
+    expect(at, '应能找到回填分支').toBeGreaterThan(0)
+    const body = src.slice(at, at + 3000)
+
+    // 单位分支必须存在，且用提交快照判断。
+    expect(body, '应处理 .unit 键').toMatch(/endsWith\('\.unit'\)/)
+    expect(body, '单位应比对提交快照').toMatch(/submittedUnits/)
     void MB
     void GB
   })
