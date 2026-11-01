@@ -50,6 +50,35 @@ const OPAQUE_EXECUTION = [/-e(?:nc|ncodedcommand)\s+\S+/i, /frombase64string/i]
  *
  * 命中即视为删除意图；目标仍按常规方式抽取（抽不出就 `ask`）。
  */
+
+/**
+ * 会**执行**引号里那段代码的包装器（2026-11-01 审查 SD-17）。
+ *
+ * `sh -c "rm x"`、`node -e "unlink(...)"`、`powershell -Command "..."` ——
+ * 引号里的删除字样会被真的执行。而 `const note = "file.Delete()"` 的同样
+ * 字样只是普通字符串。
+ *
+ * 这个集合用来区分两者：只有命令头是这些包装器时，才把引号内的删除字样
+ * 当真删除。
+ */
+const RUNS_INLINE_CODE = new Set([
+  'sh',
+  'bash',
+  'zsh',
+  'cmd',
+  'powershell',
+  'pwsh',
+  'node',
+  'nodejs',
+  'python',
+  'python3',
+  'perl',
+  'ruby',
+  'eval',
+  'exec',
+  'invoke-expression',
+  'iex',
+])
 const DELETE_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
   // find ... -delete
   { label: 'find -delete', pattern: /\bfind\b[^\n|]*\s-delete\b/i },
@@ -132,25 +161,176 @@ function stripOuterQuotes(text: string): string {
  * 注释里确实出现了删除字样，但不会执行。不剥离就会把注释当成真删除 ——
  * 那正是上一代插件把写文件用的 heredoc 也拦下的原因。
  *
- * 范围刻意保守：**只去注释，不碰字符串**。引号里的内容可能是真目标
- * （`rm -rf "/tmp/real target"`），抹掉会让分类器基于错误路径判断。至于
- * `echo "rm -rf /tmp"` 这种"只是打印"，由下面的 `mentionsOnly` 另行判定。
+ * ## 必须维护引号状态（2026-11-01 审查 SD-11 / SD-17）
+ *
+ * 第一版逐行用正则找 `#` / `//` 然后截断，**完全不看引号**。两个方向的错：
+ *
+ * **漏判（SD-11）** —— 字符串里的注释符让后续真删除被裁掉：
+ *
+ * ```js
+ * node -e "console.log(' # marker'); require('fs').unlinkSync('important.txt')"
+ * //        ^^^^^^^^^^^^^^^^^^^^^^^ 这里有 " # "，整行从那里被截断
+ * //        → 后面的 unlinkSync 根本没被看到 → destructive=false
+ * ```
+ *
+ * **误判（SD-17）** —— 注释/字符串里的 `file.Delete()` 被当成真删除：
+ *
+ * ```
+ * # file.Delete() is an example
+ * const note = "file.Delete()"
+ * ```
+ *
+ * 两者根因相同：把"字符出现"当成"语法角色"。
+ *
+ * ## 现在的做法
+ *
+ * 一次字符扫描，维护引号与转义状态：
+ *   - 单引号内：**一切都不展开**，`#`、`//`、`/*` 都是普通字符；
+ *   - 双引号内：同样保留（这里不做模板插值分析，保守起见一律当内容）；
+ *   - 引号外遇到 `#`（前面是空白/行首）、`//`、`/*` 才是注释。
+ *
+ * 只去注释，不碰字符串 —— 与第一版的范围一致。
  *
  * @param command 原始命令。
  * @returns 去掉注释后的文本。
  */
 function stripComments(command: string): string {
-  const withoutBlockComments = command.replace(/\/\*[\s\S]*?\*\//g, ' ')
-  return withoutBlockComments
-    .split('\n')
-    .map((line) => {
-      const hash = /(^|\s)#\s/.exec(line)
-      let trimmed = hash !== null ? line.slice(0, hash.index) : line
-      const slashes = /(^|\s)\/\//.exec(trimmed)
-      if (slashes !== null) trimmed = trimmed.slice(0, slashes.index)
-      return trimmed
-    })
-    .join('\n')
+  let out = ''
+  let i = 0
+  /** 当前所处的引号：`'`、`"` 或 `null`。 */
+  let quote: "'" | '"' | null = null
+
+  while (i < command.length) {
+    const ch = command[i] as string
+
+    if (quote !== null) {
+      out += ch
+      if (ch === '\\' && i + 1 < command.length) {
+        // 转义：把下一个字符原样带上，不让它被当成引号结束。
+        out += command[i + 1] as string
+        i += 2
+        continue
+      }
+      if (ch === quote) quote = null
+      i += 1
+      continue
+    }
+
+    // 引号外：识别注释起始。
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      out += ch
+      i += 1
+      continue
+    }
+
+    /*
+     * `#` 注释：POSIX shell 里要求前面是空白或行首，否则 `a#b` 是普通字符。
+     * JS 里 `#` 只在正则/私有字段出现，当作注释起始是保守的。
+     */
+    if (ch === '#') {
+      const prev = i === 0 ? ' ' : (command[i - 1] as string)
+      if (i === 0 || /\s/.test(prev)) {
+        // 跳到行尾（不含换行）。
+        while (i < command.length && command[i] !== '\n') i += 1
+        continue
+      }
+    }
+
+    // `//` 行注释。
+    if (ch === '/' && command[i + 1] === '/') {
+      while (i < command.length && command[i] !== '\n') i += 1
+      continue
+    }
+
+    // `/* */` 块注释（可跨行）。
+    //
+    // **必须确认存在配对的 `*\/` 才当注释**（2026-11-01 修正）：
+    // 路径通配里也会出现 `/*` —— `rm -rf ./*`、`rm -rf /tmp/*`。
+    // 第一版（以及我这版最初的写法）一见到 `/*` 就开始吞，把目标吃成 `.`
+    // 或 `/tmp`，于是 glob 删除的目标被判成字面路径。
+    if (ch === '/' && command[i + 1] === '*') {
+      const close = command.indexOf('*/', i + 2)
+      if (close !== -1) {
+        i = close + 2
+        // 块注释替换成一个空格，避免把两侧 token 黏在一起。
+        out += ' '
+        continue
+      }
+      // 没有配对结束符：这是普通字符（多半是路径里的通配），原样保留。
+    }
+
+    out += ch
+    i += 1
+  }
+
+  return out
+}
+
+
+/**
+ * 把**引号内的内容**替换成空格，只保留引号本身。
+ *
+ * ## 为什么需要（2026-11-01 审查 SD-17）
+ *
+ * `DELETE_PATTERNS` 里有 `.delete(` 这类方法调用形态。而字符串里也可能
+ * 出现同样的字样：
+ *
+ * ```
+ * const note = "file.Delete()"     ← 只是字符串，不会执行
+ * file.Delete()                    ← 真实调用
+ * ```
+ *
+ * 两者在"去注释后"的文本里长得一样。要区分它们，必须知道那个 `.Delete()`
+ * 是不是在引号里。
+ *
+ * 这个函数把 `"..."` 与 `'...'` 的内容抹成空格，于是：
+ *   - `const note = "file.Delete()"` → `const note = "              "`
+ *   - `file.Delete()` → 原样保留
+ *
+ * ## 为什么保留引号本身
+ *
+ * `targetFromPattern` 需要看引号来抽取目标路径。抹掉引号会让它误判。
+ *
+ * @param text 文本。
+ * @returns 引号内容被空格替换后的文本。
+ */
+function blankQuotedContent(text: string): string {
+  let out = ''
+  let i = 0
+  let quote: "'" | '"' | null = null
+
+  while (i < text.length) {
+    const ch = text[i] as string
+    if (quote === null) {
+      if (ch === "'" || ch === '"') {
+        quote = ch
+        out += ch
+        i += 1
+        continue
+      }
+      out += ch
+      i += 1
+      continue
+    }
+    // 引号内：保留引号字符本身，其余抹成空格。
+    if (ch === '\\' && i + 1 < text.length) {
+      out += '  '
+      i += 2
+      continue
+    }
+    if (ch === quote) {
+      quote = null
+      out += ch
+      i += 1
+      continue
+    }
+    // 换行保留（避免把多行结构压平），其余抹空格。
+    out += ch === '\n' ? '\n' : ' '
+    i += 1
+  }
+
+  return out
 }
 
 /**
@@ -185,6 +365,22 @@ function mentionsOnly(command: string): boolean {
     // `cat list | xargs rm -rf`：管道的下游是 `xargs rm ...`，动词在参数里。
     if (DELETES_VIA_ARGUMENT.has(head) && segTokens.some((t) => isDeleteVerb(t))) return false
     if (isDeleteVerb(head)) return false
+    /*
+     * ## 参数位置的删除标记（2026-11-01 审查 SD-10）
+     *
+     * `find /tmp/x -delete` 与 `(Get-Item x).Delete()` 的动词**不在段首**：
+     *
+     * ```
+     * echo ready; find /tmp/x -delete            ← 段首是 find
+     * echo ready; (Get-Item C:\x).Delete()       ← 段首是 (Get-Item
+     * ```
+     *
+     * 上面两行只查段首，于是被当作"仅提及"放行。而同样的删除**去掉只读前缀**
+     * 就能被别处的整串正则抓到 —— 加个 `echo` 就豁免了。
+     *
+     * 这里补一道：整段里出现参数级删除标记，就不算"仅提及"。
+     */
+    if (segTokens.some((t) => isDeleteArgumentMarker(t))) return false
   }
 
   // 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与 `echo \`rm -rf /tmp/x\``
@@ -453,6 +649,55 @@ function isDeleteVerb(token: string): boolean {
   // Windows 上 `rd.exe` / `del.exe` 与 `rd` / `del` 等同。
   const withoutExe = base.replace(/\.(exe|com|cmd|bat)$/, '')
   return (DELETE_VERBS as readonly string[]).includes(base) || (DELETE_VERBS as readonly string[]).includes(withoutExe)
+}
+
+/**
+ * 在**参数位置**表达删除的标记（2026-11-01 审查 SD-10）。
+ *
+ * `DELETE_VERBS` 是**命令名**的集合。但有些工具把删除表达为**选项**：
+ *
+ * ```
+ * find /tmp/x -delete          ← 命令名是 find（不在 DELETE_VERBS 里）
+ * rsync --delete src/ dst/     ← 命令名是 rsync
+ * ```
+ *
+ * 切段后的 `mentionsOnly` 只查段首是不是删除动词，于是
+ * `echo ready; find /tmp/x -delete` 被判为"仅提及"而放行 ——
+ * 而 `find /tmp/x -delete` 单独出现时能被别处的整串正则抓到。
+ *
+ * 隔离验证：前者 `destructive=false`，后者 `true`。同一个删除，加了只读前缀
+ * 就豁免了。
+ */
+const DELETE_ARGUMENT_MARKERS = [
+  '-delete',
+  '--delete',
+  '--delete-after',
+  '--delete-before',
+  '--delete-during',
+  '--delete-excluded',
+  '--remove-source-files',
+] as const
+
+/**
+ * 判断一个 token 是否是"参数位置的删除标记"。
+ *
+ * 也覆盖方法调用形态：`.delete()`、`.unlink()`、`.rmdir()`、`.remove()`
+ * —— PowerShell 的 `(Get-Item x).Delete()` 与 Node 的 `fs.unlinkSync(x)`
+ * 都是这种形状，动词不在段首。
+ *
+ * @param token token（已小写、已去引号）。
+ * @returns 是删除标记返回 true。
+ */
+function isDeleteArgumentMarker(token: string): boolean {
+  const cleaned = token.toLowerCase().replace(/^['"]|['"]$/g, '')
+  if ((DELETE_ARGUMENT_MARKERS as readonly string[]).includes(cleaned)) return true
+  /*
+   * 方法调用形态：`(get-item c:\x).delete()`、`fs.rmdirsync(...)`、`.unlink()`。
+   *
+   * 只认"点 + 删除动词 + 左括号"这个紧凑形状，避免把
+   * `console.log('delete')` 这种普通字符串也算进来。
+   */
+  return /\.(delete|deletemany|unlink|unlinksync|rmdir|rmdirsync|remove|removeitem)\s*\(/.test(cleaned)
 }
 
 /** 取出 token 的动词基本形式（`C:\…\rd.exe` → `rd`）。 */
@@ -842,18 +1087,97 @@ export function parseCommand(command: string): CommandVerdict {
   // 这些写法里没有 `rm`、`del` 这类词，动词表永远匹配不到。漏掉它们就等于
   // 让一条真删除通道完全不设防 —— 而这正是"写了符号却拦截失效"那种最坏的失败。
   // 命中后仍尝试抽取目标；抽不出来就交给人类判断。
-  const patternHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(raw))
+  //
+  // ## 必须在**去注释后**的文本上匹配（2026-11-01 审查 SD-17）
+  //
+  // 第一版用 `raw`（原始命令）。于是注释和字符串里的字样也算命中：
+  //
+  // ```
+  // # file.Delete() is an example       ← 注释，不会执行
+  // const note = "file.Delete()"        ← 字符串，不会执行
+  // ```
+  //
+  // 两者都被判 destructive=true —— 多出来的审批会让用户开始无脑点允许，
+  // 那比少问一次更危险。
+  //
+  // 用 `stripComments(raw)` 之后的文本来匹配，与上面 `mentionsOnly` 走同一份
+  // 词法处理。
+  //
+  // ## 为什么"抹引号内容"要分两步（2026-11-01 审查 SD-17）
+  //
+  // 字符串里的 `.delete()` 不会执行，而真实调用会。两者在纯文本上长得一样，
+  // 只有引号状态能区分。
+  //
+  // 但**不能整体抹掉**：`node -e "...unlinkSync('C:\\x')"` 的删除调用就在
+  // 双引号内部 —— 整体抹掉会把它当无害，那是把一个真删除放行了。
+  //
+  // 折中：
+  //   1. 先用**原文本**匹配一遍 —— 删除字样出现在引号里也可能真的执行
+  //      （`sh -c "rm x"`、`node -e "...unlink(...)"`），命中就是要人看；
+  //   2. 若只在"抹掉引号内容"的版本里命中，说明那个字样纯粹在字符串里、
+  //      没有任何引号外的调用形态 —— 那种才放行。
+  //
+  // 换句话说：**可疑就保守**。宁可多问一次，不可放过一条真删除。
+  const commentFree = stripComments(raw)
+  const quotedBlanked = blankQuotedContent(commentFree)
+
+  /*
+   * 判定顺序：
+   *
+   * 1. 先看**引号外**是否就有删除构造（`quotedBlanked`）——
+   *    这是最确定的"真删除"，不受字符串干扰。
+   * 2. 再看**原文本**里是否命中，但**排除执行包装器**的情况。
+   *
+   * 第 2 步的例外很关键：`sh -c "rm x"`、`node -e "...unlink..."` 的删除在
+   * 引号内，但它**会被执行**。而 `const note = "file.Delete()"` 的同样字样
+   * 只是普通字符串。两者的区别是前者有执行包装器在跑那段字符串。
+   */
+  const outsideQuotesHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(quotedBlanked))
+  const anyHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(commentFree))
+
+  /**
+   * 是否在用包装器执行引号里的内容。
+   *
+   * `sh -c "rm x"`、`node -e "unlink(...)"`、`powershell -Command "..."` ——
+   * 这些的删除字样在引号内，但**会被真的执行**。而
+   * `const note = "file.Delete()"` 的同样字样只是普通字符串。
+   *
+   * 只看命令的第一个 token，避免把很长的脚本正文当成匹配对象。
+   */
+  const runsQuotedCode = (() => {
+    const firstSegment = splitOutsideQuotes(commentFree)[0] ?? ''
+    const segTokens = tokenize(firstSegment)
+    /*
+     * 逐一检查**前几个** token，而不是只看第一个。
+     *
+     * 为什么：含空格的路径会被 `tokenize` 拆开 ——
+     * `C:\Program Files\nodejs\node.exe -e '...'` 的第一个 token 是
+     * `C:\Program`，真正的命令是后面的 `node.exe`。
+     *
+     * 只看 `[0]` 会把这条真删除判成无害（回归实测）。
+     * 检查前 4 个足够覆盖「路径 + 参数」的常见形态，又不会把
+     * 很长的脚本正文当成命令头。
+     */
+    for (const token of segTokens.slice(0, 4)) {
+      const cleaned = token.toLowerCase().replace(/^['"]|['"]$/g, '')
+      const base = (cleaned.split(/[\\/]/).pop() ?? cleaned).replace(/\.(exe|com|cmd|bat)$/, '')
+      if (RUNS_INLINE_CODE.has(base)) return true
+    }
+    return false
+  })()
+
+  const patternHit = outsideQuotesHit ?? (runsQuotedCode ? anyHit : undefined)
   if (patternHit !== undefined) {
     const recursive =
-      /-delete\b/i.test(raw) ||
-      /--del(?:ete)?\b/i.test(raw) ||
+      /-delete\b/i.test(commentFree) ||
+      /--del(?:ete)?\b/i.test(commentFree) ||
       /recursive\s*:\s*true/i.test(lower) ||
       RECURSIVE_FLAGS.some((flag) => tokens.includes(flag))
     return {
       destructive: true,
       kind: 'delete',
       recursive,
-      target: targetFromPattern(raw, patternHit.label),
+      target: targetFromPattern(commentFree, patternHit.label),
     }
   }
 
