@@ -1,269 +1,299 @@
-import { describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { batchDirOf, readManifest, recoverBatch } from '../src/batch-manifest'
+import { batchDirOf, readDirState, readManifest, recoverBatch } from '../src/batch-manifest'
 import { scratchDir } from './support/tmpdir'
 
 /**
- * SD-01（2026-11-01 审查）：批次恢复不能把"读不到"当成"空目录"。
+ * SD-01 / RV-10（第一轮 + 第二轮审查）：批次恢复不能把"读不到"当成"空目录"。
  *
- * ## 缺陷
+ * ## 原始缺陷
  *
  * ```
  * const leftovers = existsSync(staged) ? listDirSafe(staged) : []
  * if (leftovers.length === 0) rmSync(bDir, { recursive: true })
  * ```
  *
- * `listDirSafe` 遇到**任何**读取错误返回 `[]`。于是"枚举批次内容时遇到
- * 瞬时 EIO"被当成"里面是空的"，随后递归删除把唯一的用户副本删掉。
+ * `listDirSafe` 遇到**任何**读取错误返回 `[]`。于是"枚举批次内容时遇到瞬时
+ * EIO"被当成"里面是空的"，随后递归删除把唯一的用户副本删掉。
  *
- * **读取失败不是空目录的证明。** 读与删是不同系统调用，权限与瞬时错误
- * 可以不同。
+ * **读取失败不是空目录的证明。**
  *
- * ## 修复后的语义
+ * ## 第二轮审查 RV-10：第一轮的 EIO 测试是**假绿**
  *
- * `readDirState` 三态：`empty` 可以删、`nonempty` 不能删、`error` 一律保留。
- * 另外只要有任何一条不是确定归宿（`recovery-failed`），也保留目录。
+ * 那版把注入写进独立 `.cjs` 探针并 `require('../lib/batch-manifest.js')`。
+ * 三个独立原因让它从未执行断言：
+ *
+ * 1. 探针在临时目录，`../lib/...` 相对位置不对 → `MODULE_NOT_FOUND`；
+ * 2. `lib/batch-manifest.js` **不存在** —— tsdown 把它 bundle 进了 hash
+ *    chunk（本轮实测确认）；
+ * 3. 注入点是 `batches/<id>/items/<entryId>`，而实现读的是**父目录**
+ *    `batches/<id>/items` → 即使能加载也命中不了。
+ *
+ * 失败处理是打印 `SKIP` + `exit(0)`，测试看到 SKIP 就 `return` —— 一直"通过"。
+ *
+ * ## 现在的做法
+ *
+ * 不再试图 patch 全局 `readdirSync`（实测无效：ESM 的命名导入绑定直接连到
+ * 内置模块，patch CJS 导出对象命中数为 0）。改为：
+ *
+ * 1. **导出 `readDirState`**，直接测三态语义 —— 包括用 chmod 制造真实
+ *    的 EACCES，不需要任何注入；
+ * 2. `recoverBatch` 的保留行为用**真实可复现的失败**验证：
+ *    `state/items` 是文件 → 搬回必然失败 → 内容必须留在批次里。
+ *
+ * 没有任何 SKIP 分支：拿不到东西就直接失败。
  */
-describe('SD-01: a failed directory read does not delete the only copy', () => {
-  /**
-   * 造一个"搬到一半"的批次。
-   *
-   * @param opts 是否让内容搬回失败。
-   * @returns 状态目录、批次 id、条目 id。
-   */
-  async function setupBatch(opts: { blockMoveBack?: boolean } = {}): Promise<{
-    state: string
-    batchId: string
-    entryId: string
-    staged: string
-  }> {
-    const root = scratchDir('dsd-sd01-')
-    const state = join(root, 'state')
-    const batchId = 'leftover-batch'
-    const entryId = '20261030-120000-abcdef'
-    const staged = join(batchDirOf(state, batchId), 'items', entryId)
+describe('SD-01 / RV-10: a failed directory read is not proof of an empty directory', () => {
+  describe('readDirState three-state semantics', () => {
+    it('reports empty for a directory with no entries', () => {
+      const dir = join(scratchDir('dsd-rd-'), 'empty')
+      mkdirSync(dir, { recursive: true })
+      expect(readDirState(dir)).toEqual({ kind: 'empty' })
+    })
 
-    mkdirSync(staged, { recursive: true })
-    writeFileSync(join(staged, 'precious.txt'), 'ONLY-COPY')
-    mkdirSync(join(state, 'items'), { recursive: true })
+    it('reports nonempty with the entry names', () => {
+      const dir = join(scratchDir('dsd-rd-'), 'full')
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'a.txt'), 'a')
+      const state = readDirState(dir)
+      expect(state.kind).toBe('nonempty')
+      if (state.kind === 'nonempty') expect(state.names).toContain('a.txt')
+    })
 
-    writeFileSync(
-      join(batchDirOf(state, batchId), 'manifest.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        batchId,
-        createdAt: Date.now(),
-        status: 'staging',
-        entries: [{ id: entryId, originalPath: 'C:/work/precious.txt', bytes: 9 }],
-      }),
-    )
+    it('reports empty for a genuinely missing directory (ENOENT)', () => {
+      // ENOENT 与"读失败"不同：目录确实不在，可以当空。
+      const dir = join(scratchDir('dsd-rd-'), 'does-not-exist')
+      expect(readDirState(dir), 'ENOENT 可以当空').toEqual({ kind: 'empty' })
+    })
 
-    /*
-     * 让"搬回 items/"失败：把 `items/` 本身变成一个**文件**。
+    it('reports error for a permission failure, never empty', () => {
+      /*
+       * 真实 EACCES：把目录权限去掉。
+       *
+       * POSIX 上有效；Windows 上 chmod 对目录基本无效，所以那里跳过 ——
+       * 但**不能**静默跳过整条测试，所以用平台断言明确说明。
+       */
+      const dir = join(scratchDir('dsd-rd-'), 'denied')
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'secret.txt'), 'x')
+
+      if (process.platform === 'win32') {
+        /*
+         * Windows：用"路径指向一个文件"制造非 ENOENT 的读失败
+         * （ENOTDIR），仍然必须是 error 而不是 empty。
+         */
+        const asFile = join(scratchDir('dsd-rd-'), 'a-file')
+        writeFileSync(asFile, 'x')
+        const state = readDirState(asFile)
+        expect(state.kind, '目录位置是文件 → 读失败，不是空').toBe('error')
+        return
+      }
+
+      chmodSync(dir, 0o000)
+      try {
+        const state = readDirState(dir)
+        expect(state.kind, '权限失败必须是 error').toBe('error')
+      } finally {
+        chmodSync(dir, 0o755)
+      }
+    })
+
+    it('is exported so this semantics can be tested at all', async () => {
+      /*
+       * 结构性：RV-10 的根因之一是"没法直接测"。导出这件事本身要钉住 ——
+       * 否则以后有人改回私有，这套测试就只能又退回去做全局注入。
+       */
+      const mod = (await import('../src/batch-manifest')) as Record<string, unknown>
+      expect(typeof mod['readDirState'], 'readDirState 必须导出').toBe('function')
+    })
+  })
+
+  describe('recoverBatch keeps the only copy when the outcome is unknown', () => {
+    /**
+     * 造一个"搬到一半"的批次。
      *
-     * 那样 `renameSync(inBatch, inItems)` 无法创建条目目录（父路径不是目录），
-     * 产出 `recovery-failed` —— 内容留在批次里，是最危险的情形。
-     *
-     * 注意不能用"目标位置放同名目录"：那会被判成 `left-in-place`
-     * （内容已就位的合理语义），不是搬回失败。
+     * @param opts 选项。
+     * @returns 路径与 id。
      */
-    if (opts.blockMoveBack === true) {
-      const itemsRoot = join(state, 'items')
-      rmSync(itemsRoot, { recursive: true, force: true })
-      writeFileSync(itemsRoot, 'BLOCKER-NOT-A-DIRECTORY')
+    function setupBatch(opts: { emptyStaged?: boolean; blockMoveBack?: boolean } = {}): {
+      state: string
+      batchId: string
+      entryId: string
+      stagedRoot: string
+      bDir: string
+    } {
+      const root = scratchDir('dsd-sd01-')
+      const state = join(root, 'state')
+      const batchId = 'leftover-batch'
+      const entryId = '20261030-120000-abcdef'
+      const bDir = batchDirOf(state, batchId)
+      const stagedRoot = join(bDir, 'items')
+
+      if (opts.emptyStaged !== true) {
+        mkdirSync(join(stagedRoot, entryId), { recursive: true })
+        writeFileSync(join(stagedRoot, entryId, 'precious.txt'), 'ONLY-COPY')
+      } else {
+        mkdirSync(stagedRoot, { recursive: true })
+      }
+
+      if (opts.blockMoveBack === true) {
+        // `state/items` 变成文件 → 搬回必然失败（最危险：内容留在批次里）。
+        writeFileSync(join(state, 'items'), 'not-a-directory')
+      } else {
+        mkdirSync(join(state, 'items'), { recursive: true })
+      }
+
+      writeFileSync(
+        join(bDir, 'manifest.json'),
+        JSON.stringify({
+          schemaVersion: 1,
+          batchId,
+          createdAt: Date.now(),
+          status: 'staging',
+          entries: [{ id: entryId, originalPath: 'C:/work/precious.txt', bytes: 9 }],
+        }),
+      )
+
+      return { state, batchId, entryId, stagedRoot, bDir }
     }
 
-    return { state, batchId, entryId, staged }
-  }
+    it('keeps the batch when content cannot be moved back', () => {
+      /*
+       * 这是可**真实复现**的"不确定归宿"：搬回失败。
+       *
+       * 只要有任一条不是确定归宿，目录就不能删 —— 那正是 SD-01 的承诺。
+       */
+      const { state, batchId, bDir, stagedRoot, entryId } = setupBatch({ blockMoveBack: true })
 
-  it('keeps the batch when the directory read fails (EIO)', async () => {
-    /*
-     * 核心断言：注入 readdir EIO 后，批次与内容都必须保留。
+      const result = recoverBatch(state, batchId)
+
+      expect(result.batchRemoved, '搬回失败时不能删批次').toBe(false)
+      expect(existsSync(bDir), '批次目录必须保留').toBe(true)
+      expect(existsSync(join(stagedRoot, entryId, 'precious.txt')), '唯一副本必须留在批次里').toBe(
+        true,
+      )
+      expect(
+        result.entries.some((e) => e.outcome === 'recovery-failed'),
+        '应记录为未确定归宿',
+      ).toBe(true)
+    })
+
+    it('removes the batch when the staged directory is genuinely empty', () => {
+      /*
+       * 反向：真空目录 → 允许清理。否则"保留"会变成永不清理。
+       *
+       * 注意 manifest 也必须是空的 —— 若还列着条目，实现会去搬它、
+       * 结果是 `missing` 而不是"目录为空"。这两种语义不同，不能混。
+       */
+      const root = scratchDir('dsd-sd01-empty-')
+      const state = join(root, 'state')
+      const batchId = 'empty-batch'
+      const bDir = batchDirOf(state, batchId)
+      mkdirSync(join(bDir, 'items'), { recursive: true })
+      mkdirSync(join(state, 'items'), { recursive: true })
+      writeFileSync(
+        join(bDir, 'manifest.json'),
+        JSON.stringify({
+          schemaVersion: 1,
+          batchId,
+          createdAt: Date.now(),
+          status: 'staging',
+          entries: [],
+        }),
+      )
+
+      const result = recoverBatch(state, batchId)
+
+      expect(result.batchRemoved, '真空目录可以删').toBe(true)
+      expect(existsSync(bDir), '批次目录应被清理').toBe(false)
+    })
+
+    it('moves content back when the move can succeed', () => {
+      // 正常路径：内容回到 items/，批次被清理。
+      const { state, batchId, entryId, bDir } = setupBatch()
+
+      const result = recoverBatch(state, batchId)
+
+      expect(result.batchRemoved, '成功后应清理批次').toBe(true)
+      expect(existsSync(bDir)).toBe(false)
+      expect(existsSync(join(state, 'items', entryId, 'precious.txt')), '内容应回到 items/').toBe(true)
+    })
+  })
+
+  describe('manifest validation', () => {
+    /**
+     * 给校验用例用的最小批次。
      *
-     * 用 `vi.spyOn` 注入 —— 它在模块加载**之后**替换属性，
-     * 而 `batch-manifest.ts` 用的是 `import { readdirSync }`，
-     * 绑定在加载时确定。所以这里改为临时替换模块命名空间：
-     * vitest 的 ESM mock 无法改已解构的绑定，因此我们**直接验证行为**：
-     * 用 `readDirState` 的三态语义（通过真实 EACCES 场景）。
+     * @returns 状态目录、批次 id、批次目录。
      */
-    const { state, batchId, staged } = await setupBatch({ blockMoveBack: true })
-
-    /*
-     * 用真实权限错误触发 readdir 失败（Windows 上 ACL 复杂，改用
-     * 一个更可靠的方式：把 staged 目录删掉，只留 manifest ——
-     * 那样 readDirState 得到 ENOENT，应当视为 "empty"）。
-     *
-     * 这里要验证的是"读失败⇒保留"，所以另用一条独立测试走 EIO 注入。
-     */
-    const result = recoverBatch(state, batchId)
-
-    // 搬回失败 → recovery-failed → 必须保留。
-    expect(result.entries[0]?.outcome).toBe('recovery-failed')
-    expect(result.batchRemoved, '搬回失败时批次必须保留').toBe(false)
-    expect(existsSync(staged), '内容必须还在').toBe(true)
-  })
-
-  it('keeps the batch when a recovery outcome is undetermined', async () => {
-    /*
-     * 只要有任意一条不是"确定归宿"，就不能删批次目录 ——
-     * 内容可能还在里面，我们只是没能搬回去。
-     */
-    const { state, batchId } = await setupBatch({ blockMoveBack: true })
-
-    const result = recoverBatch(state, batchId)
-    const hasUndetermined = result.entries.some(
-      (e) => e.outcome === 'recovery-failed' || e.outcome === 'missing',
-    )
-    expect(hasUndetermined, '构造前提：应有一条未确定').toBe(true)
-    expect(result.batchRemoved, '有未确定条目时不能删批次').toBe(false)
-  })
-
-  it('removes the batch only when everything moved back cleanly', async () => {
-    /*
-     * 正常路径：内容成功搬回 items/、没有残留 → 批次目录可以删。
-     *
-     * 这条防止"过度保守"：修 SD-01 不能把所有批次目录都永久留着。
-     */
-    const { state, batchId, entryId, staged } = await setupBatch()
-
-    const result = recoverBatch(state, batchId)
-
-    expect(result.entries[0]?.outcome, '应成功搬回').toBe('moved-back')
-    expect(result.batchRemoved, '干净搬回后应清掉批次').toBe(true)
-    expect(existsSync(staged), '批次里的内容应已移走').toBe(false)
-    // 内容确实到了 items/。
-    expect(existsSync(join(state, 'items', entryId, 'precious.txt')), '内容应已归位').toBe(true)
-  })
-
-  it('keeps the batch when extra content remains in it', async () => {
-    /*
-     * 清单之外还有内容（例如上次崩溃留下的、或旧版本写的）——
-     * 那种情况也不能删。
-     */
-    const { state, batchId, staged } = await setupBatch()
-
-    // 在 staged 里放一个 manifest 没列的文件。
-    writeFileSync(join(batchDirOf(state, batchId), 'items', 'stray.txt'), 'STRAY')
-
-    const result = recoverBatch(state, batchId)
-
-    expect(result.batchRemoved, '有残留内容时不能删批次').toBe(false)
-    expect(existsSync(join(batchDirOf(state, batchId), 'items', 'stray.txt')), '残留应保留').toBe(true)
-    void staged
-  })
-
-  it('treats a missing batch directory as empty (safe to clean)', async () => {
-    /*
-     * ENOENT 是"确实不存在"，可以当空处理 —— 否则永远不会清理残留。
-     */
-    const root = scratchDir('dsd-sd01-enoent-')
-    const state = join(root, 'state')
-    const batchId = 'no-such-batch'
-    mkdirSync(batchDirOf(state, batchId), { recursive: true })
-    writeFileSync(
-      join(batchDirOf(state, batchId), 'manifest.json'),
-      JSON.stringify({
-        schemaVersion: 1,
-        batchId,
-        createdAt: 1,
-        status: 'staging',
-        entries: [],
-      }),
-    )
-
-    const result = recoverBatch(state, batchId)
-    // 没有条目、没有 staged 目录 → 可以删。
-    expect(result.batchRemoved, '空批次可以清理').toBe(true)
-  })
-
-  it('leaves the manifest readable after a failed recovery', async () => {
-    // 失败时 manifest 必须保留 —— 它是下次恢复的依据。
-    const { state, batchId } = await setupBatch({ blockMoveBack: true })
-
-    recoverBatch(state, batchId)
-
-    expect(readManifest(state, batchId), 'manifest 必须保留').not.toBeNull()
-    const names = readdirSync(batchDirOf(state, batchId))
-    expect(names).toContain('manifest.json')
-  })
-})
-
-/**
- * 补充：注入 readdir 失败的直接验证。
- *
- * `batch-manifest.ts` 用 `import { readdirSync }` 解构绑定，`vi.spyOn(fs, …)`
- * 改的是命名空间属性，不会影响已解构的引用。所以这里改为在**独立的
- * 子进程**里运行 —— 那里模块尚未加载，patch 能生效。
- *
- * 这条用一个很小的内联脚本，避免依赖构建产物。
- */
-describe('SD-01: injected EIO keeps the batch (isolated process)', () => {
-  it('keeps content when readdir throws EIO', async () => {
-    const { execFileSync } = await import('node:child_process')
-    const script = `
-const { createRequire } = require('node:module')
-const fs = require('node:fs')
-const path = require('node:path')
-const os = require('node:os')
-
-const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsd-sd01i-'))
-const state = path.join(root, 'state')
-const batchId = 'b1'
-const entryId = '20261030-120000-abcdef'
-const bDir = path.join(state, 'batches', batchId)
-const staged = path.join(bDir, 'items', entryId)
-fs.mkdirSync(staged, { recursive: true })
-fs.writeFileSync(path.join(staged, 'precious.txt'), 'ONLY-COPY')
-fs.mkdirSync(path.join(state, 'items'), { recursive: true })
-fs.writeFileSync(path.join(bDir, 'manifest.json'), JSON.stringify({
-  schemaVersion: 1, batchId, createdAt: 1, status: 'staging',
-  entries: [{ id: entryId, originalPath: 'C:/w/p.txt', bytes: 9 }],
-}))
-
-// 让"搬回"成功，但注入 readdir 失败 —— 这样能单独测"读失败是否阻止删除"。
-const real = fs.readdirSync
-fs.readdirSync = function (p, o) {
-  if (typeof p === 'string' && path.resolve(p) === path.resolve(staged)) {
-    const e = new Error('EIO: i/o error'); e.code = 'EIO'; throw e
-  }
-  return real.call(fs, p, o)
-}
-
-// 用编译产物（build 之后存在）；没有就直接说明跳过。
-let recoverBatch
-try {
-  recoverBatch = require('../lib/batch-manifest.js').recoverBatch
-} catch (e) {
-  fs.rmSync(root, { recursive: true, force: true })
-  console.log('SKIP: lib/batch-manifest.js 不可直接 require')
-  process.exit(0)
-}
-
-const r = recoverBatch(state, batchId)
-const contentLeft = fs.existsSync(path.join(staged, 'precious.txt'))
-const batchLeft = fs.existsSync(bDir)
-console.log(JSON.stringify({ batchRemoved: r.batchRemoved, contentLeft, batchLeft }))
-fs.rmSync(root, { recursive: true, force: true })
-`
-    const tmpScript = join(scratchDir('dsd-sd01-script-'), 'probe.cjs')
-    writeFileSync(tmpScript, script, 'utf8')
-
-    let out = ''
-    try {
-      out = execFileSync(process.execPath, [tmpScript], { encoding: 'utf8', timeout: 60_000 })
-    } catch (error) {
-      // 没有构建产物时跳过（lib 可能未 build）。
-      const msg = error instanceof Error ? error.message : String(error)
-      expect(msg, '内联探测脚本不应崩溃').toBeDefined()
-      return
+    function setupBatchLocal(): { state: string; batchId: string; bDir: string } {
+      const root = scratchDir('dsd-mv-')
+      const state = join(root, 'state')
+      const batchId = 'validate-batch'
+      const bDir = batchDirOf(state, batchId)
+      mkdirSync(join(bDir, 'items'), { recursive: true })
+      return { state, batchId, bDir }
     }
 
-    if (out.includes('SKIP')) return
-    const parsed = JSON.parse(out.trim()) as { batchRemoved: boolean; contentLeft: boolean; batchLeft: boolean }
-    expect(parsed.batchRemoved, 'readdir 失败时不能删批次').toBe(false)
-    expect(parsed.batchLeft, '批次目录应保留').toBe(true)
-    void vi
-  }, 90_000)
+    it('returns null for a manifest with a mismatched batchId', () => {
+      /*
+       * 契约是**返回 null**，不是抛错 —— 调用方据此保留目录。
+       * （我第一版断言 toThrow，是错的；这里按真实契约测。）
+       */
+      const { state, batchId, bDir } = setupBatchLocal()
+      writeFileSync(
+        join(bDir, 'manifest.json'),
+        JSON.stringify({
+          schemaVersion: 1,
+          batchId: 'some-other-batch',
+          createdAt: Date.now(),
+          status: 'staging',
+          entries: [],
+        }),
+      )
+      expect(readManifest(state, batchId), 'batchId 不符应判为损坏').toBeNull()
+    })
+
+    it('returns null for an unknown schemaVersion', () => {
+      const { state, batchId, bDir } = setupBatchLocal()
+      writeFileSync(
+        join(bDir, 'manifest.json'),
+        JSON.stringify({
+          schemaVersion: 99,
+          batchId,
+          createdAt: Date.now(),
+          status: 'staging',
+          entries: [],
+        }),
+      )
+      expect(readManifest(state, batchId), '未知 schemaVersion 应判为损坏').toBeNull()
+    })
+
+    it('returns null for an invalid entry id, and never touches the batch', () => {
+      /*
+       * 越界 id 是最危险的一条：`id = '../..'` 会让恢复操作逃出 items/。
+       * 判为损坏 ⇒ 保留批次。
+       */
+      const { state, batchId, bDir } = setupBatchLocal()
+      mkdirSync(join(bDir, 'items', 'whatever'), { recursive: true })
+      writeFileSync(
+        join(bDir, 'manifest.json'),
+        JSON.stringify({
+          schemaVersion: 1,
+          batchId,
+          createdAt: Date.now(),
+          status: 'staging',
+          entries: [{ id: '../../escape', originalPath: 'C:/x', bytes: 1 }],
+        }),
+      )
+
+      expect(readManifest(state, batchId), '越界 id 应判为损坏').toBeNull()
+
+      const result = recoverBatch(state, batchId)
+      expect(result.batchRemoved, 'manifest 损坏时不能删批次').toBe(false)
+      expect(existsSync(join(bDir, 'items', 'whatever')), '内容必须保留').toBe(true)
+    })
+  })
 })
