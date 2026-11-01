@@ -126,6 +126,62 @@ async function createRelease({ owner, repo, tag, title, body }) {
   return "ok";
 }
 
+/**
+ * 查某个 tag 是否已有 Release。
+ *
+ * 用于"失败后重跑只补建"：已存在就什么都不做，避免重复建。
+ *
+ * @param {string} owner 仓库所有者。
+ * @param {string} repo 仓库名。
+ * @param {string} tag 标签。
+ * @returns {Promise<string | null>} 已存在时返回其 html_url，否则 null。
+ */
+async function findRelease(owner, repo, tag) {
+  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  if (token === undefined || token === "") return null;
+  try {
+    const response = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tag)}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+        },
+      },
+    );
+    if (response.status === 404) return null;
+    if (!response.ok) return null;
+    const json = await response.json();
+    return typeof json.html_url === "string" ? json.html_url : "exists";
+  } catch {
+    // 查不到就当不存在 —— 建 Release 是幂等的（tag 已存在时 GitHub 会附到该 tag）。
+    return null;
+  }
+}
+
+/**
+ * 找某个 tag **之前**最近的 tag。
+ *
+ * @param {string} tag 当前 tag。
+ * @returns {string} 上一个 tag；没有则返回仓库第一个提交。
+ */
+function previousTagBefore(tag) {
+  try {
+    const list = run(["git", "describe", "--tags", "--abbrev=0", `${tag}^`]);
+    if (list !== "") return list;
+  } catch {
+    /* 没有更早的 tag */
+  }
+  try {
+    const first = run(["git", "rev-list", "--max-parents=0", tag]).split("\n")[0];
+    if (first !== undefined && first !== "") return first;
+  } catch {
+    /* 忽略 */
+  }
+  return tag;
+}
+
 /** 主流程。 */
 async function main() {
   const argv = process.argv.slice(2);
@@ -138,7 +194,70 @@ async function main() {
   // 1. 算下一个版本（复用既有脚本，它是唯一真相）。
   const next = JSON.parse(run(["node", "scripts/next-version.mjs", "--json"]) || "{}");
   if (next.level === "none") {
-    console.log("没有需要抬版本的提交，退出。");
+    /*
+     * ## 没有新提交时，可能仍需要**补建 Release**（2026-11-01 定版复核第 12 项）
+     *
+     * 发布分成"本地 → push → 建 Release"三段。若 tag 与 push 都成功、而建
+     * Release 撞上临时 500 或网络错误：
+     *
+     * ```
+     * 第一轮：tag/push 成功，Release 失败
+     * 第二轮：next.level = none → 直接 return  ← 永远补不上
+     * ```
+     *
+     * 结果是市场里只有 tag、没有更新说明，而重跑脚本没有任何帮助。
+     *
+     * 现在：没有新提交时检查**当前版本对应的 tag** —— 若 tag 存在但 Release
+     * 不存在，就只补建，不再抬版本、不重复打 tag。
+     */
+    console.log("没有需要抬版本的提交。");
+    if (dryRun) return;
+
+    const currentTag = `v${next.current}`;
+    let tagExists = false;
+    try {
+      tagExists = run(["git", "rev-parse", "--verify", `refs/tags/${currentTag}`]) !== "";
+    } catch {
+      tagExists = false;
+    }
+    if (!tagExists) {
+      console.log(`${currentTag} 也不存在，没有可补建的对象。退出。`);
+      return;
+    }
+
+    const info = packageInfo();
+    const existing = await findRelease(info.owner, info.repo, currentTag);
+    if (existing !== null) {
+      console.log(`${currentTag} 的 Release 已存在（${existing}），无需补建。`);
+      return;
+    }
+
+    console.log(`${currentTag} 的 tag 存在但 Release 缺失 —— 只补建 Release，不抬版本。`);
+    /*
+     * 提交说明用从上个 tag 到 `currentTag` 的范围。
+     *
+     * `currentTag` 自身就是终点，起点找它之前最近的 tag；找不到就用第一个提交。
+     */
+    const prev = previousTagBefore(currentTag);
+    const commits = run([
+      "git",
+      "log",
+      "--oneline",
+      `${prev}..${currentTag}`,
+    ])
+      .split("\n")
+      .filter((line) => line !== "" && !line.includes("chore(release)"))
+      .map((line) => `- ${line.replace(/^[a-f0-9]+ /, "")}`)
+      .join("\n");
+    const body = note === "" ? commits : `${note}\n\n## 变更\n\n${commits}`;
+    const backfill = await createRelease({
+      owner: info.owner,
+      repo: info.repo,
+      tag: currentTag,
+      title: currentTag,
+      body,
+    });
+    console.log(`已补建 Release：${backfill}`);
     return;
   }
   console.log(`当前 ${next.current} → 下一个 ${next.next}（${next.level}）`);

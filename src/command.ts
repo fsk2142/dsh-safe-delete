@@ -334,6 +334,43 @@ function blankQuotedContent(text: string): string {
 }
 
 /**
+ * 整条文本是否只是**一条赋值语句**（不会执行任何命令）。
+ *
+ * ## 为什么需要（2026-11-01 定版复核第 9 项）
+ *
+ * `const note = "fs.unlinkSync('x')"` 只是把字符串赋给变量。但
+ * `tokenize` 会剥掉引号并把内容并进 token 流，于是 `.unlinkSync(` 这类
+ * 模式仍能被匹配 —— 一次赋值被判成删除（实测 target="x"）。
+ *
+ * ## 判据（刻意窄）
+ *
+ * - 形如 `<可选 const/let/var/带类型> 标识符 = 值`；
+ * - **不含**命令分隔符（`;` `&&` `||` `|` 换行）。
+ *
+ * 不含分隔符是关键：`x = 1; rm -rf /tmp` 必须继续被判为删除（交给逐段
+ * 判定），所以这里只放行"整条就是一个赋值"的情况。
+ *
+ * @param text 已去注释的文本。
+ * @returns 是纯赋值返回 true。
+ */
+function isPureAssignment(text: string): boolean {
+  // 含命令分隔符就不是"纯"赋值。
+  if (/[;&|\n\r]/.test(text)) return false
+
+  const trimmed = text.trim()
+  if (trimmed === '') return false
+
+  /*
+   * TypeScript/JS 的声明或赋值：
+   *   const note = "..."
+   *   let x: string = "..."
+   *   note = "..."
+   */
+  return /^(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:\s*:\s*[^=]+?)?\s*=\s*[\s\S]+$/.test(trimmed) ||
+    /^[A-Za-z_$][\w$]*\s*=\s*[\s\S]+$/.test(trimmed)
+}
+
+/**
  * 判断这条命令是否只是"提到"删除，而不会真的执行。
  *
  * 判定：主命令是**纯输出/检索类**（echo / grep / console.log …），且删除字样
@@ -989,16 +1026,28 @@ function targetFromPattern(command: string, label: string): string | null {
  */
 function isPlainlyHarmless(body: string): boolean {
   if (body.trim() === '') return true
+  /*
+   * ## 匹配前先抹掉字符串字面量（2026-11-01 定版复核第 9 项）
+   *
+   * `node -e "const note = 'file.Delete()'"` 里 `.Delete()` 只是字符串内容。
+   * 若直接在原文上匹配 `DELETE_PATTERNS`，这条会被判成"有删除可能"，
+   * 于是每个纯赋值脚本都弹一次审批 —— 审批疲劳本身会让保护失效。
+   *
+   * 抹掉引号内容后仍是代码的地方才继续判断。
+   *
+   * 注意顺序：**先抹再判**。反过来的话字符串里的模式已经命中了。
+   */
+  const bodyCode = blankQuotedContent(stripComments(body))
   if (OPAQUE_EXECUTION.some((pattern) => pattern.test(body))) return false
-  if (DELETE_PATTERNS.some((pattern) => pattern.pattern.test(body))) return false
-  if (containsDeleteCommand(body)) return false
+  if (DELETE_PATTERNS.some((pattern) => pattern.pattern.test(bodyCode))) return false
+  if (containsDeleteCommand(bodyCode)) return false
 
   // 函数式调用形态：`fs.rmSync(...)`、`shutil.rmtree(...)`、`File.delete(...)`。
   //
   // `containsDeleteCommand` 只看"命令位的动词"，摸不到这种写法 —— 而
   // `node -e 'require("fs").rmSync("/x")'` 正是它。漏了这条就会把真删除
   // 判成无害（本轮改动一度造成这个回归）。
-  if (hasCallStyleDelete(body)) return false
+  if (hasCallStyleDelete(bodyCode)) return false
 
   // 命令替换里可能藏着删除，看不清就不算无害。
   if (commandSubstitutions(body).length > 0) return false
@@ -1071,6 +1120,22 @@ export function parseCommand(command: string): CommandVerdict {
   // 只是"提到"删除（echo/grep/console.log 的参数里含 rm -rf），不会真的执行。
   // 这条必须排在所有删除判定之前，否则 `echo "rm -rf /tmp"` 会被误拦。
   if (mentionsOnly(raw)) return { destructive: false }
+
+  /*
+   * ## 纯赋值 / 纯变量声明不是命令（2026-11-01 定版复核第 9 项）
+   *
+   * `const note = "fs.unlinkSync('x')"` 与 `const s = "rm -rf /tmp"` 都只是把
+   * 字符串赋给变量，不执行任何东西。但 `tokenize` 会剥掉引号、把内容并进
+   * token 流，于是 `.unlinkSync(` 这类模式仍能被匹配到。
+   *
+   * 实测：`const note = "fs.unlinkSync('x')"` 被判 destructive=true、
+   * target="x" —— 一次赋值被当成了删除。
+   *
+   * 判据刻意窄：整条形如 `<标识符> = <值>`（可选 const/let/var 前缀），
+   * 且**不含命令分隔符**。这样既拦住赋值，又不放过
+   * `x = 1; rm -rf /tmp`（含分隔符，交给后面的逐段判定）。
+   */
+  if (isPureAssignment(text)) return { destructive: false }
 
   // 不透明执行（Base64 编码命令等）：静态看不到内容，不能判成安全。
   //

@@ -553,16 +553,38 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
   child.unref()
 
   if (typeof child.pid === 'number') {
-    writeCleanupJob(stateDir, {
-      requestId,
-      pid: child.pid,
-      requestedAt: Date.now(),
-      startedAt: Date.now(),
-      finishedAt: null,
-      outcome: 'running',
-      recycled: 0,
-      skipped: 0,
-    })
+    /*
+     * ## 不能无条件把状态写成 `running`（2026-11-01 定版复核第 7 项）
+     *
+     * spawn 成功只表示进程启动了。**一个很快的 worker 可能在父进程执行到
+     * 这一行之前就已经跑完**：写好 `completed`、`recycled=7`、释放锁并退出。
+     *
+     * 那时父进程再写 `running` / `recycled=0`，就把终态和统计一起抹掉。
+     * 而且 `exit` 的 `code === 0` 分支只做"直接返回"，不会纠正 ——
+     * 状态永远停在 `running`，计数永远是 0。
+     *
+     * 复核用受控调度实测到：最终 running、recycled=0、锁已不存在。
+     *
+     * 现在：先读一次，若已是**本次请求**的终态就什么都不写。
+     */
+    const existing = readCleanupJob(stateDir)
+    const alreadyTerminal =
+      existing !== null &&
+      existing.requestId === requestId &&
+      (existing.outcome === 'completed' || existing.outcome === 'failed')
+
+    if (!alreadyTerminal) {
+      writeCleanupJob(stateDir, {
+        requestId,
+        pid: child.pid,
+        requestedAt: Date.now(),
+        startedAt: Date.now(),
+        finishedAt: null,
+        outcome: 'running',
+        recycled: 0,
+        skipped: 0,
+      })
+    }
   } else {
     /*
      * 没有 pid：spawn 失败了。`error` 事件可能稍后才到，但此刻我们已能

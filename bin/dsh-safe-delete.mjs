@@ -153,12 +153,36 @@ function readConfigDefaults() {
     const pickString = (key, fallbackValue) => {
       const m = new RegExp(`^\\s+${key}:\\s*(.+?)\\s*$`, 'm').exec(block)
       if (m === null) return fallbackValue
-      let raw = m[1].replace(/#.*$/, '').trim()
-      if (
-        (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) ||
-        (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2)
-      ) {
-        raw = raw.slice(1, -1)
+      /*
+       * ## 注释剥离必须在**引号语境之后**（2026-11-01 定版复核第 8 项）
+       *
+       * 第一版先 `.replace(/#.*$/, '')` 再判断引号。于是：
+       *
+       * ```
+       * stateDir: 'C:/.../zone#one'
+       *   → 截断成 'C:/.../zone'      ← 结尾引号一起被删
+       *   → 引号判断不成立（没有闭合引号）
+       *   → path.resolve 拿到带前导引号的错误目录
+       * ```
+       *
+       * 实测：用假 DSH_HOME/profile 真实 spawn CLI，`status` 指向
+       * `'C:/.../zone` 而不是 `C:/.../zone#one` —— CLI 又指错了目录，
+       * 正是 SD-13 修好的那个救援通道。
+       *
+       * 现在：先看原文是否被引号包裹；是就取引号内的内容（`#` 在引号里是
+       * 普通字符），否则才剥注释。这与 YAML 的引用语义一致。
+       */
+      const rawValue = m[1].trim()
+      const quoted =
+        (rawValue.startsWith("'") && rawValue.endsWith("'") && rawValue.length >= 2) ||
+        (rawValue.startsWith('"') && rawValue.endsWith('"') && rawValue.length >= 2)
+      let raw
+      if (quoted) {
+        // 引号内：# 是普通字符，不剥注释。
+        raw = rawValue.slice(1, -1)
+      } else {
+        // 未加引号：行尾 # 之后是注释。
+        raw = rawValue.replace(/(^|\s)#.*$/, '').trim()
       }
       return raw === '' ? fallbackValue : raw
     }
