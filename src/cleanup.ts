@@ -497,6 +497,66 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
       lastError: `failed to spawn cleanup worker: ${error.message}`,
     })
   })
+
+  /*
+   * ## 必须监听 `exit`（2026-11-01 审查 SD-08）
+   *
+   * `spawn` 成功只表示 **Node 进程启动了**，不表示 worker 文件被成功加载。
+   * 入口缺失、依赖损坏、绑定前崩溃 —— 这些情况下 Node 正常产生 pid、
+   * 然后以非零码退出，**不会触发 `error` 事件**。
+   *
+   * 而锁里存的是**父进程 pid**（worker 还没来得及 `bindWorkerPid`）。
+   * 于是：
+   *
+   * ```
+   * worker 退出（锁没释放）
+   * 父进程活着 → isAlive(holder.pid) 恒真
+   * → 陈旧锁接管永不成立 → 清理永久停摆
+   * ```
+   *
+   * 现在监听 `exit`：正常退出（code 0）什么都不做 —— worker 自己已经写好
+   * 状态并释放锁。非零退出视为失败，写 failed 状态并释放锁。
+   *
+   * 竞态说明：worker 可能已经写了 completed 状态之后才退出（code 0），
+   * 所以**只在非零退出时**覆盖状态，不去踩正常路径写下的结果。
+   */
+  child.on('exit', (code: number | null, signal: string | null) => {
+    if (code === 0 || spawnFailed !== undefined) {
+      /*
+       * 正常退出，或 `error` 已经处理过 —— 不覆盖。
+       *
+       * 注意 `exit` 与 `error` 可能都触发，`spawnFailed` 是去重标志。
+       */
+      return
+    }
+    /*
+     * 非零退出 / 被信号杀掉：worker 没能完成自己的收尾。
+     *
+     * 释放锁并把状态标为 failed —— 否则它会永远停在 `running`，
+     * 而陈旧锁接管又被活着的父 pid 挡住。
+     */
+    releaseLock(stateDir, ownerToken)
+    /*
+     * 只在状态仍是本次请求的 `running` 时才覆盖 ——
+     * 避免踩掉一个已经开始的新请求。
+     */
+    const current = readCleanupJob(stateDir)
+    if (current !== null && current.requestId === requestId && current.outcome === 'running') {
+      writeCleanupJob(stateDir, {
+        requestId,
+        pid: child.pid ?? null,
+        requestedAt: current.requestedAt,
+        startedAt: current.startedAt ?? Date.now(),
+        finishedAt: Date.now(),
+        outcome: 'failed',
+        recycled: 0,
+        skipped: 0,
+        lastError:
+          `cleanup worker exited before finishing (code ${code ?? 'null'}, signal ${signal ?? 'none'}). ` +
+          'The lock has been released so the next run can start.',
+      })
+    }
+  })
   child.unref()
 
   if (typeof child.pid === 'number') {
