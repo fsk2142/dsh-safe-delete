@@ -121,8 +121,28 @@ export function classifyPath(absPath: string, env: ClassifyEnv): Classification 
    *
    * 保护规则优先于便利规则 —— 这个顺序没有取舍空间。
    */
-  if (env.installDir !== undefined && env.installDir !== '' && isUnder(target, env.installDir)) {
-    return 'protected'
+  /*
+   * ## 祖先也要保护（2026-11-01 审查 SD-23）
+   *
+   * 第一版只判断 `isUnder(target, installDir)` —— 即目标**在**安装目录里。
+   * 但反过来同样危险：目标是安装目录的**祖先**时，移动它会把整个安装内容
+   * 一起搬走。
+   *
+   * 隔离验证：`installDir = <workspace>/application/bin`，目标
+   * `<workspace>/application` 被判为 `free` —— 而移动它会把 `bin/` 连同
+   * DSH 一起搬走。
+   */
+  if (env.installDir !== undefined && env.installDir !== '') {
+    if (isUnder(target, env.installDir)) return 'protected'
+    // 反方向：目标包含安装目录 → 移动它等于移动安装内容。
+    if (isUnder(env.installDir, target)) return 'protected'
+  }
+  /*
+   * 安全区根同理：目标是 `dshHome` 的祖先时，移动它会连安全区一起搬走 ——
+   * 那会让所有可恢复的条目一起消失。
+   */
+  if (env.dshHome !== undefined && env.dshHome !== '') {
+    if (isUnder(env.dshHome, target)) return 'protected'
   }
   if (hasNodeModulesSegment(target)) return 'protected'
 

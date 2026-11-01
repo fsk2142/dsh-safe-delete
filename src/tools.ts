@@ -903,7 +903,18 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     parameters: {},
     beforeExecute: pruneIfDue,
     async execute() {
-      return { ok: true, text: checkComposition(deps.env) }
+      /*
+       * `ok` 必须反映体检结果（2026-11-01 审查 SD-18）。
+       *
+       * 第一版无条件 `return { ok: true, text: ... }` —— 即使输出里写着
+       * `[FAIL]` 和 "Fix the FAIL items before restarting dsh"，结构化字段
+       * 仍然是成功。
+       *
+       * 模型与 UI 通常先看 `ok`：一个"失败但 ok=true"的结果会被当成通过，
+       * 而这恰恰是体检唯一要防的事。
+       */
+      const text = checkComposition(deps.env)
+      return { ok: text.includes('[FAIL]') ? false : true, text }
     },
   })
 
@@ -983,11 +994,35 @@ export function checkComposition(env: ClassifyEnv): string {
         } else {
           lines.push(`[ok] ${patch}`)
           const ids = new Map<string, string>()
+          /*
+           * ## 同文件内的重复 id 必须在读取时立刻发现（2026-11-01 审查 SD-18）
+           *
+           * 第一版只做 `ids.set(id, ...)` —— 同一个 patch 里出现两行同 id 时，
+           * 后者覆盖前者，Map 里只剩一个。而后续的重复检查只比较**不同 Map
+           * 之间**（跨 profile），同文件内的重复永远不会被发现。
+           *
+           * 隔离验证：一个 cordis.patch.yml 里两行同 id，`checkComposition`
+           * 仍然 PASS 并输出 "safe to restart" —— 而宿主加载时可能只认其中
+           * 一个，用户以为配了两个。
+           */
+          const duplicatesInFile: string[] = []
           let line = 0
           for (const raw of text.split(/\r?\n/)) {
             line += 1
             const match = /^\s*-\s+id:\s*(\S+)/.exec(raw)
-            if (match !== null) ids.set(match[1]!, `${patch}:${line}`)
+            if (match === null) continue
+            const id = match[1]!
+            const previous = ids.get(id)
+            if (previous !== undefined) {
+              duplicatesInFile.push(`${id}（${previous} 与 ${patch}:${line}）`)
+              continue
+            }
+            ids.set(id, `${patch}:${line}`)
+          }
+          if (duplicatesInFile.length > 0) {
+            failed = true
+            lines.push(`[FAIL] ${patch} — duplicate row id(s) in the same patch:`)
+            for (const d of duplicatesInFile) lines.push(`       ${d}`)
           }
           rowIdsByFile.set(patch, ids)
         }
