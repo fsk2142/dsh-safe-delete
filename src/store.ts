@@ -18,14 +18,17 @@ import {
   cpSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   rmdirSync,
   statSync,
+  symlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
@@ -920,6 +923,29 @@ export async function listSafeZoneUnordered(
  * 中途失败时源仍完整。已复制的那部分只是同一份数据的副本 ——
  * 不删源是保守且正确的。
  *
+ * ## 链接必须原样重建，绝不进入（2026-11-01 第二轮审查 RV-01）
+ *
+ * 第一版用 `statSync(from).isDirectory()` 判类型。`stat` **跟随链接**，于是：
+ *
+ * ```
+ * pkg/
+ *   inside.txt
+ *   linkdir -> C:\external      ← junction
+ * ```
+ *
+ * `linkdir` 被当成普通目录 → `mkdirSync(to)` 建出**真目录** → 递归把
+ * `C:\external` 的内容**搬进来**。实测后果：
+ *
+ * - 恢复后的 `linkdir` 从 junction 变成普通目录（链接语义丢失）；
+ * - `external/outside-sub` 整棵**从外部原位置消失**，内容出现在恢复结果下。
+ *
+ * 这不是"多复制一份" —— 它改动了**用户目录树之外**的东西。
+ *
+ * 现在：先用 `lstatSync` 判是否链接，是链接就 `readlinkSync` 拿目标、
+ * 用 `symlinkSync` 原样重建（`junction` 类型在 Windows 上保留），
+ * **不进入目标**。断链/循环链接也照样重建 —— 链接本来就可能是断的，
+ * 重建它比"跟随进去"安全得多。
+ *
  * @param source 源目录。
  * @param target 已由我们 `mkdir` 创建的空目标目录。
  */
@@ -937,9 +963,97 @@ function mergeDirectoryNoOverwrite(source: string, target: string): void {
     const from = path.join(source, name)
     const to = path.join(target, name)
 
+    /*
+     * 先用 `lstat` 判类型 —— 它**不跟随**链接。
+     *
+     * 这一步是 RV-01 的核心：`stat` 会把 junction/符号链接当成普通目录，
+     * 于是递归进入链接目标，把外部内容搬走。
+     */
+    let lst: ReturnType<typeof lstatSync>
+    try {
+      lst = lstatSync(from)
+    } catch (error) {
+      throw new Error(`cannot lstat ${from} while restoring: ${String(error)}`)
+    }
+
+    if (lst.isSymbolicLink()) {
+      /*
+       * 链接：原样重建，绝不进入目标。
+       *
+       * 先读链接目标；读不出来就视为冲突放弃（不能凭空造一个链接）。
+       */
+      let linkTarget: string
+      try {
+        linkTarget = readlinkSync(from)
+      } catch (error) {
+        throw new Error(`cannot read the link ${from} while restoring: ${String(error)}`)
+      }
+
+      /*
+       * Windows 上要区分 junction 与普通符号链接：junction 必须用
+       * `'junction'` 重建才能保持"目录链接"语义。
+       *
+       * ## 断链时**必须**用 junction（本轮实测的坑）
+       *
+       * 第一版在 `stat` 失败时退回 `'file'`。实测：
+       *
+       * ```
+       * symlinkSync(断链目标, to, 'file')
+       *   → EPERM: operation not permitted
+       * ```
+       *
+       * 因为 `'file'` 类型要求目标存在。而 junction **不要求**目标存在 ——
+       * 断链正是要靠它才能重建。
+       *
+       * 现在：能 stat 到目录 → junction；断链 → 也 junction；
+       * 都失败时换另一种类型再试一次。
+       */
+      const linkKind: 'junction' | 'file' = (() => {
+        if (process.platform !== 'win32') return 'file'
+        try {
+          return statSync(from).isDirectory() ? 'junction' : 'file'
+        } catch {
+          // 断链：优先 junction（不要求目标存在）。
+          return 'junction'
+        }
+      })()
+
+      try {
+        symlinkSync(linkTarget, to, linkKind)
+        continue
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'EEXIST') throw new Error('claim-polluted')
+        /*
+         * 类型不匹配时换另一种再试一次 —— junction / file 的可建条件不同
+         * （断链只能建成 junction，普通文件链接只能建成 file）。
+         */
+        if (process.platform === 'win32' && (code === 'EPERM' || code === 'EINVAL')) {
+          const fallback: 'junction' | 'file' = linkKind === 'junction' ? 'file' : 'junction'
+          try {
+            symlinkSync(linkTarget, to, fallback)
+            continue
+          } catch (retryError) {
+            const retryCode = (retryError as NodeJS.ErrnoException).code
+            if (retryCode === 'EEXIST') throw new Error('claim-polluted')
+            throw new Error(
+              `cannot recreate the link ${to} (tried ${linkKind} and ${fallback}): ${String(retryError)}`,
+            )
+          }
+        }
+        /*
+         * 建不出链接（权限、目标类型不支持）—— 这是**我们无法保真**的情况。
+         *
+         * 不能悄悄改成复制（那正是原缺陷），也不能静默跳过。
+         * 抛出去让上层换候选或明确失败，源保持完整。
+         */
+        throw new Error(`cannot recreate the link ${to}: ${String(error)}`)
+      }
+    }
+
     let isDirectory: boolean
     try {
-      isDirectory = statSync(from).isDirectory()
+      isDirectory = lst.isDirectory()
     } catch {
       throw new Error(`cannot stat ${from} while restoring`)
     }
