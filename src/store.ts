@@ -31,6 +31,7 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 
+import { normalize as normalizeForCompare } from './classify'
 import { describeTarget } from './describe'
 import { withIndexLock } from './index-lock'
 import { moveToSystemRecycleBin, type RecycleOutcome, type Recycler } from './recycle'
@@ -493,6 +494,7 @@ export function isValidEntryId(id: string): boolean {
   return true
 }
 
+
 /**
  * `child` 是否在 `parent` **之内**（**不含** `parent` 本身）。
  *
@@ -513,8 +515,9 @@ export function isValidEntryId(id: string): boolean {
  * @returns 严格在内部返回 true；相等或在外返回 false。
  */
 export function isStrictlyUnder(child: string, parent: string): boolean {
-  const c = path.resolve(child)
-  const p = path.resolve(parent)
+  // 大小写归一化（Windows）—— 见 normalizeForCompare 的注释。
+  const c = normalizeForCompare(child)
+  const p = normalizeForCompare(parent)
   if (c === p) return false
   return c.startsWith(p + path.sep)
 }
@@ -529,8 +532,9 @@ export function isStrictlyUnder(child: string, parent: string): boolean {
  * @returns 在内部或相等返回 true。
  */
 function isUnder(child: string, parent: string): boolean {
-  const c = path.resolve(child)
-  const p = path.resolve(parent)
+  // 与 isStrictlyUnder 共用同一套大小写归一化（SD-06）。
+  const c = normalizeForCompare(child)
+  const p = normalizeForCompare(parent)
   if (c === p) return true
   return c.startsWith(p + path.sep)
 }

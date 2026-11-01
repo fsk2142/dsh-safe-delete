@@ -17,7 +17,7 @@ import { existsSync, statfsSync } from 'node:fs'
 import path from 'node:path'
 
 import { appendAudit } from './audit'
-import { classifyPath, requiresApproval, type ClassifyEnv } from './classify'
+import { classifyPath, normalize as normalizeForCompare, requiresApproval, type ClassifyEnv } from './classify'
 import { describeTarget } from './describe'
 import { moveToSafeZone } from './store'
 import type { Classification, TargetDescription, TrashEntry } from './types'
@@ -95,10 +95,26 @@ function isDriveRoot(p: string): boolean {
   return path.parse(resolved).root === resolved
 }
 
-/** 判断目标是否落在安全区自己的状态目录里。 */
+/**
+ * 判断目标是否落在安全区自己的状态目录里。
+ *
+ * ## 大小写必须归一化（2026-11-01 审查 SD-06）
+ *
+ * Windows 上 `C:\X\STATE` 与 `C:\X\state` 是同一个目录，而 `startsWith`
+ * 区分大小写。第一版直接比较，于是大写写法能把"目标是安全区自己"
+ * 判成 false —— 自保护被绕过。
+ *
+ * 复用 `classify.ts` 里已有的归一化（那里早就是这么做的），
+ * 避免两处规则漂移。
+ *
+ * @param target 待判定路径。
+ * @param stateDir 安全区目录。
+ * @returns 在安全区内返回 true。
+ */
 function isInsideStateDir(target: string, stateDir: string): boolean {
-  const state = path.resolve(stateDir)
-  return target === state || target.startsWith(state + path.sep)
+  const state = normalizeForCompare(stateDir)
+  const t = normalizeForCompare(target)
+  return t === state || t.startsWith(state + path.sep)
 }
 
 /**

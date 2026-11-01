@@ -56,10 +56,18 @@ const PROTECTED_HOME_FILES = ['cordis.patch.yml', 'settings.yaml'] as const
 /**
  * 路径规范化 + Windows 风格的大小写归一。
  *
+ * ## 为什么导出
+ *
+ * 这是"两个路径是否指同一位置"的唯一正确实现。`store.ts` 与
+ * `delete-core.ts` 都需要它（2026-11-01 审查 SD-06：它们此前各自用
+ * 区分大小写的 `startsWith`，在 Windows 上能被大写路径绕过）。
+ *
+ * 集中在一处，避免三份实现慢慢漂移。
+ *
  * @param p 任意路径。
  * @returns 规范化后的绝对路径（Windows 上统一小写）。
  */
-function normalize(p: string): string {
+export function normalize(p: string): string {
   const resolved = path.resolve(p)
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
