@@ -197,7 +197,7 @@ describe('SD-01: restore never deletes or overwrites concurrent data', () => {
     const state = join(root, 'state')
     const work = join(root, 'work')
 
-    const { original, id } = await stage(state, work, 'pkg2', null)
+    const { id } = await stage(state, work, 'pkg2', null)
 
     let injectedPath = ''
     let firstOnly = true
@@ -217,17 +217,53 @@ describe('SD-01: restore never deletes or overwrites concurrent data', () => {
     })
 
     expect(injectedPath, '钩子应当被调用').not.toBe('')
-    expect(restoredTo, '该候选被污染，必须换名').not.toBe(original)
 
     /*
-     * **核心断言**：那份并发写入的文件必须还在。
+     * **核心断言**：那份并发写入的文件必须还在，且内容一字不改。
      *
-     * `rmdir` 遇到非空目录会 ENOTEMPTY → 实现换候选名 → 用户文件原样保留。
-     * 若换成 `rmSync(recursive)`，文件会被删掉，这条就红。
+     * 这是 SD-01 真正要守的东西 —— 不能删掉别人写进占位目录的内容。
+     * 至于"要不要因此换候选名"，取决于实现策略：
+     *
+     * - 旧实现 `rmdir` 后 `rename`：非空目录 rmdir 失败 → 换候选；
+     * - 新实现（2026-11-01 SD-03）：占位目录**保留**，以 no-overwrite
+     *   语义逐项合并 —— 竞争者文件不同名时正常共存，不换候选。
+     *
+     * 两种策略都不删用户数据。这里改为断言**结果**，不锁死具体策略。
      */
     expect(existsSync(injectedPath), '并发写入的文件绝不能删').toBe(true)
-    expect(readFileSync(injectedPath, 'utf8')).toBe('USER DATA')
-    expect(readdirSync(restoredTo), '恢复的目录内容应完好').toEqual(['inner.txt'])
+    expect(readFileSync(injectedPath, 'utf8'), '内容不能改').toBe('USER DATA')
+
+    // 我们的内容也必须完整落地。
+    expect(existsSync(join(restoredTo, 'inner.txt')), '恢复的内容应在').toBe(true)
+    expect(readFileSync(join(restoredTo, 'inner.txt'), 'utf8')).toBe('INNER')
+  })
+
+  it('switches candidates when a competitor occupies the same name', async () => {
+    /*
+     * 真正的冲突：竞争者在占位目录里放了**与我们同名**的文件。
+     *
+     * 这时必须换候选 —— 不能覆盖对方，也不能合并出错误内容。
+     */
+    const root = scratchDir('dsd-sd01-nameclash-')
+    const state = join(root, 'state')
+    const work = join(root, 'work')
+
+    const { original, id } = await stage(state, work, 'clash', null)
+
+    let firstOnly = true
+    const { restoredTo } = await restoreFromSafeZone(state, id, (candidate) => {
+      if (!firstOnly) return
+      firstOnly = false
+      // 与条目内容**同名**的文件 —— 这才会触发冲突。
+      writeFileSync(join(candidate, 'inner.txt'), 'THEIRS')
+    })
+
+    expect(restoredTo, '同名冲突时必须换候选').not.toBe(original)
+
+    // 竞争者那份内容不能被覆盖。
+    expect(readFileSync(join(original, 'inner.txt'), 'utf8'), '竞争者内容不能被改写').toBe('THEIRS')
+    // 我们的内容在另一个候选上。
+    expect(readFileSync(join(restoredTo, 'inner.txt'), 'utf8')).toBe('INNER')
   })
 
   it('uses a no-replace primitive for files (link semantics, not check-then-rename)', async () => {

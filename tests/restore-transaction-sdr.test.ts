@@ -80,8 +80,13 @@ describe('SD-R1: content stays in the safe zone until a destination is secured',
 
     await expect(
       restoreFromSafeZone(state, id, (candidate) => {
-        // 往我们的空占位目录里放东西，让 rmdir 失败。
-        writeFileSync(join(candidate, 'squatter.txt'), 'OCCUPIED')
+        /*
+         * 放一个**与条目内容同名**的文件 —— 那才会真正冲突。
+         *
+         * 不同名的文件会正常共存（新实现以 no-overwrite 语义合并），
+         * 不会让候选失效。要让 100 个候选全部不可用，必须制造同名冲突。
+         */
+        writeFileSync(join(candidate, 'inner.txt'), 'OCCUPIED')
       }),
     ).rejects.toThrow(/100 candidates are all taken/i)
 
@@ -101,7 +106,7 @@ describe('SD-R1: content stays in the safe zone until a destination is secured',
 
     // 错误信息必须明确说"什么都没搬"。
     await expect(
-      restoreFromSafeZone(state, id, (c) => writeFileSync(join(c, 'x.txt'), 'x')),
+      restoreFromSafeZone(state, id, (c) => writeFileSync(join(c, 'inner.txt'), 'OCCUPIED')),
     ).rejects.toThrow(/Nothing was moved/i)
   })
 

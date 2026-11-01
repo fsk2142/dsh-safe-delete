@@ -828,6 +828,123 @@ export async function listSafeZoneUnordered(
 }
 
 /**
+ * 把一个目录的内容以 **no-overwrite** 语义搬进已存在的目标目录。
+ *
+ * ## 为什么不用 `cpSync` / `renameSync`
+ *
+ * - `cpSync(src, dst, {recursive:true})` 在目标已有同名文件时**直接覆盖**
+ *   （`force` 默认 true）。隔离实验证实竞争者的内容被我们的覆盖。
+ *   它没有可靠的 no-overwrite 选项。
+ * - `renameSync` 在 POSIX 上能覆盖空目录、Windows 上拒绝非空目录 ——
+ *   行为不一致，且"先 rmdir 释放再 rename"会开一个窗口。
+ *
+ * ## 现在的做法
+ *
+ * 逐项递归，每个节点都用**原子 no-replace** 原语：
+ *   - 目录：`mkdirSync`（EEXIST 即冲突）；
+ *   - 文件：`linkSync`（EEXIST 即冲突），不可用时回退到 `open(wx)` + 写入。
+ *
+ * 遇到任何冲突就整体放弃（抛 `claim-polluted`），由调用方换下一个候选。
+ * **已经搬进去的部分留在原地** —— 它们是我们自己的内容，且都在一个
+ * 由我们独占创建的空目录里，不会与用户数据混淆。
+ *
+ * ## 为什么源只在全部成功后删除
+ *
+ * 中途失败时源仍完整。已复制的那部分只是同一份数据的副本 ——
+ * 不删源是保守且正确的。
+ *
+ * @param source 源目录。
+ * @param target 已由我们 `mkdir` 创建的空目标目录。
+ */
+function mergeDirectoryNoOverwrite(source: string, target: string): void {
+  let names: string[]
+  try {
+    names = readdirSync(source)
+  } catch (error) {
+    throw new Error(
+      `cannot read the directory being restored: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+
+  for (const name of names) {
+    const from = path.join(source, name)
+    const to = path.join(target, name)
+
+    let isDirectory: boolean
+    try {
+      isDirectory = statSync(from).isDirectory()
+    } catch {
+      throw new Error(`cannot stat ${from} while restoring`)
+    }
+
+    if (isDirectory) {
+      try {
+        mkdirSync(to)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        // 目标已存在 —— 竞争者在那个名字上放了东西，放弃这个候选。
+        if (code === 'EEXIST') throw new Error('claim-polluted')
+        throw error
+      }
+      // 递归；子层冲突同样冒泡成 claim-polluted。
+      mergeDirectoryNoOverwrite(from, to)
+      continue
+    }
+
+    /*
+     * 文件：优先 link（零拷贝 + 原子 no-replace）。
+     *
+     * 失败时区分两类：EEXIST 是冲突；EXDEV/EPERM/ENOTSUP 是"这个文件系统
+     * 不支持硬链接"，回退到 open(wx) + 写入（同样 no-replace）。
+     */
+    try {
+      linkSync(from, to)
+      continue
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') throw new Error('claim-polluted')
+      if (code !== 'EXDEV' && code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS') {
+        throw error
+      }
+    }
+
+    // 回退：open(wx) 独占创建，再逐块写入，写完才继续。
+    let fd: number
+    try {
+      fd = openSync(to, 'wx')
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') throw new Error('claim-polluted')
+      throw error
+    }
+    try {
+      const data = readFileSync(from)
+      let written = 0
+      while (written < data.length) {
+        const n = writeSync(fd, data, written, data.length - written, written)
+        if (n <= 0) {
+          throw new Error(`short write while restoring ${from}: ${written} of ${data.length} bytes`)
+        }
+        written += n
+      }
+    } finally {
+      try {
+        closeSync(fd)
+      } catch {
+        /* 已经关了 */
+      }
+    }
+  }
+
+  /*
+   * 全部搬完 —— 现在才删源。
+   *
+   * 中途失败时源保持完整（上面的 throw 都不会执行到这里）。
+   */
+  rmSync(source, { recursive: true, force: true })
+}
+
+/**
  * 生成候选还原路径。
  *
  * 第 0 个是用户期望的原路径，之后依次是 `.restored-<时间戳>` 兄弟名。
@@ -995,22 +1112,40 @@ function placeNoReplace(
    */
   const fill = (candidate: string): void => {
     if (isDir) {
-      // 目录：占位是空目录，先用 rmdir 收掉再 rename。
-      // 若期间有人往里放了东西，rmdir 会 ENOTEMPTY —— 那就换候选。
+      /*
+       * ## 目录恢复：**保留占位**，以 no-overwrite 语义往里放内容
+       * （2026-11-01 审查 SD-03）
+       *
+       * 第一版是：
+       *
+       * ```
+       * mkdirSync(candidate)   // 占位
+       * rmdirSync(candidate)   // ← 落点空出来了
+       * renameSync(source, candidate)
+       * ```
+       *
+       * 两个问题，都已隔离复现：
+       *
+       * 1. `rmdir` 与 `rename` 之间有窗口，竞争者可以创建同名对象。
+       *    Windows 上 `rename` 到非空目录会失败（数据幸存），但 POSIX 上
+       *    会**覆盖** —— 不能依赖平台行为。
+       * 2. 跨卷回退用 `cpSync(source, candidate)`，它**没有 no-overwrite 选项**。
+       *    实验证实：竞争者在该目录里的同名文件被我们的内容覆盖。
+       *
+       * 现在改成：占位目录**一直留着**，把内容逐项以 `link`（文件）/
+       * `mkdir`（目录）搬进去 —— 两者在目标已存在时都原子失败。
+       * 任何冲突就判定这个候选被污染，换下一个。
+       *
+       * 代价：目录恢复从"一次 rename"变成"逐项搬运"，条目多时会慢一些。
+       * 这是有意的取舍 —— 不覆盖用户内容优先于恢复速度。
+       */
       try {
-        rmdirSync(candidate)
-      } catch {
-        throw new Error('claim-polluted')
-      }
-      try {
-        renameSync(source, candidate)
+        mergeDirectoryNoOverwrite(source, candidate)
         return
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code !== 'EXDEV') throw error
-        cpSync(source, candidate, { recursive: true, preserveTimestamps: true })
-        rmSync(source, { recursive: true, force: true })
-        return
+        // 冲突：这个候选被别人占了，换下一个。
+        if (error instanceof Error && error.message === 'claim-polluted') throw error
+        throw error
       }
     }
 
