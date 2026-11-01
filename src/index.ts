@@ -812,9 +812,13 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           removed: [],
           freedBytes: 0,
           failures: [],
-          note:
-            `cleanup was not started (${submitted.reason ?? 'unknown reason'}); ` +
-            `${selected.length} item(s) are still in the safe zone. Try again in a moment.`,
+          /*
+           * `scheduled` 是渲染层唯一会读的字段（2026-11-01 审查 SD-16）。
+           *
+           * 原来只有 `note` —— 而 `CommandDeps.clean` 的类型里没有它，
+           * 于是这段说明被**丢弃**，命令回复"没有需要清理的条目"。
+           */
+          scheduled: { started: false, reason: submitted.reason ?? 'unknown reason' },
         }
       }
 
@@ -822,9 +826,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         removed: [],
         freedBytes: 0,
         failures: [],
-        note:
-          `cleanup started in the background for ${selected.length} item(s) — ` +
-          'it does not block the UI. Check progress with /safe-delete status.',
+        scheduled: { started: true },
       }
     },
     readConfig: async () => {

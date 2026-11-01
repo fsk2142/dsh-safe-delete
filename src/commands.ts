@@ -42,6 +42,24 @@ export interface CommandDeps {
     removed: readonly string[]
     freedBytes: number
     failures?: readonly string[]
+    /**
+     * 后台清理的调度状态（2026-11-01 审查 SD-16）。
+     *
+     * 清理现在跑在独立进程里，所以"移除了几项"通常为 0 —— 但那**不等于**
+     * "没有东西可清理"。三件事必须能区分：
+     *
+     *   - `started`：已派发后台任务；
+     *   - `busy`：已有 worker 在跑，本轮没启动；
+     *   - `failed`：派发失败（含原因）。
+     *
+     * 第一版没有这个字段，于是"已后台启动"和"worker 正忙"都回复
+     * "没有需要清理的条目（都还在保留期内）" —— 用户以为无事可做，
+     * 而清理其实正在进行或根本没开始。
+     */
+    scheduled?: {
+      started: boolean
+      reason?: string
+    }
   }>
   /** 读当前配置。 */
   readConfig: () => Promise<Record<string, unknown>>
@@ -217,9 +235,48 @@ export async function runCommand(rawInput: string, deps: CommandDeps): Promise<C
     const dryRun = rest.includes('--dry-run')
     const result = await deps.clean(dryRun)
     const failures = result.failures ?? []
+    const scheduled = result.scheduled
+
+    /*
+     * ## 后台调度状态优先（2026-11-01 审查 SD-16）
+     *
+     * 清理跑在独立进程里，所以 `removed` 通常是空 —— 那不表示"无事可做"。
+     * 必须先看 `scheduled`：
+     *
+     *   - 已启动 → 告诉用户后台在跑，并说明结果怎么看；
+     *   - 没启动 → 说明原因（worker 忙、锁被占、派发失败）。
+     *
+     * 第一版把这两种都和"真的没有过期条目"混成一件事，用户会以为
+     * 清理成功了（或无事可做），而实际状态完全不同。
+     */
+    if (scheduled !== undefined) {
+      if (scheduled.started) {
+        return {
+          kind: 'success',
+          text:
+            '已在后台开始清理。\n' +
+            '清理在独立进程里跑，所以本命令立即返回；用 `/safe-delete status` 查看进度与结果。',
+        }
+      }
+      /*
+       * 没启动：说明原因，并区分"真的没有可清理的"与"这次没能启动"。
+       */
+      const reason = scheduled.reason ?? 'unknown'
+      if (result.removed.length === 0 && failures.length === 0) {
+        return {
+          kind: 'error',
+          text:
+            `清理**没有启动**：${reason}\n` +
+            '这不等于"没有需要清理的条目" —— 后台任务未运行，安全区未被改动。\n' +
+            '稍后重试，或用 `/safe-delete status` 查看当前状态。',
+        }
+      }
+    }
 
     if (result.removed.length === 0 && failures.length === 0) {
-      return { kind: 'success', text: '没有需要清理的条目（都还在保留期内，且未超容量）。' }
+      // 走到这里说明没有调度信息（旧路径），或调度已启动但还没结果 ——
+      // 前者是"真的没有可清理的条目"，后者上面的分支已经返回了。
+      return { kind: 'success', text: '没有需要清理的条目（都还在保留期内）。' }
     }
 
     const lines: string[] = []
