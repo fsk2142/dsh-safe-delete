@@ -500,33 +500,210 @@ function isPureAssignment(text: string): boolean {
   }
 
   /*
-   * `new X()` 纯构造：`const m = new Map()`、`const s = new Set()` ——
-   * 创建内存对象，不碰文件系统。
+   * `new X()` 纯构造。
    *
-   * 第六轮复审测过 `node -e 'const m=new Map(); m.delete("k")'` 被误判：
-   * 前半段是构造、后半段是容器操作，两段都不该拦。
+   * **参数也要能证明是纯值**（2026-11-02 定版验收 F7-S1）：
+   * 上一版只检查外层形状 `new X([...])`，于是
+   * `new Array([require("fs").rmSync("/tmp/x")])` 被当成纯值放行 ——
+   * 而构造参数会**求值**，删除在赋值完成前就执行了。
    *
-   * 刻意只认**无可执行参数**的构造（`new Map()` / `new Set()` /
-   * `new Map([])` 这类）。带调用的构造（`new Worker(script)`）可能触发
-   * 副作用，不放行。
+   * 现在参数为空、或参数是能递归证明的纯字面量，才放行。
    */
-  if (/^new\s+[A-Z][\w$]*\s*\(\s*(\[[^\]]*\]|\{[^{}]*\})?\s*\)$/.test(body)) return true
+  const constructor = /^new\s+[A-Z][\w$]*\s*\(([\s\S]*)\)$/.exec(body)
+  if (constructor !== null) {
+    return isPureLiteralValue((constructor[1] ?? '').trim())
+  }
 
   /*
    * 对象 / 数组字面量：`const cfg = { delete: true }`。
    *
    * 这里的 `delete` 是**对象键**，不是方法调用 —— 第六轮复审测过它被误判。
-   * 只认单层字面量：嵌套太深时可能是构造参数或调用，不放行。
+   *
+   * ## 内部元素必须逐个证明是纯值（F7-S1）
+   *
+   * 上一版用 `[\s\S]*` / `[^{}]*` 只看形状，于是：
+   *
+   * ```
+   * const result = { deleted: require("fs").rmSync("/tmp/x") }
+   * const result = [require("fs").rmSync("/tmp/x")]
+   * ```
+   *
+   * 都被当成"纯数据"放行。但对象属性值与数组元素**都会求值**。
+   *
+   * 现在递归检查每个元素。
    */
-  if (/^\[[\s\S]*\]$/.test(body)) return true
-  if (/^\{[^{}]*\}$/.test(body)) return true
+  if (/^\[[\s\S]*\]$/.test(body) || /^\{[\s\S]*\}$/.test(body)) {
+    return isPureLiteralValue(body)
+  }
 
   // 数字 / 布尔 / 空值。
   return /^(?:-?\d+(?:\.\d+)?|true|false|null|undefined)$/.test(body)
 }
 
 /**
- * 判断这条命令是否**可以证明**不会删除任何东西。
+ * 判断一段值是否是**纯字面量**（求值不会产生任何副作用）。
+ *
+ * ## 为什么需要递归（2026-11-02 定版验收 F7-S1）
+ *
+ * 上一版只检查外层形状：
+ *
+ * ```
+ * const result = { deleted: require("fs").rmSync("/tmp/x") }   ← 属性值会求值
+ * const result = [require("fs").rmSync("/tmp/x")]              ← 元素会求值
+ * const result = new Array([require("fs").rmSync("/tmp/x")])   ← 构造参数会求值
+ * ```
+ *
+ * 三条都被当成"纯数据"放行。而 JS 里对象属性、数组元素、构造参数**都会
+ * 在赋值完成前求值** —— 删除已经执行了。
+ *
+ * ## 判据（递归下降，不做完整 JS 解析）
+ *
+ * 允许：
+ *   - 数字 / 字符串 / 布尔 / null / undefined
+ *   - 数组 `[…]`，其中每个元素都能证明
+ *   - 对象 `{…}`，其中每个值都能证明（键名不限制）
+ *
+ * 拒绝：
+ *   - 任何调用 `f(` / `x.y(`
+ *   - `require` / `import`
+ *   - 模板插值 `${`
+ *   - 二次求值：`=>`、`function`、`eval`
+ *   - 二元/一元运算（可能藏调用）
+ *
+ * @param text 值文本（已去首尾空白）。
+ * @returns 能证明是纯字面量返回 true。
+ */
+function isPureLiteralValue(text: string): boolean {
+  const t = text.trim()
+  if (t === '') return true
+
+  // 标量。
+  if (/^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(t)) return true
+  if (/^(?:true|false|null|undefined|NaN|Infinity|True|False|None)$/.test(t)) return true
+  if (
+    (t.startsWith("'") && t.endsWith("'")) ||
+    (t.startsWith('"') && t.endsWith('"')) ||
+    (t.startsWith('`') && t.endsWith('`'))
+  ) {
+    // 引号内不能有插值或转义外的引号闭合问题，交给更粗的检查。
+    return !t.slice(1, -1).includes('${') && t.length >= 2
+  }
+
+  // 数组：逐个元素证明。
+  if (t.startsWith('[') && t.endsWith(']')) {
+    const inner = t.slice(1, -1).trim()
+    if (inner === '') return true
+    return splitTopLevel(inner, ',').every((part) => isPureLiteralValue(part))
+  }
+
+  // 对象：逐个值证明。键可以是标识符、字符串或计算后的简写。
+  if (t.startsWith('{') && t.endsWith('}')) {
+    const inner = t.slice(1, -1).trim()
+    if (inner === '') return true
+    return splitTopLevel(inner, ',').every((entry) => {
+      const trimmed = entry.trim()
+      // `{ delete: true }` —— 找顶层冒号。
+      const colon = findTopLevel(trimmed, ':')
+      if (colon === -1) {
+        /*
+         * 简写属性 `{ fn }`：值就是变量 `fn` 本身。
+         *
+         * 变量引用不会执行任何东西（读取变量无副作用），但为了保守，
+         * 只接受纯标识符。
+         */
+        return /^[A-Za-z_$][\w$]*$/.test(trimmed)
+      }
+      const key = trimmed.slice(0, colon).trim()
+      const value = trimmed.slice(colon + 1).trim()
+      // 键必须是字面量或标识符（计算键 `[f()]: 1` 会求值）。
+      if (key.startsWith('[') && key.endsWith(']')) return false
+      if (!/^(?:[A-Za-z_$][\w$]*|'[^']*'|"[^"]*"|\d+)$/.test(key)) return false
+      return isPureLiteralValue(value)
+    })
+  }
+
+  // 其他形态（调用、运算、模板插值…）一律不能证明。
+  return false
+}
+
+/**
+ * 按顶层分隔符切分（忽略括号与引号内部）。
+ *
+ * @param text 文本。
+ * @param separator 单字符分隔符。
+ * @returns 各段。
+ */
+function splitTopLevel(text: string, separator: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let quote: string | null = null
+  let current = ''
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i] as string
+    if (quote !== null) {
+      current += ch
+      if (ch === '\\' && i + 1 < text.length) {
+        current += text[i + 1] as string
+        i += 1
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1
+
+    if (ch === separator && depth === 0) {
+      parts.push(current)
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  parts.push(current)
+  return parts
+}
+
+/**
+ * 找顶层某个字符的位置（忽略括号与引号内部）。
+ *
+ * @param text 文本。
+ * @param target 目标字符。
+ * @returns 索引；找不到返回 -1。
+ */
+function findTopLevel(text: string, target: string): number {
+  let depth = 0
+  let quote: string | null = null
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i] as string
+    if (quote !== null) {
+      if (ch === '\\') {
+        i += 1
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch
+      continue
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1
+    else if (ch === target && depth === 0) return i
+  }
+  return -1
+}
+
+/**
+ * 判断一条命令是否**可以证明**不会删除任何东西。
  *
  * ## 为什么判定方向反过来了（2026-11-02 架构调整）
  *
@@ -924,23 +1101,55 @@ const PROVEN_READ_ONLY = new Set([
 ])
 
 /**
- * `python -m <module>` 里**已知不会删文件**的模块。
+ * `python -m <module>` 里**整体**可以证明只读的模块。
  *
  * `python -m pytest` / `python -m json.tool` 是标准开发命令；
  * 而 `python -m 任意模块` 可能调用 `shutil.rmtree`。
  *
- * 只收明确只读或测试框架的模块名。
+ * ## `pip` / `venv` 不在这里（2026-11-02 定版验收 F7-S3）
+ *
+ * 上一版把 `pip` 和 `venv` 整体列为安全。但：
+ *
+ * - `python -m venv --clear /tmp/env` —— `--clear` **会删除**已存在目标目录的内容
+ *   （`python -m venv --help` 有原文说明）；
+ * - `python -m pip uninstall -y demo` —— 卸载并**删除**已安装文件。
+ *
+ * 一个模块里有查询能力，不能推出它的**所有**调用都不删文件。
+ * 所以这两个改为按子操作判断（见 `PROVEN_READ_ONLY_PY_SUBCOMMAND`）。
  */
 const PROVEN_READ_ONLY_PY_MODULE = new Set([
   'pytest',
   'unittest',
   'json.tool',
   'http.server',
-  'pip',
-  'venv',
   'compileall',
   'pydoc',
 ])
+
+/**
+ * 需要看**子操作与参数**才能判断的 python 模块。
+ *
+ * 每条都只放行明确的查询形态；其余（`uninstall`、`--clear`、
+ * 以及任何不认识的子命令/参数）都要求审批。
+ */
+const PROVEN_READ_ONLY_PY_SUBCOMMAND: Record<string, (args: readonly string[]) => boolean> = {
+  /*
+   * `pip` 的只读子命令。`uninstall` / `cache purge` 等会删文件 —— 不放行。
+   * 另外 `--target` / `-t` 会写目录，也排除。
+   */
+  pip: (args) => {
+    const sub = (args[0] ?? '').toLowerCase()
+    const readOnly = new Set(['list', 'show', 'freeze', 'check', '--version', '-v', 'search', 'index', 'inspect'])
+    if (!readOnly.has(sub)) return false
+    // 写目录的参数即使出现在只读子命令里也不能证明。
+    return !args.some((a) => /^(?:--target|-t|--prefix|--root|--clear)/i.test(a))
+  },
+  /*
+   * `venv` 默认会在目标目录创建环境（写文件，但不删已有内容）。
+   * `--clear` / `--upgrade` 会先清空目标 —— 必须拦。
+   */
+  venv: (args) => !args.some((a) => /^--(?:clear|upgrade)\b/i.test(a)),
+}
 
 /**
  * `git` 的只读子命令。
@@ -1153,7 +1362,21 @@ function provenHarmless(segment: string, depth = 0): boolean {
    */
   if (/^(?:python[0-9.]*|py)$/.test(first) && tokens[1]?.toLowerCase() === '-m') {
     const module = (tokens[2] ?? '').toLowerCase()
-    return module !== '' && PROVEN_READ_ONLY_PY_MODULE.has(module)
+    if (module === '') return false
+
+    // 整体只读的模块。
+    if (PROVEN_READ_ONLY_PY_MODULE.has(module)) return true
+
+    /*
+     * 要看子操作与参数的模块（`pip` / `venv`）。
+     *
+     * F7-S3：`venv --clear` 会清空目标目录、`pip uninstall` 会删安装文件 ——
+     * 不能因为模块名在白名单里就整体放行。
+     */
+    const judge = PROVEN_READ_ONLY_PY_SUBCOMMAND[module]
+    if (judge !== undefined) return judge(tokens.slice(3))
+
+    return false
   }
 
   /*
@@ -1228,21 +1451,56 @@ function isReadOnlyExpression(text: string): boolean {
   const t = text.trim()
   if (t === '') return false
 
+  /*
+   * ## 从"未命中即安全"改成"正向证明"（2026-11-02 定版验收 F7-S2）
+   *
+   * 上一版是列出若干危险模式，**都没命中就 return true**。于是
+   * `pwsh -Command '[System.IO.Directory]::Delete("C:\Temp\x", $true)'`
+   * 被放行 —— 而它的裸调用形式却能进 ask：
+   *
+   * | 输入 | 结果 |
+   * |---|---|
+   * | `[System.IO.Directory]::Delete("x", $true)` | ask ✓ |
+   * | `pwsh -Command '[System.IO.Directory]::Delete("x", $true)'` | **放行** ✗ |
+   *
+   * 同一个删除，加了执行包装反而绕过 —— 与五轮复审的根因完全同型：
+   * 黑名单挡不住没想到的写法。
+   *
+   * ## 现在的判据
+   *
+   * 只有落在下面这些**已知安全形态**里才返回 true：
+   *   - 纯标量：数字、字符串字面量、布尔、null
+   *   - 属性读取：`process.version`、`a.b.c`
+   *   - 上述的简单组合（不含调用、不含运算副作用）
+   *
+   * 其余（含任何 `(`、`[`、`::`、`=>`）一律不能证明 —— 要求审批。
+   */
   if (containsDeleteCommand(t)) return false
   if (tokenize(t).some((token) => isDeleteArgumentMarker(token))) return false
   if (hasCallStyleDelete(blankQuotedContent(t))) return false
-  if (/\b(?:system|popen|execSync|spawnSync|eval|Function)\s*\(/i.test(t)) return false
-  if (commandSubstitutions(t).length > 0) return false
 
   /*
-   * 含 `require(` / `import(` 的表达式能加载任意模块（`fs` 就在其中）——
-   * 静态看不出它要干什么。`require("fs").rmSync(...)` 已被上面的
-   * `hasCallStyleDelete` 挡住，但 `require("fs")` 赋给变量再调用就看不到，
-   * 所以整体不放行。
+   * 任何调用形态都不能证明：`f(`、`x.y(`、`::`、`=>`、`[`（索引器可能触发访问器）。
    */
-  if (/\b(?:require|import)\s*\(/.test(t)) return false
+  if (/[`$]/.test(t)) return false
+  if (t.includes('(') || t.includes('::') || t.includes('=>')) return false
+  if (/\b(?:require|import|eval|Function|new)\b/.test(t)) return false
+  if (/[+\-*/%&|^~<>!=?]/.test(t)) return false
 
-  return true
+  /*
+   * 正向形态：
+   *   - 纯标量（数字 / 字符串 / 布尔 / 空值）
+   *   - 属性链 `a.b.c`（读取属性无副作用）
+   */
+  if (/^-?\d+(?:\.\d+)?$/.test(t)) return true
+  if (/^(?:true|false|null|undefined|NaN|Infinity|True|False|None)$/.test(t)) return true
+  if ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith('"') && t.endsWith('"'))) {
+    return t.length >= 2
+  }
+  if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(t)) return true
+
+  // 不认识 → 不能证明。
+  return false
 }
 
 /**
@@ -1611,7 +1869,13 @@ const CALL_STYLE_DELETE_ANY_CASE = new RegExp(
  * 排除容器操作：`Map.delete(`、`Set.delete(`、`cache.delete(`。
  */
 const CALL_STYLE_DELETE_CASE_SENSITIVE =
-  /(?:System\s*\.\s*IO\s*\.\s*)?File\]?\s*(?:\.|::)\s*[Dd]elete\s*\(|\.Delete\s*\(/
+  /*
+   * .NET 的 File **和 Directory** 静态删除（2026-11-02 定版验收 F7-S2）。
+   *
+   * `[System.IO.Directory]::Delete("C:\Temp\x", $true)` 是递归删目录 ——
+   * 上一版只匹配 `File`，于是这条标准 .NET 调用被当成无害。
+   */
+  /(?:System\s*\.\s*IO\s*\.\s*)?(?:File|Directory|DirectoryInfo|FileInfo)\]?\s*(?:\.|::)\s*[Dd]elete\s*\(|\.Delete\s*\(/
 
 /**
  * 判断脚本体里是否有函数式删除调用。
