@@ -102,22 +102,32 @@ describe('定版复核第 7 项: the parent cannot overwrite a terminal state', 
       expect(job.finishedAt, '终态必须有 finishedAt').not.toBeNull()
     }
 
-    const source = readFileSync('src/cleanup.ts', 'utf8')
-    const codeOnly = source
+    /*
+     * ## 架构不变量（2026-11-02 定版验收 RV-07）
+     *
+     * 三轮修补都失败，最终确认方向错了：只给一侧加锁挡不住不拿锁的另一侧。
+     * 现在把状态机收成**单写者** —— worker 是唯一写状态的一方。
+     *
+     * 所以断言不再是"父进程写 running 前有没有检查终态"，
+     * 而是"父进程根本不写 running"，且 worker 会写。
+     */
+    const parent = readFileSync('src/cleanup.ts', 'utf8')
+    const parentCode = parent
       .split('\n')
       .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
       .join('\n')
 
-    // 结构约束：写 running 之前必须先查是否已是终态。
-    const at = codeOnly.indexOf("outcome: 'running'")
-    expect(at, '应能找到写 running 的位置').toBeGreaterThan(0)
+    expect(parentCode, '父进程不该再写 running').not.toMatch(/outcome: 'running'/)
+    expect(parentCode, '父进程不该再写 completed').not.toMatch(/outcome: 'completed'/)
 
-    /*
-     * 2026-11-02 定版终审 RV-07 把"读后写"改成"锁内读改写"：
-     * 断言它走的是条件写，而不是再出现一个读判断。
-     */
-    expect(codeOnly, '写 running 必须经过条件写').toMatch(/writeJobConditionally/)
-    expect(codeOnly, '不应再有裸的 alreadyTerminal 读判断').not.toMatch(/const alreadyTerminal =/)
+    const worker = readFileSync('src/cleanup-worker.ts', 'utf8')
+    const workerCode = worker
+      .split('\n')
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n')
+
+    expect(workerCode, 'worker 应写 running').toMatch(/outcome: 'running'/)
+    expect(workerCode, 'worker 应写终态').toMatch(/outcome: 'completed'|outcome: 'failed'/)
   }, 60_000)
 })
 

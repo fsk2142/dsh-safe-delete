@@ -397,4 +397,134 @@ describe('F-02: a kept number draft keeps the unit it was typed in', () => {
     const impliedBytes = Number(input.value) * (unit.value === 'MB' ? MB : GB)
     expect(impliedBytes, '界面隐含的字节数应等于用户本意 2GB').toBe(2 * GB)
   }, 60_000)
+
+  it('keeps a unit the user changed during the save (GB -> MB)', async () => {
+    /*
+     * 2026-11-02 定版验收 P1：**在途同时改数字和单位**。
+     *
+     * 上一版修 F-02 时加的"隐式单位补写"循环，会无条件用提交时的旧单位
+     * 覆盖已经合并的新单位 —— 这是我引入的直接回归。
+     *
+     * 场景：初始 3GB → 改成 5GB → 保存（请求在飞）
+     *       等待期间改成 2048 MB（数字与单位都改）
+     *
+     * 期望：回读后仍是 2048 MB，第二次保存写 2 GB。
+     */
+    const { act, calls, input, unit, release, container } = await mount(
+      { confirmBytes: 3 * GB },
+      true,
+    )
+
+    expect(unit.value, '初始 3GB 的自然单位是 GB').toBe('GB')
+    await changeValue(act, input, '5')
+
+    await act(async () => {
+      findSaveButton(container)?.click()
+      await new Promise((r) => setTimeout(r, 60))
+    })
+
+    // 请求在飞：数字和单位都改
+    await changeValue(act, input, '2048')
+    await changeValue(act, unit, 'MB')
+
+    await act(async () => {
+      release()
+      await new Promise((r) => setTimeout(r, 300))
+    })
+
+    expect(input.value, '新数字应保留').toBe('2048')
+    expect(unit.value, '**用户新选的单位不能被旧快照覆盖**').toBe('MB')
+
+    const save2 = findSaveButton(container)
+    expect(save2, '仍有未提交编辑，保存按钮应存在').not.toBeNull()
+    await act(async () => {
+      save2?.click()
+      await new Promise((r) => setTimeout(r, 300))
+    })
+
+    const all = calls.flatMap((c) => c.ops).filter((o) => o.path[0] === 'confirmBytes')
+    const last = all[all.length - 1]
+    expect(last?.value, '第二次应写入 2 GB').toBe(2 * GB)
+    expect(last?.value as number, '绝不能变成 TB 量级').toBeLessThan(TB)
+  }, 60_000)
+
+  it('keeps a unit the user changed during the save (MB -> GB)', async () => {
+    /*
+     * 反向：MB 底值，在途把单位改成 GB。
+     *
+     * 用户主动选 GB 时，第二次保存**应该**写 TB 量级 —— 那是他的本意。
+     * 这条防的是"把反向情况也当成缺陷"的误判。
+     */
+    const { act, calls, input, unit, release, container } = await mount(
+      { confirmBytes: 500 * MB },
+      true,
+    )
+
+    expect(unit.value, '初始 500MB 的自然单位是 MB').toBe('MB')
+    await changeValue(act, input, '1024')
+
+    await act(async () => {
+      findSaveButton(container)?.click()
+      await new Promise((r) => setTimeout(r, 60))
+    })
+
+    // 请求在飞：数字和单位都改
+    await changeValue(act, input, '2048')
+    await changeValue(act, unit, 'GB')
+
+    await act(async () => {
+      release()
+      await new Promise((r) => setTimeout(r, 300))
+    })
+
+    expect(input.value).toBe('2048')
+    expect(unit.value, '用户新选的 GB 必须保留').toBe('GB')
+
+    const save2 = findSaveButton(container)
+    await act(async () => {
+      save2?.click()
+      await new Promise((r) => setTimeout(r, 300))
+    })
+
+    const all = calls.flatMap((c) => c.ops).filter((o) => o.path[0] === 'confirmBytes')
+    expect(all[all.length - 1]?.value, '2048 GB 是用户本意').toBe(2048 * GB)
+  }, 60_000)
+
+  it('keeps the number-and-unit pair coherent across every in-flight combination', async () => {
+    /*
+     * 汇总不变量：`显示值 = 数字 × 单位` 必须始终等于用户最后一次输入的含义。
+     *
+     * 覆盖四种在途组合（数字改/不改 × 单位改/不改），排除"修好一种、坏掉另一种"。
+     */
+    const cases: Array<{ from: string; n: string; u: 'MB' | 'GB'; expBytes: number }> = [
+      { from: '500MB', n: '2048', u: 'MB', expBytes: 2048 * MB },
+      { from: '3GB', n: '2048', u: 'MB', expBytes: 2048 * MB },
+      { from: '500MB', n: '2', u: 'GB', expBytes: 2 * GB },
+      { from: '3GB', n: '7', u: 'GB', expBytes: 7 * GB },
+    ]
+
+    for (const c of cases) {
+      const initial = c.from === '500MB' ? 500 * MB : 3 * GB
+      const { act, input, unit, release, container } = await mount(
+        { confirmBytes: initial },
+        true,
+      )
+
+      await changeValue(act, input, '1234')
+      await act(async () => {
+        findSaveButton(container)?.click()
+        await new Promise((r) => setTimeout(r, 60))
+      })
+      await changeValue(act, input, c.n)
+      await changeValue(act, unit, c.u)
+
+      await act(async () => {
+        release()
+        await new Promise((r) => setTimeout(r, 300))
+      })
+
+      const implied = Number(input.value) * (unit.value === 'MB' ? MB : GB)
+      expect(implied, `${c.from} 在途改 ${c.n}${c.u} → 应等于 ${c.expBytes} 字节`).toBe(c.expBytes)
+    }
+  }, 120_000)
 })

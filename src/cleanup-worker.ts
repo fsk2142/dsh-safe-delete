@@ -124,6 +124,26 @@ async function main(): Promise<number> {
   const prev = readCleanupJob(stateDir)
   const requestedAt = prev?.requestedAt ?? Date.now()
 
+  /*
+   * ## worker 自己写 `running`（2026-11-02 定版验收 RV-07）
+   *
+   * 父进程不再写状态（见 `requestCleanup` 的注释）：只给一侧加锁挡不住
+   * 不拿锁的另一侧。worker 是唯一持有清理锁、也是唯一会写终态的一方，
+   * 所以由它从 `running` 写到终态 —— 状态机只有一条写者。
+   *
+   * 这一步在 `bindWorkerPid` 成功之后：写之前已确认自己持有锁。
+   */
+  writeCleanupJobState(stateDir, {
+    requestId: id,
+    pid: process.pid,
+    requestedAt,
+    startedAt: prev?.startedAt ?? Date.now(),
+    finishedAt: null,
+    outcome: 'running',
+    recycled: 0,
+    skipped: 0,
+  })
+
   try {
     const result = await pruneNowForWorker(stateDir, Number.isFinite(limit) ? limit : 500, undefined, undefined, mode)
 

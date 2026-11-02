@@ -71,14 +71,27 @@ describe('F-03: delete detection covers real execution, not everything else', ()
       expect(isDestructive('const s = `x ${require("fs").rmSync("y")}`')).toBe(true)
     })
 
-    it('treats a plain template literal with no delete call as harmless', () => {
+    it('flags a backtick block that contains a delete, because Bash executes it', () => {
       /*
-       * 纯模板字符串（无插值、无删除内容）不该触发审批。
+       * ## 反引号里含删除字样：必须判删除（2026-11-02 定版验收，P1）
        *
-       * 注意与上一条的区别：`${…}` 会执行；没有插值的反引号字符串
-       * 就是普通字面量。
+       * 我在上一轮把这条断言写成了 `false`，理由是"没有插值就是普通字面量"。
+       * 那是**只按 JavaScript 语义**推理 —— 而同一个解析器也服务 Bash 工具。
+       * 在 Bash 里反引号是命令替换，`result=`rm -rf /tmp/x`` 会被执行。
+       *
+       * 终审因此要求：可执行命令替换必须保守识别。
        */
-      expect(isDestructive('const out = `rm -rf /tmp/x`'), '纯字符串不该判删除').toBe(false)
+      expect(isDestructive('const out = `rm -rf /tmp/x`'), '反引号里的删除必须识别').toBe(true)
+      expect(isDestructive('result=`find /tmp -delete`'), '参数级删除也要识别').toBe(true)
+    })
+
+    it('treats a backtick block with no delete content as harmless', () => {
+      /*
+       * 反引号里**没有**删除内容时仍是纯字面量，不误拦 ——
+       * 过度反应会造成审批疲劳。
+       */
+      expect(isDestructive('const s = `plain text`'), '纯文本模板不该判删除').toBe(false)
+      expect(isDestructive('const s = `hello world`')).toBe(false)
     })
   })
 

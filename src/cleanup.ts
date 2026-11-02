@@ -30,8 +30,6 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { withIndexLock } from './index-lock'
-
 /** 清理任务的状态快照（写在 `<stateDir>/cleanup-job.json`）。 */
 export interface CleanupJobState {
   /** 请求 id（便于日志关联）。 */
@@ -89,50 +87,6 @@ function writeCleanupJob(stateDir: string, state: CleanupJobState): void {
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
   renameSync(tmp, file)
-}
-
-/**
- * 只在状态**仍是本次请求且仍在 running** 时才写入。
- *
- * ## 为什么需要它（2026-11-02 定版终审 RV-07）
- *
- * 上一版是"先读、判断、再写"：
- *
- * ```ts
- * const existing = readCleanupJob(stateDir)
- * if (!alreadyTerminal) writeCleanupJob(...)   // ← 这两步之间是窗口
- * ```
- *
- * worker 可能恰好在**读之后、写之前**写完 `completed` 与计数 ——
- * 父进程那次写仍会把终态倒退成 `running` / `recycled=0`。
- * 终审正是这样复现的：读检查只**缩小**了窗口，没有关闭它。
- *
- * 现在用锁内读改写：读与写在同一个临界区里，中间不会有别的进程插进来。
- *
- * @param stateDir 安全区目录。
- * @param requestId 本次请求 id。
- * @param make 基于当前状态决定要写什么；返回 `null` 表示放弃写入。
- * @returns 真的写了返回 true。
- */
-async function writeJobConditionally(
-  stateDir: string,
-  requestId: string,
-  make: (current: CleanupJobState) => CleanupJobState | null,
-): Promise<boolean> {
-  /*
-   * 用现有的索引锁保护这次读改写。
-   *
-   * `index.lock` 已经覆盖同一批索引文件；复用它而不是新造一把锁，
-   * 避免再引入一套需要证明的互斥协议。
-   */
-  return withIndexLock(stateDir, async () => {
-    const current = readCleanupJob(stateDir)
-    if (current === null || current.requestId !== requestId) return false
-    const next = make(current)
-    if (next === null) return false
-    writeCleanupJob(stateDir, next)
-    return true
-  })
 }
 
 /**
@@ -579,8 +533,28 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
      * 只在状态仍是本次请求的 `running` 时才覆盖 ——
      * 避免踩掉一个已经开始的新请求。
      */
+    /*
+     * ## 不再要求状态是 `running`（2026-11-02 定版验收 RV-07）
+     *
+     * 父进程已不再写 `running` —— 状态由 worker 独占。于是 worker 在
+     * **写 running 之前**就崩溃（入口缺失、绑定前失败）时，状态还停在
+     * 上一次请求的内容，旧的 `current.outcome === 'running'` 条件永远
+     * 不成立，**没人**把这次失败记下来。
+     *
+     * 实测：`worker-exit-sd08` 的"worker 加载失败"用例等 20 秒后仍是
+     * `pending`，界面会一直以为"还在排队"。
+     *
+     * 现在只按 `requestId` 归属判断：只要状态属于**本次请求**（无论它
+     * 现在是 pending 还是 running），非零退出就把整次请求标为 failed。
+     * 这不会踩掉新请求 —— 新请求有不同的 requestId。
+     */
     const current = readCleanupJob(stateDir)
-    if (current !== null && current.requestId === requestId && current.outcome === 'running') {
+    const belongsToThisRun =
+      current !== null &&
+      current.requestId === requestId &&
+      current.outcome !== 'completed' &&
+      current.outcome !== 'failed'
+    if (belongsToThisRun) {
       writeCleanupJob(stateDir, {
         requestId,
         pid: child.pid ?? null,
@@ -600,39 +574,27 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
 
   if (typeof child.pid === 'number') {
     /*
-     * ## 不能无条件把状态写成 `running`（2026-11-01 定版复核第 7 项）
+     * ## 父进程**不再写**状态（2026-11-02 定版验收 RV-07）
      *
-     * spawn 成功只表示进程启动了。**一个很快的 worker 可能在父进程执行到
-     * 这一行之前就已经跑完**：写好 `completed`、`recycled=7`、释放锁并退出。
+     * ## 三轮都在改同一处，说明方向错了
      *
-     * 那时父进程再写 `running` / `recycled=0`，就把终态和统计一起抹掉。
-     * 而且 `exit` 的 `code === 0` 分支只做"直接返回"，不会纠正 ——
-     * 状态永远停在 `running`，计数永远是 0。
+     * - 第一版：spawn 后无条件写 `running` —— 覆盖 worker 已写好的终态。
+     * - 第二版：先读一次、判断是否终态 —— 只缩小窗口，读与写之间仍可插入。
+     * - 第三版：读改写放进 `index.lock` —— 但 **worker 不参与这把锁**，
+     *   它收尾时直接调无锁的 `writeCleanupJobState`。终审用真实 worker
+     *   重放两次（含真实空安全区清理），两次都从 `completed` 倒退成 `running`。
      *
-     * 复核用受控调度实测到：最终 running、recycled=0、锁已不存在。
+     * 结论：只给一侧加锁永远挡不住不拿锁的另一侧。
      *
-     * ## 只"先读一次"不够（2026-11-02 定版终审 RV-07）
+     * ## 现在的划分
      *
-     * 上一版是「先读、判断、再写」。worker 可能恰好在**读之后、写之前**
-     * 写完终态 —— 那次写仍会把它倒退。终审确认：读检查只缩小了窗口。
+     * worker 是**唯一**会写状态的一方：
+     *   - 它由父进程 `wx` 建锁后启动，`bindWorkerPid` 成功才会干活；
+     *   - 它写 `running`，再写 `completed` / `failed` 并释放锁。
      *
-     * 现在用 `writeJobConditionally`：读与写在同一个临界区内完成，
-     * 中间不会有别的进程插进来。
+     * 父进程只负责失败收尾（spawn 失败、非零退出），不写 `running`。
+     * 这样"终态被倒退"在**结构上**不可能发生 —— 不是靠时序运气。
      */
-    await writeJobConditionally(stateDir, requestId, (current) => {
-      // 已是本次请求的终态 → 什么都不写。
-      if (current.outcome === 'completed' || current.outcome === 'failed') return null
-      return {
-        requestId,
-        pid: child.pid ?? null,
-        requestedAt: current.requestedAt,
-        startedAt: current.startedAt ?? Date.now(),
-        finishedAt: null,
-        outcome: 'running',
-        recycled: 0,
-        skipped: 0,
-      }
-    })
   } else {
     /*
      * 没有 pid：spawn 失败了。`error` 事件可能稍后才到，但此刻我们已能

@@ -354,8 +354,24 @@ function blankQuotedContent(text: string): string {
  * @returns 是纯赋值返回 true。
  */
 function isPureAssignment(text: string): boolean {
-  // 含命令分隔符就不是"纯"赋值。
-  if (/[;&|\n\r]/.test(text)) return false
+  /*
+   * ## 分号要区分"尾分号"与"语句分隔"（2026-11-02 定版验收）
+   *
+   * 上一版这里是 `/[;&|\n\r]/.test(text)` —— 只要出现分号就直接拒绝。
+   * 而后面还有一段"允许一个尾分号"的逻辑（`body.endsWith(';')`），
+   * 那段因此**永远不可达**。
+   *
+   * 后果：`const note = "rm -rf /tmp"` 能正确放行，
+   * 但 `const note = "rm -rf /tmp";` 被判为删除 —— 一次普通赋值
+   * 因为多了一个分号就弹审批。
+   *
+   * 现在：先把**一个**尾分号摘掉，再看剩下的是否还含分隔符。
+   * 这样 `x = "a"; rm -rf /tmp`（分号后还有语句）仍会被拒绝，
+   * 而 `x = "a";`（只是收尾）可以放行。
+   */
+  const withoutTrailing = text.trim().replace(/;\s*$/, '')
+  // 剩下的部分含任何分隔符，就不是"纯"赋值。
+  if (/[;&|\n\r]/.test(withoutTrailing)) return false
 
   const trimmed = text.trim()
   if (trimmed === '') return false
@@ -389,10 +405,48 @@ function isPureAssignment(text: string): boolean {
   if (body === '') return false
 
   /*
-   * 模板字符串：含 `${…}` 就是插值，可能执行代码 —— 不放行。
+   * ## 反引号有两种语境（2026-11-02 定版验收，P1）
+   *
+   * `body` 以反引号包裹时：
+   *
+   * - **JavaScript 模板字符串**：纯文本就是字面量，`${…}` 会执行；
+   * - **Bash 命令替换**：`result=`rm -rf /tmp/x`` 里反引号内**会被执行**。
+   *
+   * 上一版只按 JS 规则判断（"无 `${}` 就是纯字面量"），于是：
+   *
+   * ```
+   * result=`rm -rf /tmp/x`     → destructive:false   ← Bash 里会真的删
+   * ```
+   *
+   * 这与已修的 `result=$(rm -rf /tmp/x)` 是**同一种能力的两种写法**，
+   * 不该因为反引号长得像 JS 模板就放过。
+   *
+   * ## 判据
+   *
+   * 不看"是哪种语言"（接口没有语境参数），而看**内容是否有执行风险**：
+   * 反引号内若出现删除命令或命令替换，就按删除处理。
+   * 纯文字的模板字符串仍然放行 —— 那样不会误拦常见写法。
    */
   if (body.startsWith('`') && body.endsWith('`')) {
-    return body.length >= 2 && !body.includes('${')
+    if (body.length < 2) return false
+    // `${…}` 插值：两种语境都会执行。
+    if (body.includes('${')) return false
+    const inner = body.slice(1, -1)
+    /*
+     * 反引号内若是可执行的删除（Bash 语境），不能当纯字面量。
+     *
+     * 三道都要：
+     *   - `containsDeleteCommand`：命令位动词、包装器解包；
+     *   - `isDeleteArgumentMarker`：`find -delete`、`rsync --delete` 这类
+     *     动词在参数里的形态；
+     *   - `hasCallStyleDelete`：`fs.rmSync(...)` 这类方法调用。
+     *
+     * 只查第一道会漏掉后两类（本轮实测）。
+     */
+    if (containsDeleteCommand(inner)) return false
+    if (tokenize(inner).some((t) => isDeleteArgumentMarker(t))) return false
+    if (hasCallStyleDelete(blankQuotedContent(inner))) return false
+    return true
   }
 
   /*

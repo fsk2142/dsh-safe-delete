@@ -886,6 +886,33 @@ export function SafeZoneSettings(): ReactElement {
                 const liveDraft = prev[draftKey]
                 const submittedDraft = submittedDrafts[spec.key]
                 if (typeof liveDraft !== 'string' || liveDraft === submittedDraft) continue
+
+                /*
+                 * ## 只在**没有有效单位**时才补写（2026-11-02 定版验收，P1）
+                 *
+                 * 上一版这里无条件 `merged[unitKey] = submittedUnit`。
+                 * 而上面的循环已经把"用户本次新选的单位"合并进 `merged` ——
+                 * 于是这个补写会把它**覆盖回提交时的旧单位**：
+                 *
+                 * ```
+                 * 初始 3GB，改成 5GB，点保存（请求在飞）
+                 *   等待期间改成 2048 MB（数字和单位都改了）
+                 *   回读后草稿 2048 保留 ✓
+                 *   但补写循环把单位改回 GB ✗ → 显示 2048 GB
+                 *   第二次保存写 2 TB（用户本意 2 GB）
+                 * ```
+                 *
+                 * 这是我在修 F-02 时引入的**直接回归**；反向（在途 MB→GB）
+                 * 同样会被改回旧 MB。
+                 *
+                 * 现在按优先级取：
+                 *   1. `merged` 里已有有效单位（用户新选的）→ 不动；
+                 *   2. 否则用提交时的有效单位（隐式单位场景）；
+                 *   3. 都没有才留给服务端自然单位。
+                 */
+                const alreadyMerged = merged[unitKey]
+                if (alreadyMerged === 'MB' || alreadyMerged === 'GB') continue
+
                 const submittedUnit = submittedUnits[spec.key]
                 if (submittedUnit === undefined) continue
                 merged[unitKey] = submittedUnit
