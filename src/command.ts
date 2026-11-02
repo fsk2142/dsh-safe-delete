@@ -454,13 +454,45 @@ function isPureAssignment(text: string): boolean {
    *
    * 要求首尾配对且中间**没有**未转义的同类引号 —— 否则说明它是拼接
    * 或调用的一部分（如 `"a" + f()`），不能当纯字面量。
+   *
+   * ## 但单引号与双引号在 Bash 里**根本不同**（2026-11-02 定版验收，P1）
+   *
+   * 这是我连续三轮漏掉的地方，每轮只修了一种表面写法：
+   *
+   * - 第一轮漏 `const r = fs.rmSync("x")`（右侧是调用）；
+   * - 第二轮漏 `result=`rm -rf /tmp/x``（裸反引号）；
+   * - 第三轮漏 `result="$(rm -rf /tmp/x)"`（**双引号里的命令替换**）。
+   *
+   * POSIX shell 规则：
+   *   - **单引号**内一切都不展开 —— `'$(rm x)'` 就是字面量，安全；
+   *   - **双引号**内 `$(…)` 与反引号**照常执行**，只是结果不分词。
+   *
+   * 所以"被双引号包裹"不能当作"纯文字"。这里对双引号内容单独检查。
    */
   const quote = body[0]
   if (quote === "'" || quote === '"') {
     if (!body.endsWith(quote) || body.length < 2) return false
     const inner = body.slice(1, -1)
     // 内部若有同类引号（非转义），说明外层不是单一字面量。
-    return !new RegExp(`(^|[^\\\\])${quote === "'" ? "'" : '"'}`).test(inner)
+    if (new RegExp(`(^|[^\\\\])${quote === "'" ? "'" : '"'}`).test(inner)) return false
+
+    // 单引号：内容不展开，可以直接当字面量。
+    if (quote === "'") return true
+
+    /*
+     * 双引号：检查内部**仍会执行**的命令替换。
+     *
+     * `commandSubstitutions` 已经正确处理"单引号内不展开"的语境，
+     * 所以直接复用它：它返回的每段都会被 shell 真的执行。
+     */
+    for (const substitution of commandSubstitutions(`"${inner}"`)) {
+      if (containsDeleteCommand(substitution)) return false
+      if (tokenize(substitution).some((t) => isDeleteArgumentMarker(t))) return false
+      if (hasCallStyleDelete(blankQuotedContent(substitution))) return false
+    }
+
+    // 没有会执行的删除（含转义后的 `\$(`）→ 是字面量。
+    return true
   }
 
   // 数字 / 布尔 / 空值。
@@ -552,11 +584,28 @@ function mentionsOnly(command: string): boolean {
     if (parseCommand(segment).destructive) return false
   }
 
-  // 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与 `echo \`rm -rf /tmp/x\``
-  // 都不是"仅在参数里提到删除"，而是「先执行里面的删除，再把输出交给 echo」。
-  // 只看段首会漏掉这一类，所以把替换内容也当作一段来判。
+  /*
+   * ## 命令替换里的删除也要**完整**判定（2026-11-02 定版验收，P1）
+   *
+   * 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与反引号写法都不是
+   * "仅在参数里提到删除"。
+   *
+   * 上一版这里只调 `containsDeleteCommand` —— 它只看命令位动词。于是：
+   *
+   * ```
+   * "$(find /tmp -delete)"   提取到 `find /tmp -delete`
+   *   containsDeleteCommand 不认参数级删除 → 判"仅提及" → 提前放行 ✗
+   * ```
+   *
+   * 而 `$(rm -rf /tmp/x)` 因为 `rm` 恰好在命令位，碰巧能识别 —— 修复看起来
+   * "部分有效"，掩盖了判据缺两道的事实。
+   *
+   * 现在与逐段检查用同一套三道判定，不再有缩水版本。
+   */
   for (const inner of commandSubstitutions(stripped)) {
     if (containsDeleteCommand(inner)) return false
+    if (tokenize(inner).some((t) => isDeleteArgumentMarker(t))) return false
+    if (hasCallStyleDelete(blankQuotedContent(inner))) return false
   }
 
   const tokens = tokenize(segments[0] ?? '')
@@ -1485,6 +1534,34 @@ export function parseCommand(command: string): CommandVerdict {
      */
     if (hasCallStyleDelete(blankQuotedContent(text))) {
       return { destructive: true, kind: 'delete', recursive: false, target: null }
+    }
+
+    /*
+     * ## 双引号包裹的命令替换（2026-11-02 定版验收，P1）
+     *
+     * `result="$(![]...)"` 这类写法里，删除在**双引号内部**。上面的
+     * `blankQuotedContent` 会把双引号里的内容抹成空格，于是：
+     *
+     * ```
+     * result="$(fs.rmSync("x"))"    ← 抹掉后 `.rmSync(` 消失
+     * result="$(find /tmp -delete)" ← 同上
+     * ```
+     *
+     * 而 Bash 的双引号**不抑制**命令替换 —— 它们是会执行的。
+     *
+     * 这里改用 `commandSubstitutions`：它按 shell 规则提取 `$(…)` 与反引号
+     * 内容（单引号内的不提取），提取出来的每段都真的会被执行，用原文本判。
+     */
+    for (const substitution of commandSubstitutions(text)) {
+      if (containsDeleteCommand(substitution)) {
+        return { destructive: true, kind: 'delete', recursive: false, target: null }
+      }
+      if (tokenize(substitution).some((t) => isDeleteArgumentMarker(t))) {
+        return { destructive: true, kind: 'delete', recursive: false, target: null }
+      }
+      if (hasCallStyleDelete(blankQuotedContent(substitution))) {
+        return { destructive: true, kind: 'delete', recursive: false, target: null }
+      }
     }
 
     /*
