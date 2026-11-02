@@ -88,6 +88,50 @@ function stateDir() {
 }
 
 /**
+ * 去掉 YAML 值的行尾注释，**尊重引号**。
+ *
+ * ## 为什么不能简单 `.replace(/#.*$/, '')`（2026-11-02 定版终审 RV-08 残留）
+ *
+ * 上一版对未加引号的值直接截 `#` 之后的内容。而合法写法可能同时有引号和注释：
+ *
+ * ```
+ * stateDir: 'C:/.../zone#one' # local safe zone
+ * ```
+ *
+ * 直接截断会把引号内的 `#one` 一起吃掉，得到 `'C:/.../zone` —— 引号不配对，
+ * CLI 指向错误的安全区目录，正好毁掉救援通道。
+ *
+ * ## 规则
+ *
+ * 扫描一遍，记录引号状态：
+ *   - 引号**外**的 `#` 是注释起点（YAML 要求前面有空白或行首）；
+ *   - 引号**内**的 `#` 是数据。
+ *
+ * @param {string} text 原始值文本。
+ * @returns {string} 去掉行尾注释后的文本。
+ */
+function stripTrailingComment(text) {
+  let quote = null
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (ch === '#') {
+      // YAML：`#` 前面是空白或行首才算注释。
+      const prev = i === 0 ? ' ' : text[i - 1]
+      if (i === 0 || /\s/.test(prev)) return text.slice(0, i)
+    }
+  }
+  return text
+}
+
+/**
  * 读本插件的配置；读不到就退回内置默认值，并**明确标注**。
  *
  * 为什么必须标注：终端里没有 settings 服务。如果 `status` 直接打印
@@ -173,17 +217,29 @@ function readConfigDefaults() {
        * 普通字符），否则才剥注释。这与 YAML 的引用语义一致。
        */
       const rawValue = m[1].trim()
+      /*
+       * ## 引号值 + 行尾注释（2026-11-02 定版终审 RV-08 残留）
+       *
+       * 上一版只看"整段是否被引号包裹"。于是这个合法写法失败：
+       *
+       * ```
+       * stateDir: 'C:/.../zone#one' # local safe zone
+       * ```
+       *
+       * 它以 `'` 开头但以 `zone` 结尾（不是引号），`quoted` 判为 false，
+       * 于是走"剥注释"分支 —— 连**引号内的** `#one` 一起截掉，
+       * 又回到错误目录。
+       *
+       * 正确做法：先扫描一遍，**引号外的** `#` 才是注释起点；引号内的
+       * `#` 是数据。剥完注释后再判断剩下的是否为引号值。
+       */
+      let raw = stripTrailingComment(rawValue).trim()
+
       const quoted =
-        (rawValue.startsWith("'") && rawValue.endsWith("'") && rawValue.length >= 2) ||
-        (rawValue.startsWith('"') && rawValue.endsWith('"') && rawValue.length >= 2)
-      let raw
-      if (quoted) {
-        // 引号内：# 是普通字符，不剥注释。
-        raw = rawValue.slice(1, -1)
-      } else {
-        // 未加引号：行尾 # 之后是注释。
-        raw = rawValue.replace(/(^|\s)#.*$/, '').trim()
-      }
+        (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) ||
+        (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2)
+      if (quoted) raw = raw.slice(1, -1)
+
       return raw === '' ? fallbackValue : raw
     }
 

@@ -257,7 +257,25 @@ async function main() {
       title: currentTag,
       body,
     });
-    console.log(`已补建 Release：${backfill}`);
+    /*
+     * ## 没 token 时不能说"已补建"（2026-11-02 定版终审）
+     *
+     * `createRelease` 在没有 `GITHUB_TOKEN` / `GH_TOKEN` 时返回 `"no-token"`，
+     * 表示**什么都没做**。第一版无条件打印 `已补建 Release：no-token` ——
+     * 用户会以为建好了，实际去市场看仍然是只有 tag 没说明。
+     *
+     * 现在按返回值区分成功与跳过，并说明怎么补。
+     */
+    if (backfill === "no-token") {
+      console.log(
+        `跳过补建：没有 GITHUB_TOKEN / GH_TOKEN，${currentTag} 的 Release 未创建。`,
+      );
+      console.log(
+        `设置 token 后重跑本脚本即可补建（不会抬版本、不会重复打 tag）。`,
+      );
+      return;
+    }
+    console.log(`已补建 Release：${currentTag}`);
     return;
   }
   console.log(`当前 ${next.current} → 下一个 ${next.next}（${next.level}）`);

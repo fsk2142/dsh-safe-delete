@@ -111,34 +111,37 @@ describe('定版复核第 7 项: the parent cannot overwrite a terminal state', 
     // 结构约束：写 running 之前必须先查是否已是终态。
     const at = codeOnly.indexOf("outcome: 'running'")
     expect(at, '应能找到写 running 的位置').toBeGreaterThan(0)
-    const before = codeOnly.slice(Math.max(0, at - 1200), at)
-    expect(before, '写 running 前应检查是否已是终态').toMatch(/alreadyTerminal/)
+
+    /*
+     * 2026-11-02 定版终审 RV-07 把"读后写"改成"锁内读改写"：
+     * 断言它走的是条件写，而不是再出现一个读判断。
+     */
+    expect(codeOnly, '写 running 必须经过条件写').toMatch(/writeJobConditionally/)
+    expect(codeOnly, '不应再有裸的 alreadyTerminal 读判断').not.toMatch(/const alreadyTerminal =/)
   }, 60_000)
 })
 
 describe('定版复核第 8 项: the CLI parses YAML strings by quoting context', () => {
-  it('does not strip a # that belongs to a quoted value', () => {
+  it('has a quote-aware comment stripper, not a blind regex', () => {
     /*
-     * 结构约束：`pickString` 必须先看引号、再剥注释。
+     * 结构约束：必须有引号感知的注释剥离。
      *
-     * 反了的话 `stateDir: 'C:/zone#one'` 会被截成 `'C:/zone`，
-     * 引号不配对，CLI 指向错误目录。
+     * 2026-11-02 定版终审发现上一版仍有残留：`'C:/zone#one' # comment`
+     * 这种"引号值 + 行尾注释"会被整体截断（结束引号不是引号，于是
+     * `quoted` 判 false，走剥注释分支吃掉引号内的 `#`）。
+     *
+     * 修法是引号感知的 `stripTrailingComment`，之后才判断引号。
+     * 真实 CLI 行为见 `tests/cli-statedir-sd13.test.ts`。
      */
     const src = readFileSync(join('bin', 'dsh-safe-delete.mjs'), 'utf8')
 
+    expect(src, '应有引号感知的注释剥离函数').toMatch(/function stripTrailingComment/)
+    expect(src, 'pickString 应调用它').toMatch(/stripTrailingComment\(rawValue\)/)
+
+    // 不该再有"整体正则截断"的老写法。
     const at = src.indexOf('const pickString =')
-    expect(at, '应存在 pickString').toBeGreaterThan(0)
-    const body = src.slice(at, at + 2200)
-
-    // 必须先判断引号。
-    const quotedAt = body.indexOf('const quoted =')
-    const stripAt = body.indexOf('replace(/(^|\\s)#.*$/')
-    expect(quotedAt, '应先判断是否被引号包裹').toBeGreaterThan(0)
-    expect(stripAt, '剥注释只应在未加引号时发生').toBeGreaterThan(0)
-    expect(quotedAt, '判断引号必须在剥注释之前').toBeLessThan(stripAt)
-
-    // 引号内的分支不能剥注释。
-    expect(body, '引号内直接取内容').toMatch(/raw = rawValue\.slice\(1, -1\)/)
+    const body = src.slice(at, at + 1600)
+    expect(body, '不该再用朴素的 replace(/#.*$/)').not.toMatch(/rawValue\.replace\(\/#/)
   })
 })
 

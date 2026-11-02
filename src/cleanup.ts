@@ -30,6 +30,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { withIndexLock } from './index-lock'
+
 /** 清理任务的状态快照（写在 `<stateDir>/cleanup-job.json`）。 */
 export interface CleanupJobState {
   /** 请求 id（便于日志关联）。 */
@@ -87,6 +89,50 @@ function writeCleanupJob(stateDir: string, state: CleanupJobState): void {
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
   renameSync(tmp, file)
+}
+
+/**
+ * 只在状态**仍是本次请求且仍在 running** 时才写入。
+ *
+ * ## 为什么需要它（2026-11-02 定版终审 RV-07）
+ *
+ * 上一版是"先读、判断、再写"：
+ *
+ * ```ts
+ * const existing = readCleanupJob(stateDir)
+ * if (!alreadyTerminal) writeCleanupJob(...)   // ← 这两步之间是窗口
+ * ```
+ *
+ * worker 可能恰好在**读之后、写之前**写完 `completed` 与计数 ——
+ * 父进程那次写仍会把终态倒退成 `running` / `recycled=0`。
+ * 终审正是这样复现的：读检查只**缩小**了窗口，没有关闭它。
+ *
+ * 现在用锁内读改写：读与写在同一个临界区里，中间不会有别的进程插进来。
+ *
+ * @param stateDir 安全区目录。
+ * @param requestId 本次请求 id。
+ * @param make 基于当前状态决定要写什么；返回 `null` 表示放弃写入。
+ * @returns 真的写了返回 true。
+ */
+async function writeJobConditionally(
+  stateDir: string,
+  requestId: string,
+  make: (current: CleanupJobState) => CleanupJobState | null,
+): Promise<boolean> {
+  /*
+   * 用现有的索引锁保护这次读改写。
+   *
+   * `index.lock` 已经覆盖同一批索引文件；复用它而不是新造一把锁，
+   * 避免再引入一套需要证明的互斥协议。
+   */
+  return withIndexLock(stateDir, async () => {
+    const current = readCleanupJob(stateDir)
+    if (current === null || current.requestId !== requestId) return false
+    const next = make(current)
+    if (next === null) return false
+    writeCleanupJob(stateDir, next)
+    return true
+  })
 }
 
 /**
@@ -565,26 +611,28 @@ export async function requestCleanup(opts: RequestCleanupOptions): Promise<{ sta
      *
      * 复核用受控调度实测到：最终 running、recycled=0、锁已不存在。
      *
-     * 现在：先读一次，若已是**本次请求**的终态就什么都不写。
+     * ## 只"先读一次"不够（2026-11-02 定版终审 RV-07）
+     *
+     * 上一版是「先读、判断、再写」。worker 可能恰好在**读之后、写之前**
+     * 写完终态 —— 那次写仍会把它倒退。终审确认：读检查只缩小了窗口。
+     *
+     * 现在用 `writeJobConditionally`：读与写在同一个临界区内完成，
+     * 中间不会有别的进程插进来。
      */
-    const existing = readCleanupJob(stateDir)
-    const alreadyTerminal =
-      existing !== null &&
-      existing.requestId === requestId &&
-      (existing.outcome === 'completed' || existing.outcome === 'failed')
-
-    if (!alreadyTerminal) {
-      writeCleanupJob(stateDir, {
+    await writeJobConditionally(stateDir, requestId, (current) => {
+      // 已是本次请求的终态 → 什么都不写。
+      if (current.outcome === 'completed' || current.outcome === 'failed') return null
+      return {
         requestId,
-        pid: child.pid,
-        requestedAt: Date.now(),
-        startedAt: Date.now(),
+        pid: child.pid ?? null,
+        requestedAt: current.requestedAt,
+        startedAt: current.startedAt ?? Date.now(),
         finishedAt: null,
         outcome: 'running',
         recycled: 0,
         skipped: 0,
-      })
-    }
+      }
+    })
   } else {
     /*
      * 没有 pid：spawn 失败了。`error` 事件可能稍后才到，但此刻我们已能
