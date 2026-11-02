@@ -652,8 +652,31 @@ export function SafeZoneSettings(): ReactElement {
     for (const spec of FIELDS) {
       const d = values[`${spec.key}.draft`]
       if (typeof d === 'string') submittedDrafts[spec.key] = d
-      const u = values[`${spec.key}.unit`]
-      if (typeof u === 'string') submittedUnits[spec.key] = u
+      /*
+       * ## 记**有效**单位，不只是显式设置过的（2026-11-02 定版终审 F-02）
+       *
+       * 用户没手动切过单位时，`values[key.unit]` 不存在 —— 界面显示的是
+       * **自然单位**（由底值推导）。上一版只记显式单位，于是隐式 MB 场景
+       * 的 `submittedUnits` 是空的：
+       *
+       * ```
+       * 500MB → 显示 500 MB（自然单位，values 里没有 .unit 键）
+       * 在途改数字为 2048 → 回读底值 1GB
+       * → 单位快照为空，draftKept 分支拿不到对比基准
+       * → 单位被丢弃 → 变成 GB
+       * ```
+       *
+       * 现在记"提交时界面实际显示的单位"：显式值的优先，否则按底值算自然单位。
+       */
+      if (spec.kind === 'bytes') {
+        const explicit = values[`${spec.key}.unit`]
+        const currentBytes = numericOf(values, spec.key, spec.fallback)
+        submittedUnits[spec.key] =
+          explicit === 'MB' || explicit === 'GB' ? explicit : naturalBytesUnit(currentBytes)
+      } else {
+        const u = values[`${spec.key}.unit`]
+        if (typeof u === 'string') submittedUnits[spec.key] = u
+      }
     }
     const nextErrors: Record<string, string> = {}
     const payload: Record<string, unknown> = {}
@@ -816,18 +839,56 @@ export function SafeZoneSettings(): ReactElement {
                 if (key.endsWith('.unit')) {
                   const fieldKey = key.slice(0, -'.unit'.length)
                   const submittedUnit = submittedUnits[fieldKey]
+                  const liveDraft = prev[`${fieldKey}.draft`]
+                  const submittedDraft = submittedDrafts[fieldKey]
                   /*
-                   * ## 单位的判据与数字**独立**（定版复核第 3 项的后半）
+                   * ## 单位必须跟着**新数字草稿**一起保留（2026-11-02 定版终审 F-02）
                    *
-                   * 第一版要求"同字段有仍在编辑的草稿"才保留单位。于是
-                   * "保存期间只切单位、数字不动"时新单位被丢弃，界面显示
-                   * 已保存但实际没生效。
+                   * 上一版只比较"单位是否与提交时不同"，两个反例：
                    *
-                   * 现在：单位与**提交时**不同就保留。
+                   * ```
+                   * 明确选 MB，输入 1024，点保存
+                   *   等待期间把数字改 2048，单位仍是 MB
+                   *   → 数字草稿 2048 被保留（与提交时不同）
+                   *   → 单位与提交时**相同**，于是被丢弃
+                   *   → fallback 按回读底值 1GB 推导 → 界面变成 2048 GB
+                   *   → 第二次保存写入 2 TB（用户本意 2 GB）
+                   * ```
+                   *
+                   * 根因：把"数字"和"单位"当成两个独立判据。它们其实是同一个
+                   * **快照** —— 显示值 = 数字 × 单位，丢掉单位，数字的含义就变了。
+                   *
+                   * 现在：只要该字段的新数字草稿被保留，它绑定的单位就一并保留，
+                   * 无论单位本身是否变化。只有"没有在途新编辑"时才回到服务端
+                   * 自然单位。
                    */
-                  if (typeof value === 'string' && value !== submittedUnit) merged[key] = value
+                  const draftKept =
+                    typeof liveDraft === 'string' && liveDraft !== submittedDraft
+                  const unitChanged = typeof value === 'string' && value !== submittedUnit
+                  if (unitChanged || draftKept) merged[key] = value
                   continue
                 }
+              }
+              /*
+               * ## 隐式单位要**主动补写**（2026-11-02 定版终审 F-02）
+               *
+               * 上面的循环只遍历 `prev` 里**已存在**的键。用户没手动切过单位时
+               * `prev` 没有 `<key>.unit`，于是"保留单位"这个决定无处落地 ——
+               * 界面仍会按回读底值推导，隐式 MB 的场景照样变成 GB。
+               *
+               * 这里对每个 bytes 字段补一次：若它的新数字草稿被保留，
+               * 就把提交时的有效单位显式写进去，把它钉住。
+               */
+              for (const spec of FIELDS) {
+                if (spec.kind !== 'bytes') continue
+                const draftKey = `${spec.key}.draft`
+                const unitKey = `${spec.key}.unit`
+                const liveDraft = prev[draftKey]
+                const submittedDraft = submittedDrafts[spec.key]
+                if (typeof liveDraft !== 'string' || liveDraft === submittedDraft) continue
+                const submittedUnit = submittedUnits[spec.key]
+                if (submittedUnit === undefined) continue
+                merged[unitKey] = submittedUnit
               }
               return merged
             })

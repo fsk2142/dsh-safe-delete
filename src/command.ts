@@ -361,13 +361,56 @@ function isPureAssignment(text: string): boolean {
   if (trimmed === '') return false
 
   /*
-   * TypeScript/JS 的声明或赋值：
-   *   const note = "..."
-   *   let x: string = "..."
-   *   note = "..."
+   * ## 右侧必须是**纯字面量**（2026-11-02 定版终审 F-03A）
+   *
+   * 上一版只要求"形如赋值"，右侧接受任意内容。于是这些被判成无害：
+   *
+   * ```
+   * const result = fs.rmSync("x")      ← 右侧是函数调用，会真的删
+   * result=$(rm -rf /tmp/x)            ← 右侧是命令替换，会被执行
+   * ```
+   *
+   * 终审确认：1.11.2 对两者都是 destructive=true，2.0.0 变成 false ——
+   * 这是我引入的**回归**。
+   *
+   * 现在只放行右侧为字面量的赋值：字符串、数字、布尔、null/undefined。
+   * 任何调用、命令替换、拼接都继续走删除判定。
    */
-  return /^(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:\s*:\s*[^=]+?)?\s*=\s*[\s\S]+$/.test(trimmed) ||
-    /^[A-Za-z_$][\w$]*\s*=\s*[\s\S]+$/.test(trimmed)
+  const assignment =
+    /^(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:\s*:\s*[^=]+?)?\s*=\s*([\s\S]+)$/.exec(trimmed) ??
+    /^[A-Za-z_$][\w$]*\s*=\s*([\s\S]+)$/.exec(trimmed)
+  if (assignment === null) return false
+
+  const rhs = (assignment[1] ?? '').trim()
+  if (rhs === '') return false
+
+  // 允许一个尾分号（`const x = "a";`）。
+  const body = rhs.endsWith(';') ? rhs.slice(0, -1).trim() : rhs
+  if (body === '') return false
+
+  /*
+   * 模板字符串：含 `${…}` 就是插值，可能执行代码 —— 不放行。
+   */
+  if (body.startsWith('`') && body.endsWith('`')) {
+    return body.length >= 2 && !body.includes('${')
+  }
+
+  /*
+   * 单/双引号字符串。
+   *
+   * 要求首尾配对且中间**没有**未转义的同类引号 —— 否则说明它是拼接
+   * 或调用的一部分（如 `"a" + f()`），不能当纯字面量。
+   */
+  const quote = body[0]
+  if (quote === "'" || quote === '"') {
+    if (!body.endsWith(quote) || body.length < 2) return false
+    const inner = body.slice(1, -1)
+    // 内部若有同类引号（非转义），说明外层不是单一字面量。
+    return !new RegExp(`(^|[^\\\\])${quote === "'" ? "'" : '"'}`).test(inner)
+  }
+
+  // 数字 / 布尔 / 空值。
+  return /^(?:-?\d+(?:\.\d+)?|true|false|null|undefined)$/.test(body)
 }
 
 /**
@@ -427,6 +470,32 @@ function mentionsOnly(command: string): boolean {
 
     if (containsDeleteCommand(segment)) return false
     if (tokenize(segment).some((t) => isDeleteArgumentMarker(t))) return false
+  }
+
+  /*
+   * ## 逐段递归判定，覆盖所有已支持的形态（2026-11-02 定版终审 F-03B）
+   *
+   * 上一版只对每段调 `containsDeleteCommand` + 参数级 marker。这覆盖了
+   * `find -delete` 和 `sh -c`，但仍漏了**函数式调用**：
+   *
+   * ```
+   * fs.rmSync("x")                              → true
+   * echo ready; fs.rmSync("x")                  → false   ← 漏
+   * node -e "require('fs').rmSync('x')"          → true
+   * echo ready; node -e "...rmSync('x')"         → false   ← 漏
+   * python -c "import shutil; shutil.rmtree('x')" → true
+   * echo ready; python -c "...rmtree('x')"       → false   ← 漏
+   * ```
+   *
+   * `rmSync` / `rmtree` 不在命令位动词表里，参数 marker 也没有它们 ——
+   * 只有 `parseCommand` 的完整链路（含 `hasCallStyleDelete`）才认。
+   *
+   * 所以这里直接递归 `parseCommand`：段内不含顶层分隔符，递归立即终止。
+   * 与上面两道并存（都返回 false 才算"仅提及"），任一道命中即不是仅提及。
+   */
+  for (const segment of segments.slice(1)) {
+    if (segment.trim() === '') continue
+    if (parseCommand(segment).destructive) return false
   }
 
   // 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与 `echo \`rm -rf /tmp/x\``
@@ -1339,6 +1408,28 @@ export function parseCommand(command: string): CommandVerdict {
     // 一个 token，主循环认不出 `rm`。这类命令在 shell 里**真的会删**，
     // 所以宁可判成删除（目标不可解析 → 交给人看），也不能放行。
     if (containsDeleteCommand(text)) {
+      return { destructive: true, kind: 'delete', recursive: false, target: null }
+    }
+
+    /*
+     * ## 函数式调用也要认（2026-11-02 定版终审 F-03B）
+     *
+     * `containsDeleteCommand` 只看**命令位**的动词。而
+     * `require("fs").rmSync("x")` 里没有命令位动词 —— `tokenize` 把
+     * `require("fs").rmSync` 粘成一个 token，于是这里判成无害。
+     *
+     * 实测（修复前）：
+     *
+     * ```
+     * fs.rmSync("x")                  → true
+     * require("fs").rmSync("x")       → false   ← 漏
+     * ```
+     *
+     * 两者会被真的执行，判据不该因为前面多了个 `require(...)` 就变。
+     * 用与 `isPlainlyHarmless` 相同的 `hasCallStyleDelete`，
+     * 且同样先抹掉字符串字面量再匹配。
+     */
+    if (hasCallStyleDelete(blankQuotedContent(text))) {
       return { destructive: true, kind: 'delete', recursive: false, target: null }
     }
 

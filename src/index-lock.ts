@@ -33,7 +33,7 @@
  * @module dsh-safe-delete/index-lock
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 锁文件名。 */
@@ -102,9 +102,10 @@ function readHolder(stateDir: string): LockHolder | null {
  *
  * @param stateDir 安全区目录。
  * @param token 本次的 owner token。
+ * @param onStale 检测到"过期但持有者已死"时收到原因说明（本轮**不接管**）。
  * @returns 拿到返回 true。
  */
-function tryOnce(stateDir: string, token: string): boolean {
+function tryOnce(stateDir: string, token: string, onStale?: (reason: string) => void): boolean {
   // 目录不存在时先建出来：锁文件本身也需要它。
   try {
     mkdirSync(stateDir, { recursive: true })
@@ -143,94 +144,49 @@ function tryOnce(stateDir: string, token: string): boolean {
   const alive = isAlive(holder.pid)
   if (age > STALE_MS && !alive) {
     /*
-     * ## 接管陈旧锁必须是一个原子步骤（2026-10-30 复审 SD-L1）
+     * ## 不再自动接管陈旧锁（2026-11-02 定版终审 F-01）
      *
-     * 第一版是 `rmSync(file)` 然后 `writeFileSync(wx)`。两个接管者会这样交错：
+     * ## 为什么撤销
+     *
+     * 上一轮我在 `cleanup.ts` 里已经废除了这套协议，但**漏了这个文件**——
+     * 终审明确指出两者逐字节同形，并重放出丢更新：
      *
      * ```
-     * A: 读到旧锁，判定可接管
-     * B: 读到旧锁，判定可接管
-     * A: rmSync(旧锁) → write(wx) 成功，A 开始写索引
-     * B: rmSync(锁路径) —— 此时删掉的是 A 刚建的新锁！
-     * B: write(wx) 成功，B 也开始写索引
-     * → A、B 都认为自己持锁，互斥失效
+     * B: 读到陈旧锁，判定可接管
+     * A: 接管成功，建活锁，开始写索引
+     * B: rename(file, tombstoneB)   ← 搬走的是 A 的活锁
+     * B: token 不符 → 退出，但锁路径已经空了
+     * C: write(wx) 成功 → C 也进入工作体
+     * → A 从未被停止；A 与 C 同时写索引
      * ```
      *
-     * ## 改法：用 rename 抢，而不是删除后重建
+     * 终审用两个真实 `withIndexLock` 工作体验证：`overlap=true`，
+     * C 先写 [C]、A 后写 [A]，最终只剩 [A] —— **C 的更新丢失**。
      *
-     * `renameSync(lock, uniqueName)` 是原子的：只有一个进程能把那个文件
-     * 改名成功，另一个会拿到 ENOENT（文件已不在原名）。谁改名成功，谁就是
-     * 唯一合法的接管者，随后它建新锁。
+     * 事后比对 token 只能让 B 退出，不能让 A 恢复所有权。`renameSync`
+     * 不校验 inode，"原子 rename"保证的是"只有一个能改名"，
+     * 不是"只有一个能写索引"。
      *
-     * 抢到的人保留那个改名后的文件直到结束时删掉 —— 它只是"我已接管"的凭证。
+     * 彻底修复需要 OS 级锁句柄（`fcntl` / `LockFileEx`），与本插件的
+     * 零运行时依赖冲突。
+     *
+     * ## 现在的行为
+     *
+     * 检测到"过期 + 持有者已死"时**不接管**，返回失败并交出一个可操作的
+     * 说明（通过 `onStale` 回调）。调用方重试或报错，不会写索引。
+     *
+     * 取舍明确：可能停摆到人工删锁，但索引不会被两个进程同时写坏。
+     * **宁可停下，也不能丢数据。**
      */
-    const tombstone = `${file}.stale-${process.pid}-${Date.now().toString(36)}`
-    try {
-      renameSync(file, tombstone)
-    } catch {
-      // 文件已不在原名（别人抢先接管了），本轮放弃。
-      return false
-    }
-    /*
-     * 抢到了。但还要确认一件事：我们改名拿走的那个锁，**真的是我们判定过的
-     * 那把陈旧锁吗**？极端情况下，判读到建新锁之间它可能已被别人刷新。
-     * 用改名后的文件再核一次 token。
-     */
-    let taken = ''
-    try {
-      taken = readFileSync(tombstone, 'utf8')
-    } catch {
-      /* 读不到就当它已失效，继续 */
-    }
-    try {
-      const parsed = JSON.parse(taken) as { token?: string }
-      if (parsed.token !== holder.token) {
-        /*
-         * ## 拿到的不是我们判定过的那把锁 —— **不要放回去**
-         * （2026-10-30 复审 SD-N04）
-         *
-         * 第一版在这里 `renameSync(tombstone, file)` 把它放回原位。
-         * 两个问题：
-         *
-         * 1. 放回是**又一次 rename**，期间锁路径短暂不存在。第三方可以趁
-         *    这个间隙 `wx` 拿到锁 —— 于是又出现两个 writer。这恰好是
-         *    我们想消除的那类窗口，却在"防御性回滚"里重新引入了一个。
-         * 2. 我们并不知道那把锁现在的语义：它可能是别人刚建的、正在使用的。
-         *    由我们把它搬来搬去，是在替别人做决定。
-         *
-         * 现在**放弃**，让那把锁留在 tombstone 里。持有者会发现自己的锁
-         * 不见了 —— 那是"锁被别人动过"的明确信号，比"锁还在但内容被换过"
-         * 更容易诊断。
-         *
-         * 本轮返回 false，调用方重试或报错，不会写索引。
-         *
-         * ## 仍然存在的窗口（如实标注）
-         *
-         * `renameSync(file, tombstone)` 本身不校验 inode，所以理论上仍可能
-         * 搬走别人刚建的新锁。要彻底消除需要 OS 级锁句柄
-         * （`fcntl` / `LockFileEx`），而本插件零运行时依赖。
-         *
-         * 与此前相比的改进：**不再有一次额外的、可被利用的 rename**。
-         */
-        return false
-      }
-    } catch {
-      /* 内容读不出 JSON：它本来就是坏的，继续接管 */
-    }
-
-    try {
-      writeFileSync(file, payload, { flag: 'wx' })
-      rmSync(tombstone, { force: true })
-      return true
-    } catch {
-      // 新锁建不出来（别人抢先了）：让出，并把凭证清掉。
-      try {
-        rmSync(tombstone, { force: true })
-      } catch {
-        /* 无所谓 */
-      }
-      return false
-    }
+    onStale?.(
+      `the index lock is held by a process that is no longer running ` +
+        `(pid ${String(holder.pid)}, ${Math.round(age / 1000)}s old). ` +
+        'Automatic takeover is disabled because it cannot be proven safe: ' +
+        'a taker can move a live lock away, leaving the path empty for a third process, ' +
+        'and index updates are then lost. ' +
+        `To clear it, make sure no DSH process is running, then delete ${file} and retry.`,
+    )
+    return false
   }
   return false
 }
@@ -268,14 +224,27 @@ export async function withIndexLock<T>(stateDir: string, job: () => Promise<T>):
   const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   const deadline = Date.now() + ACQUIRE_TIMEOUT_MS
 
+  /*
+   * 记录"陈旧但无法安全接管"的原因（2026-11-02 定版终审 F-01）。
+   *
+   * 这类失败与"别人正在写索引"性质完全不同：前者需要人工删锁，
+   * 后者等一会儿就好。混成一句话会让用户一直重试一个永远不会自愈的状态。
+   */
+  let staleReason: string | undefined
+
   for (;;) {
-    if (tryOnce(stateDir, token)) break
+    if (tryOnce(stateDir, token, (reason) => {
+      staleReason = reason
+    })) {
+      break
+    }
     if (Date.now() >= deadline) {
       const holder = readHolder(stateDir)
       throw new Error(
-        `cannot acquire the index lock under ${stateDir} after ${ACQUIRE_TIMEOUT_MS} ms` +
-          (holder === null ? '' : `; held by pid ${holder.pid}`) +
-          '. Another process is writing the index. Retry shortly — nothing was changed.',
+        staleReason ??
+          `cannot acquire the index lock under ${stateDir} after ${ACQUIRE_TIMEOUT_MS} ms` +
+            (holder === null ? '' : `; held by pid ${holder.pid}`) +
+            '. Another process is writing the index. Retry shortly — nothing was changed.',
       )
     }
     await new Promise((r) => setTimeout(r, RETRY_MS))

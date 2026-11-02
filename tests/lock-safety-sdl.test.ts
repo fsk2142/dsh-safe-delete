@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { indexLockHolder, withIndexLock } from '../src/index-lock'
@@ -7,25 +7,40 @@ import { bindWorkerPid, cleanupLockHolder, tryAcquireLock } from '../src/cleanup
 import { scratchDir } from './support/tmpdir'
 
 /**
- * SD-L1：陈旧 `index.lock` 的接管必须是单一原子步骤。
+ * F-01（2026-11-02 定版终审，P1）：索引锁**停止**自动接管陈旧锁。
  *
- * ## 缺陷（2026-10-30 复审）
+ * ## 缺陷
  *
- * 第一版是 `rmSync(file)` → `writeFileSync(wx)`。两个接管者会这样交错：
+ * 上一轮我在 `cleanup.ts` 里废除了这套接管协议，但**漏了 `index-lock.ts`**
+ * ——两者逐字节同形。终审重放出丢失更新：
  *
  * ```
- * A: 读到旧锁，判定可接管
- * B: 读到旧锁，判定可接管
- * A: rmSync(旧锁) → write(wx) 成功，A 开始写索引
- * B: rmSync(锁路径) —— 删掉的是 A 刚建的新锁！
- * B: write(wx) 成功，B 也开始写索引
- * → 互斥失效
+ * B: 读到陈旧锁，判定可接管
+ * A: 接管成功，建活锁，开始写索引
+ * B: rename(file, tombstoneB)   ← 搬走的是 A 的活锁
+ * B: token 不符 → 退出，但锁路径已经空了
+ * C: write(wx) 成功 → C 也进入工作体
+ * → A 从未被停止；A 与 C 同时写索引
  * ```
  *
- * 改法：用 `renameSync(lock, unique)` 抢占 —— 改名是原子的，只有一个进程能
- * 成功，另一个拿到 ENOENT。
+ * 终审用两个真实 `withIndexLock` 工作体验证：`overlap=true`，
+ * C 先写 [C]、A 后写 [A]，最终只剩 [A] —— **C 的更新丢失**。
+ *
+ * `renameSync` 不校验 inode，"原子 rename"保证的是"只有一个能改名"，
+ * 不是"只有一个能写索引"。事后比对 token 只能让 B 退出，
+ * 不能让 A 恢复所有权。
+ *
+ * ## 现在的契约
+ *
+ * | 情况 | 行为 |
+ * |---|---|
+ * | 无锁 | 建锁成功 |
+ * | 活锁（持有者活着） | 等待，超时后明确失败 |
+ * | 陈旧锁（过期 + 持有者已死） | **失败**，给出原因与人工恢复办法 |
+ *
+ * 取舍：可能停摆到人工删锁，但索引不会被两个进程同时写坏。
  */
-describe('SD-L1: stale index-lock takeover is atomic', () => {
+describe('F-01: the index lock does not take over stale locks', () => {
   /**
    * 写一把陈旧的锁（持有者是死 pid，时间戳很旧）。
    *
@@ -36,168 +51,147 @@ describe('SD-L1: stale index-lock takeover is atomic', () => {
     mkdirSync(state, { recursive: true })
     writeFileSync(
       join(state, 'index.lock'),
-      JSON.stringify({ pid: 999_999_999, at: Date.now() - 10 * 60 * 1000, token }),
+      JSON.stringify({ pid: 999_999_999, at: Date.now() - 60 * 60 * 1000, token }),
     )
   }
 
-  it('takes over a stale lock whose holder is dead', async () => {
-    // 基本能力：陈旧锁确实能被接管。
-    const state = scratchDir('dsd-sdl1-takeover-')
+  it('refuses a stale lock instead of taking it over', async () => {
+    /*
+     * 核心变更：陈旧锁不再被接管，`withIndexLock` 必须**失败**。
+     */
+    const state = scratchDir('dsd-f01-stale-')
     writeStaleLock(state, 'dead-holder')
 
-    const r = await withIndexLock(state, async () => 'ok')
-    expect(r).toBe('ok')
-  })
+    let jobRan = false
+    await expect(
+      withIndexLock(state, async () => {
+        jobRan = true
+        return 'done'
+      }),
+      '陈旧锁不该被接管，任务不该执行',
+    ).rejects.toThrow()
 
-  it('does not leave the stale tombstone file behind', async () => {
+    expect(jobRan, '拒绝时绝不能执行任务').toBe(false)
+  }, 60_000)
+
+  it('explains why and how to recover', async () => {
     /*
-     * 接管用 rename 做，会留下一个 `.stale-*` 凭证文件。
-     * 成功后必须清掉，否则 `stateDir` 会慢慢堆满垃圾。
+     * 失败信息必须能指导操作 —— 否则用户面对一个永远失败、
+     * 却不知道怎么办的状态。
      */
-    const state = scratchDir('dsd-sdl1-clean-')
+    const state = scratchDir('dsd-f01-msg-')
     writeStaleLock(state, 'dead-holder')
 
-    await withIndexLock(state, async () => 'ok')
+    let message = ''
+    try {
+      await withIndexLock(state, async () => 'x')
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
 
-    const { readdirSync } = await import('node:fs')
-    const junk = readdirSync(state).filter((n) => n.includes('.stale-'))
-    expect(junk, '不该留下 stale 凭证文件').toHaveLength(0)
-  })
+    expect(message, '应说明持有者已不在').toMatch(/no longer running/)
+    expect(message, '应说明为什么不接管').toMatch(/cannot be proven safe/)
+    expect(message, '应给出删锁的恢复办法').toMatch(/delete .*index\.lock/)
+  }, 60_000)
 
-  it('refuses takeover when the lock changed between reading and renaming', async () => {
+  it('leaves the lock file byte-identical when refusing', async () => {
     /*
-     * 核心竞态防护：我们判读的是锁 X，但改名拿到的可能是锁 Y。
+     * **关键不变量**：拒绝时不能把锁搬走、删除或改写。
      *
-     * 实现会在改名后再核一次 token；不一致就放回去并放弃。
-     *
-     * 这条用**单进程**模拟：先写陈旧锁，让接手者读到它；但在 `renameSync`
-     * 之前把锁换成新的（不同 token）。实现必须发现不一致、拒绝接管。
-     *
-     * 注入点：用一个已存在的 tombstone 名字无关 —— 这里改用更直接的方式：
-     * 直接断言"读到的 token 与最终持有者一致"这个不变量。
+     * 旧实现的缺陷正是"搬走 A 的活锁后留下空路径"，第三者能趁机进入。
+     * 锁原样保留意味着没有这个窗口。
      */
-    const state = scratchDir('dsd-sdl1-changed-')
-    writeStaleLock(state, 'old-token')
+    const state = scratchDir('dsd-f01-keep-')
+    writeStaleLock(state, 'dead-holder')
+    const before = readFileSync(join(state, 'index.lock'), 'utf8')
 
-    // 抢在接管前刷新锁（不同 token、活的 pid、新时间戳）。
-    writeFileSync(
-      join(state, 'index.lock'),
-      JSON.stringify({ pid: process.pid, at: Date.now(), token: 'fresh-token' }),
-    )
+    await expect(withIndexLock(state, async () => 'x')).rejects.toThrow()
 
+    expect(existsSync(join(state, 'index.lock')), '锁文件必须保留').toBe(true)
+    expect(readFileSync(join(state, 'index.lock'), 'utf8'), '锁内容不能变').toBe(before)
+    // 不能留下 tombstone 之类残留。
+    const leftovers = readdirSync(state).filter((n) => n.includes('.stale-'))
+    expect(leftovers, '不该留下 tombstone').toHaveLength(0)
+  }, 60_000)
+
+  it('does not move the lock anywhere (no rename-based takeover at all)', () => {
     /*
-     * 此时锁是新鲜的且持有者活着 → 不该接管。
-     * 若实现只看第一版读到的陈旧数据，它会错误地抢走。
+     * 结构性：源码里不该再有"把锁 rename 到 tombstone"的接管方案。
+     *
+     * 这不是形状洁癖 —— 那段代码本身就是被证明不成立的协议，
+     * 留着它就会有下一个反例。
      */
-    let acquired = false
-    const p = withIndexLock(state, async () => {
-      acquired = true
-      return 'ok'
-    })
-
-    await new Promise((r) => setTimeout(r, 120))
-    expect(acquired, '新鲜且持有者活着的锁不能被抢').toBe(false)
-
-    // 让测试收尾：把锁挪走，等它接上。
-    const { rmSync } = await import('node:fs')
-    rmSync(join(state, 'index.lock'), { force: true })
-    await expect(p).resolves.toBe('ok')
-  })
-
-  it('only one of two concurrent processes can take over', async () => {
-    /*
-     * 并发接管：两个 `withIndexLock` 同时面对一把陈旧锁。
-     *
-     * 由于进程内队列先排队，这里实际测的是"两个都尝试接管时不会互相
-     * 破坏"—— 至少不能出现"两个都认为自己持锁"的状态。
-     *
-     * 真正的多进程验证需要另起子进程，见 `tests/` 其他集成测试；
-     * 这里守住单进程下的不变量：任意时刻锁文件只有一个合法持有者。
-     */
-    const state = scratchDir('dsd-sdl1-two-')
-    writeStaleLock(state, 'dead')
-
-    const results = await Promise.all([
-      withIndexLock(state, async () => 'a'),
-      withIndexLock(state, async () => 'b'),
-    ])
-
-    expect(results.sort()).toEqual(['a', 'b'])
-    // 两段临界区都跑完且不残留锁。
-    expect(existsSync(join(state, 'index.lock')), '结束后不该残留锁').toBe(false)
-  })
-
-  it('takes over by renaming, not by delete-then-recreate (source-level check)', async () => {
-    /*
-     * ## 为什么这里是结构性检查而不是行为测试
-     *
-     * SD-L1 的缺陷是**跨进程**竞态：A 删掉旧锁、建新锁，B 删掉的却是 A
-     * 刚建的那把。单进程里 `indexQueue` 会把两次接管串行化，交错**不会发生**。
-     *
-     * 我试过写行为测试 —— 把实现改回 `rmSync + write(wx)`，那些测试**仍然全绿**。
-     * 也就是说它们根本没有覆盖这个属性。
-     *
-     * 真正的跨进程验证要另起子进程同步两个接管者，成本远高于收益。所以退一步
-     * 用结构性断言：接管路径必须用 `renameSync` 抢占（原子），不得用
-     * "`rmSync` 之后重建"。
-     *
-     * 这是**降级的保证**，但比"没人记得这条路径存在"好得多，而且删掉 rename
-     * 会立刻变红 —— 已验证。
-     */
-    const { readFileSync } = await import('node:fs')
     const src = readFileSync('src/index-lock.ts', 'utf8')
-
-    const at = src.indexOf('const tombstone =')
-    expect(at, '接管路径应使用 tombstone(rename) 方案').toBeGreaterThan(0)
-
-    // 从 tombstone 定义到函数结束的这一段里，必须出现 renameSync。
-    const tail = src.slice(at, at + 2500)
-    expect(tail, '接管必须用 renameSync 抢占').toMatch(/renameSync\(file, tombstone\)/)
-
-    /*
-     * 不允许"删掉锁再重建"的模式出现在接管路径里。
-     *
-     * 具体形态：rmSync(file) 紧跟 writeFileSync(file, …, {flag:'wx'})。
-     */
-    expect(tail, '不许用 rmSync(file) 做接管').not.toMatch(/rmSync\(file[^)]*\)[\s\S]{0,80}writeFileSync\(file/)
-  })
-
-  it('abandons a mismatched lock instead of renaming it back (SD-N04)', async () => {
-    /*
-     * SD-N04：接管时若发现拿到的锁 token 不符，第一版会把它 `renameSync`
-     * **放回去**。放回是又一次 rename —— 期间锁路径短暂不存在，
-     * 第三方可趁这个间隙拿锁。
-     *
-     * 现在直接放弃，让那把锁留在 tombstone 里。
-     *
-     * 同样是结构性检查（跨进程窗口无法在单进程里稳定命中）。
-     */
-    const { readFileSync } = await import('node:fs')
-    const src = readFileSync('src/index-lock.ts', 'utf8')
-
-    const at = src.indexOf('parsed.token !== holder.token')
-    expect(at, '应能找到 token 不符的分支').toBeGreaterThan(0)
-
-    /*
-     * 只看**代码行**，跳过注释 —— 注释里会引用旧写法作为反例。
-     */
-    const branch = src.slice(at, at + 1600)
-    const codeOnly = branch
+    const codeOnly = src
       .split('\n')
-      .filter((l) => !/^\s*(\*|\/\/)/.test(l))
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
       .join('\n')
 
-    expect(codeOnly, 'token 不符时不许把锁 rename 回去').not.toMatch(/renameSync\(tombstone, file\)/)
-    // 该分支必须以 return false 放弃。
-    expect(codeOnly, '应放弃而非重试').toMatch(/return false/)
+    expect(codeOnly, '不该再把索引锁 rename 走').not.toMatch(/renameSync\(file/)
+    expect(codeOnly, '不该有 tombstone 接管').not.toMatch(/const tombstone =/)
+  })
+
+  it('still works normally when the lock is free', async () => {
+    /*
+     * 回归保护：改动不能把正常加锁/释放也一起废掉。
+     */
+    const state = scratchDir('dsd-f01-ok-')
+    mkdirSync(state, { recursive: true })
+
+    const result = await withIndexLock(state, async () => 'job-result')
+
+    expect(result, '正常路径应返回任务结果').toBe('job-result')
+    expect(existsSync(join(state, 'index.lock')), '任务结束后锁应释放').toBe(false)
+  })
+
+  it('releases the lock even when the job throws', async () => {
+    // 失败路径也必须释放锁。
+    const state = scratchDir('dsd-f01-throw-')
+    mkdirSync(state, { recursive: true })
+
+    await expect(
+      withIndexLock(state, async () => {
+        throw new Error('boom')
+      }),
+    ).rejects.toThrow('boom')
+
+    expect(existsSync(join(state, 'index.lock')), '抛错后锁也必须释放').toBe(false)
+  })
+
+  it('serialises two concurrent jobs in one process', async () => {
+    /*
+     * 基本互斥仍然成立：同一进程内两个任务不能重叠。
+     *
+     * 注意这**不是**跨进程竞态的证明 —— 那需要 OS 级锁句柄。
+     * 这里只确认改动没有破坏正常的串行化。
+     */
+    const state = scratchDir('dsd-f01-serial-')
+    mkdirSync(state, { recursive: true })
+
+    let active = 0
+    let maxActive = 0
+    const run = (): Promise<void> =>
+      withIndexLock(state, async () => {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((r) => setTimeout(r, 20))
+        active -= 1
+      })
+
+    await Promise.all([run(), run(), run()])
+
+    expect(maxActive, '同一时刻最多一个任务').toBe(1)
   })
 
   it('reports the holder so a stuck lock can be diagnosed', () => {
-    const state = scratchDir('dsd-sdl1-diag-')
+    // 诊断可见性：能查到持有者与判活结果。
+    const state = scratchDir('dsd-f01-diag-')
     writeStaleLock(state, 'dead')
+
     const h = indexLockHolder(state)
+    expect(h, '应能读到持有者').not.toBeNull()
     expect(h?.alive, '死持有者应报 alive=false').toBe(false)
-    expect(h?.ageMs).toBeGreaterThan(0)
+    expect(h?.ageMs, '应报告锁龄').toBeGreaterThan(0)
   })
 })
 
@@ -244,10 +238,9 @@ describe('SD-L2: bindWorkerPid failure is respected', () => {
      */
     const state = scratchDir('dsd-sdl2-untouched-')
     expect(tryAcquireLock(state, 60_000, 'owner')).toBe(true)
+
     const before = readFileSync(join(state, 'cleanup.lock'), 'utf8')
-
-    bindWorkerPid(state, 'wrong')
-
-    expect(readFileSync(join(state, 'cleanup.lock'), 'utf8'), '失败时锁不该被改').toBe(before)
+    expect(bindWorkerPid(state, 'wrong'), '错误 token 绑定应失败').toBe(false)
+    expect(readFileSync(join(state, 'cleanup.lock'), 'utf8'), '锁内容不能变').toBe(before)
   })
 })
