@@ -28,14 +28,36 @@ describe('M4: deletes inside interpreter one-liners are visible', () => {
     })
   }
 
-  // 只跑脚本文件时不拦截：内容静态看不到，交给运行时的其它层。
-  const allowed = ['python script.py', 'node app.js', 'perl build.pl', 'python -m pytest']
 
-  for (const command of allowed) {
-    it(`allows ${JSON.stringify(command)}`, () => {
-      expect(parseCommand(command).destructive).toBe(false)
+  /*
+   * ## 行为变更（2026-11-02 架构调整）：执行脚本文件现在要求审批
+   *
+   * 原来注释写的是"只跑脚本文件时不拦截：内容静态看不到，交给运行时的其它层"。
+   *
+   * 新架构的判断相反：**看不到就问**。理由：
+   *
+   * - `script.py` 里可以是 `shutil.rmtree('/')`，静态层面看不出来；
+   * - 把它放行意味着"本插件的保护可以被一个外部文件绕过"；
+   * - 而"交给运行时的其它层"是假设，不是保证。
+   *
+   * 实测过替代方案（读脚本内容再判）：本仓库三个 scripts/*.mjs **全部**
+   * 被判 destructive（正文提到删除字样就命中），需要专门调优，
+   * 属于独立特性的工作量。
+   *
+   * 所以选择保守。代价：`node scripts/build.mjs` 这类日常命令弹一次卡。
+   */
+  const requiresApproval = ['python script.py', 'node app.js', 'perl build.pl']
+
+  for (const command of requiresApproval) {
+    it(`requires approval for ${JSON.stringify(command)} (content not visible)`, () => {
+      expect(parseCommand(command).destructive).toBe(true)
     })
   }
+
+  it('still allows python -m with a known read-only module', () => {
+    // 模块名不是文件，已知只读模块可以放行。
+    expect(parseCommand('python -m pytest').destructive).toBe(false)
+  })
 })
 
 /**

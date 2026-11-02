@@ -92,11 +92,27 @@ describe('interception must not block ordinary work', () => {
       '# rm -rf the old build',
       'const cfg = { delete: true }',
       'delete obj.key',
-      'obj.delete("key")',
       'console.log("call unlink to clean up")',
     ]) {
       expect(parseCommand(command).destructive, command).toBe(false)
     }
+  })
+
+  it('requires approval for a bare obj.delete() because obj is not identifiable', () => {
+    /*
+     * ## 行为变更（2026-11-02 架构调整）
+     *
+     * `obj.delete("key")` 原来在这条测试里被列为"不会删文件"。
+     *
+     * 但 `obj` 是**任意标识符**：它可能是 `new Map()`，也可能是
+     * `const obj = require("fs")` 之后的包装。静态看不出是哪种 ——
+     * 按"无法证明就问"的原则，它属于 unverifiable。
+     *
+     * 对比：`m.delete("key")` / `cache.delete(key)` 这类**已知容器名**
+     * 会被 `isContainerDeleteOnly` 放行（见 `tests/command-double-quote.test.ts`
+     * 与容器相关用例）。
+     */
+    expect(parseCommand('obj.delete("key")').destructive, 'obj 身份不可识别').toBe(true)
   })
 
   it('does not mistake listing commands for deleting', () => {

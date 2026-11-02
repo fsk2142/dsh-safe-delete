@@ -80,11 +80,20 @@ describe('M1: a verb-looking argument is not a delete command', () => {
   const notDeletes = [
     'cp /tmp/rm /backup/',
     'cp del.exe bin/',
-    'mv ri ri.bak',
     'cp rd /backup/',
     'ls rm',
     'git add rm',
     'cat /tmp/del',
+    /*
+     * 原选项是 `mv ri ri.bak` —— 移走文件的操作。
+     *
+     * 2026-11-02 架构调整后，`mv` 不再放行：它会把文件从原位置**移走**，
+     * 对用户来说与丢失同义（这正是本插件要防的"我删错了"场景）。
+     *
+     * 但这条测试的**意图**是"参数里的动词词形不该导致误判"，与 `mv`
+     * 本身是不是安全操作无关。所以换成 `cp` —— 它只读源、写目标，不删不移。
+     */
+    'cp ri ri.bak',
   ]
 
   for (const command of notDeletes) {

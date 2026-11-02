@@ -136,7 +136,11 @@ function unwrapExecutedCommand(command: string): string | null {
   // 与标志后无空格（`python -c'...'`）—— 三者都是合法 shell 写法，朴素匹配会漏。
   // `python.exe -c` 在 Windows 上尤其自然，与 `isDeleteVerb` 忽略 `.exe` 的做法一致。
   const interpreter =
-    /^(?:[^\s]*[\\/])?(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)(?:\.(?:exe|com|bat|cmd))?\s*(?:-c|-e|-E|-r)\s*([\s\S]+)$/i.exec(trimmed)
+    /*
+     * `-p` / `--print` 是只读求值：`node -p 'process.version'` 打印表达式结果，
+     * 与 `-e` 的区别只是"求值并打印"。要能解包才能看到里面有没有删除。
+     */
+    /^(?:[^\s]*[\\/])?(?:python[0-9.]*|node|nodejs|perl|ruby|php|lua)(?:\.(?:exe|com|bat|cmd))?\s*(?:-c|-e|-E|-r|-p|--print)\s*([\s\S]+)$/i.exec(trimmed)
   if (interpreter !== null) {
     return stripOuterQuotes(interpreter[1]!.trim())
   }
@@ -495,170 +499,78 @@ function isPureAssignment(text: string): boolean {
     return true
   }
 
+  /*
+   * `new X()` 纯构造：`const m = new Map()`、`const s = new Set()` ——
+   * 创建内存对象，不碰文件系统。
+   *
+   * 第六轮复审测过 `node -e 'const m=new Map(); m.delete("k")'` 被误判：
+   * 前半段是构造、后半段是容器操作，两段都不该拦。
+   *
+   * 刻意只认**无可执行参数**的构造（`new Map()` / `new Set()` /
+   * `new Map([])` 这类）。带调用的构造（`new Worker(script)`）可能触发
+   * 副作用，不放行。
+   */
+  if (/^new\s+[A-Z][\w$]*\s*\(\s*(\[[^\]]*\]|\{[^{}]*\})?\s*\)$/.test(body)) return true
+
+  /*
+   * 对象 / 数组字面量：`const cfg = { delete: true }`。
+   *
+   * 这里的 `delete` 是**对象键**，不是方法调用 —— 第六轮复审测过它被误判。
+   * 只认单层字面量：嵌套太深时可能是构造参数或调用，不放行。
+   */
+  if (/^\[[\s\S]*\]$/.test(body)) return true
+  if (/^\{[^{}]*\}$/.test(body)) return true
+
   // 数字 / 布尔 / 空值。
   return /^(?:-?\d+(?:\.\d+)?|true|false|null|undefined)$/.test(body)
 }
 
 /**
- * 判断这条命令是否只是"提到"删除，而不会真的执行。
+ * 判断这条命令是否**可以证明**不会删除任何东西。
  *
- * 判定：主命令是**纯输出/检索类**（echo / grep / console.log …），且删除字样
- * 只作为它的参数出现。例如 `echo "rm -rf /tmp"`、`grep -rn "rm -rf" docs/`。
+ * ## 为什么判定方向反过来了（2026-11-02 架构调整）
  *
- * 为什么用白名单而不是黑名单：把"主命令不是删除动词"当成条件太宽 ——
- * `find /tmp -delete`、`file.Delete()`、`powershell -EncodedCommand …` 的主命令
- * 都不是删除动词，但它们会真的删东西。只有明确"只读/只打印"的命令才可豁免。
+ * 前五轮的做法是"找删除证据"：识别到就拦，找不到就放行。
+ * 每轮复审都能找出一种没识别到的写法，而写法是无穷的 ——
+ * 实测 10 个等价写法里漏了 4 个，且能无限造新的。
+ *
+ * 根因不在某条规则，在**默认值**：`return { destructive: false }` 把
+ * "没找到证据"当成了"证明无害"。
+ *
+ * 现在：每一段都必须**正向证明**只读（`provenHarmless`），否则不算
+ * "仅提及"。未知写法的默认归宿从"放行"变成"要求审批"。
+ *
+ * ## 与旧版的差别
+ *
+ * 旧版 `segments.slice(1)` —— **跳过第一段**，只检查后续段。
+ * 于是第一段里的命令替换、或者整条就是一个替换时，检查不到。
+ * 现在每一段都要证明，包括第一段。
+ *
+ * @param command 命令原文。
+ * @returns 能证明无害返回 true（调用方据此放行）。
  */
 function mentionsOnly(command: string): boolean {
   const stripped = stripComments(command)
 
-  /**
-   * 按 shell 的命令分隔符切段。
+  /*
+   * 按 shell 分隔符切段（引号感知）。
    *
-   * 为什么必须切：`echo hi; rm -rf /tmp/x` 里第一段只是打印，第二段是**真删除**。
-   * 只看整条的第一个词，就会把这类命令整体豁免 —— 而 `;`、`&&`、换行、管道
-   * 都是最常见的串联方式，等于给了一条不需要任何技巧的绕过通道。
+   * `echo hi; rm -rf /tmp/x` 的第二段是真删除 —— 必须逐段判。
    */
   const segments = splitOutsideQuotes(stripped)
-
   if (segments.length === 0) return false
 
-  // 除第一段外，任何一段自己就是删除命令，就不算"仅提及"。
-  for (const segment of segments.slice(1)) {
-    /*
-     * ## 复用**完整**检测，不用缩水的 marker 表（2026-11-01 定版复核第 6 项）
-     *
-     * 前两版这里是手写的一串简化判断（段首动词 + 参数级 marker）。
-     * 每补一种形态就要加一条，而 `containsDeleteCommand` 早就有完整逻辑
-     * （命令位判定、包装器解包、`DELETES_VIA_ARGUMENT`）。
-     *
-     * 结果是"已经支持的删除"加了只读前缀就失效：
-     *
-     * ```
-     * sh -c "rm -rf /tmp/x"                         → true
-     * echo ready; sh -c "rm -rf /tmp/x"             → false   ← 漏
-     * sudo rm -rf /tmp/x                            → true
-     * echo ready; sudo rm -rf /tmp/x                → false   ← 漏
-     * node -e "require('fs').unlinkSync('x')"       → true
-     * echo ready; node -e "...unlinkSync('x')"      → false   ← 漏
-     * ```
-     *
-     * 现在直接对每一段调用同一套检测 —— 判据不再有两条路径，也就不会漂移。
-     *
-     * ## 但完整检测本身也不覆盖"参数级"删除（实测）
-     *
-     * `containsDeleteCommand` 只看**命令位**的动词。`find /tmp/x -delete`
-     * 与 `rsync --delete` 的动词在参数里，它不认。
-     *
-     * 所以这里两道都要：完整检测（管包装器、命令位）+ 参数级 marker
-     * （管 `-delete` / `--delete` / `.Delete()`）。缺任何一道都会漏。
-     */
-
-    if (containsDeleteCommand(segment)) return false
-    if (tokenize(segment).some((t) => isDeleteArgumentMarker(t))) return false
-  }
-
   /*
-   * ## 逐段递归判定，覆盖所有已支持的形态（2026-11-02 定版终审 F-03B）
+   * 每一段都要能证明无害。
    *
-   * 上一版只对每段调 `containsDeleteCommand` + 参数级 marker。这覆盖了
-   * `find -delete` 和 `sh -c`，但仍漏了**函数式调用**：
-   *
-   * ```
-   * fs.rmSync("x")                              → true
-   * echo ready; fs.rmSync("x")                  → false   ← 漏
-   * node -e "require('fs').rmSync('x')"          → true
-   * echo ready; node -e "...rmSync('x')"         → false   ← 漏
-   * python -c "import shutil; shutil.rmtree('x')" → true
-   * echo ready; python -c "...rmtree('x')"       → false   ← 漏
-   * ```
-   *
-   * `rmSync` / `rmtree` 不在命令位动词表里，参数 marker 也没有它们 ——
-   * 只有 `parseCommand` 的完整链路（含 `hasCallStyleDelete`）才认。
-   *
-   * 所以这里直接递归 `parseCommand`：段内不含顶层分隔符，递归立即终止。
-   * 与上面两道并存（都返回 false 才算"仅提及"），任一道命中即不是仅提及。
+   * 旧版跳过第一段，理由是"第一段是主命令"。但第一段也可能含命令替换
+   * （`"$(rm -rf x)"` 整条就是一段），跳过它等于不检查。
    */
-  for (const segment of segments.slice(1)) {
-    if (segment.trim() === '') continue
-    if (parseCommand(segment).destructive) return false
+  for (const segment of segments) {
+    if (!provenHarmless(segment)) return false
   }
 
-  /*
-   * ## 命令替换里的删除也要**完整**判定（2026-11-02 定版验收，P1）
-   *
-   * 命令替换会被真的执行：`echo $(rm -rf /tmp/x)` 与反引号写法都不是
-   * "仅在参数里提到删除"。
-   *
-   * 上一版这里只调 `containsDeleteCommand` —— 它只看命令位动词。于是：
-   *
-   * ```
-   * "$(find /tmp -delete)"   提取到 `find /tmp -delete`
-   *   containsDeleteCommand 不认参数级删除 → 判"仅提及" → 提前放行 ✗
-   * ```
-   *
-   * 而 `$(rm -rf /tmp/x)` 因为 `rm` 恰好在命令位，碰巧能识别 —— 修复看起来
-   * "部分有效"，掩盖了判据缺两道的事实。
-   *
-   * 现在与逐段检查用同一套三道判定，不再有缩水版本。
-   */
-  for (const inner of commandSubstitutions(stripped)) {
-    if (containsDeleteCommand(inner)) return false
-    if (tokenize(inner).some((t) => isDeleteArgumentMarker(t))) return false
-    if (hasCallStyleDelete(blankQuotedContent(inner))) return false
-  }
-
-  const tokens = tokenize(segments[0] ?? '')
-  const first = tokens[0]?.toLowerCase()
-  if (first === undefined) return false
-
-  /**
-   * "把后面的字符串当成命令执行"的包装器。
-   *
-   * 它们必须**排除在豁免之外**：`cmd /c "rd /s /q C:\x"` 的主命令是 `cmd`，
-   * 但引号里那一段会被真的执行。把它们当"仅提及"等于开了一个大洞。
-   */
-  const EXECUTING_WRAPPERS = new Set([
-    'cmd',
-    'sh',
-    'bash',
-    'zsh',
-    'powershell',
-    'pwsh',
-    'eval',
-    'exec',
-    'invoke-expression',
-    'iex',
-    'start-process',
-    'call',
-  ])
-  if (EXECUTING_WRAPPERS.has(first)) return false
-
-  /** 只会输出或检索、不会改动文件系统的命令。 */
-  const READ_ONLY_COMMANDS = new Set([
-    'echo',
-    'printf',
-    'print',
-    'console.log',
-    'grep',
-    'egrep',
-    'rg',
-    'ag',
-    'cat',
-    'type',
-    'less',
-    'more',
-    'head',
-    'tail',
-    'get-content',
-    'select-string',
-    'write-output',
-    'write-host',
-    'man',
-    'help',
-  ])
-
-  return READ_ONLY_COMMANDS.has(first)
+  return true
 }
 
 /**
@@ -900,6 +812,441 @@ function isDeleteVerb(token: string): boolean {
  *
  * 隔离验证：前者 `destructive=false`，后者 `true`。同一个删除，加了只读前缀
  * 就豁免了。
+ */
+/**
+ * 可以**证明**只读的命令（正向白名单）。
+ *
+ * ## 为什么是白名单而不是黑名单（2026-11-02 架构调整）
+ *
+ * 前五轮都在做"识别删除"——每轮补一种写法，复审再找出一种新的。
+ * 实测证明这条路没有终点：`awk system()`、`busybox rm`、
+ * `xargs sh -c` 等 10 个等价写法里我漏了 4 个，而且能无限造。
+ *
+ * 根因是 `parseCommand` 的最后一个 `return { destructive: false }` ——
+ * **"没找到删除证据"被当成了"证明不会删除"**。
+ *
+ * 现在把判定反过来：每个执行段必须落在下面的名单里，才允许放行；
+ * 其余一律要求审批。这样"未知写法"的默认归宿是**问**，不是**放**。
+ *
+ * ## 名单为什么这么短
+ *
+ * 越短越安全、误报越多。这里只收**明确不会产生文件系统副作用**的命令：
+ *
+ * - 纯输出：`echo` / `printf` / `print`
+ * - 纯读取：`cat` / `head` / `tail` / `less` / `more` / `wc` / `sort` / `uniq`
+ * - 纯检索：`grep` / `rg` / `egrep` / `ag` / `findstr`
+ * - 纯查询：`pwd` / `whoami` / `date` / `env` / `which` / `type`
+ * - 版本控制**只读子命令**另判（`git status` 等），不整条 `git` 放行
+ *
+ * ## 刻意不收的
+ *
+ * - `find`：支持 `-delete` / `-exec`
+ * - `awk` / `sed`：支持 `system()` / `e` 命令
+ * - `xargs`：会把管道内容当命令执行
+ * - `sh` / `bash` / `node` / `python`：执行包装器
+ * - `tee` / `touch` / `mkdir` / `cp` / `mv`：有写入副作用
+ */
+const PROVEN_READ_ONLY = new Set([
+  'echo',
+  'printf',
+  'print',
+  'console.log',
+  'ls',
+  'dir',
+  'pwd',
+  'whoami',
+  'date',
+  'env',
+  'which',
+  'cat',
+  'type',
+  'less',
+  'more',
+  'head',
+  'tail',
+  'wc',
+  'sort',
+  'uniq',
+  'grep',
+  'egrep',
+  'rg',
+  'ag',
+  'findstr',
+  /*
+   * `cp` / `copy` 只**读取**源、写入目标，不删除任何东西。
+   * 第六轮复审测过 `cp /tmp/rm /backup/`（源文件名含 rm）被误判。
+   *
+   * 注意 `mv` **不在此列** —— 它会移走原文件，语义上接近删除。
+   */
+  'cp',
+  'copy',
+  /*
+   * `find` 本身是只读查询。
+   *
+   * 我起初拒绝把它放进来（因为它支持 `-delete` / `-exec`），但
+   * `isDeleteArgumentMarker` 与 `containsDeleteCommand` 已经挡住那些形态：
+   * `find /tmp -delete` 会在参数级标记处被否决，不需要靠"不在白名单"。
+   *
+   * 所以 `find /tmp -name "*.log"` 这种纯查询可以放行 —— 否则每次列文件
+   * 都要弹卡。
+   */
+  'find',
+  'get-content',
+  'select-string',
+  'write-output',
+  'write-host',  'man',
+  'help',
+  'true',
+  'false',
+  'test',
+  // PowerShell 只读形态（大小写在调用处已归一）。
+  'get-childitem',
+  'get-item',
+  'get-itemproperty',
+  'get-location',
+  'get-process',
+  'get-service',
+  'get-command',
+  'get-help',
+  'get-date',
+  'get-content',
+  'select-object',
+  'where-object',
+  'sort-object',
+  'measure-object',
+  'format-table',
+  'format-list',
+  'out-string',
+  'resolve-path',
+  'test-path',
+  'join-path',
+  'split-path',
+])
+
+/**
+ * `python -m <module>` 里**已知不会删文件**的模块。
+ *
+ * `python -m pytest` / `python -m json.tool` 是标准开发命令；
+ * 而 `python -m 任意模块` 可能调用 `shutil.rmtree`。
+ *
+ * 只收明确只读或测试框架的模块名。
+ */
+const PROVEN_READ_ONLY_PY_MODULE = new Set([
+  'pytest',
+  'unittest',
+  'json.tool',
+  'http.server',
+  'pip',
+  'venv',
+  'compileall',
+  'pydoc',
+])
+
+/**
+ * `git` 的只读子命令。
+ *
+ * 为什么单独判而不整条放行 `git`：`git clean -fdx` 会**真的删文件**，
+ * 而 `git status` / `git log` / `git diff` 只读。按子命令区分才准确。
+ */
+const PROVEN_READ_ONLY_GIT = new Set([
+  'status',
+  'log',
+  'diff',
+  'show',
+  'branch',
+  'remote',
+  'rev-parse',
+  'ls-files',
+  'blame',
+  'describe',
+  'tag',
+  'config',
+  /*
+   * `git add` / `git commit` 只改索引与仓库状态，**不删**工作区文件。
+   * 第六轮复审测过 `git add rm`（文件名恰好叫 rm）被误判成删除。
+   *
+   * ## 刻意不收的 git 子命令
+   *
+   * - `clean`：`git clean -fdx` 会真的删文件；
+   * - `checkout` / `restore` / `switch`：会**覆盖**工作区内容（未提交的修改丢失）；
+   * - `stash`：把修改移走；
+   * - `merge` / `rebase` / `cherry-pick`：可能改写工作区。
+   *
+   * 它们不"删文件"，但都能让用户丢数据 —— 归入要求审批。
+   */
+  'add',
+  'commit',
+  'fetch',
+  'pull',
+  'push',
+])
+
+/**
+ * 包管理器的**只读**子命令。
+ *
+ * `pnpm typecheck` / `pnpm test` 是开发时最高频的写法，不该弹卡；
+ * 而 `pnpm remove` / `pnpm uninstall` 会改文件系统（并删目录）。
+ */
+const PROVEN_READ_ONLY_PKG = new Set([
+  'typecheck',
+  'test',
+  'lint',
+  'run',
+  'exec',
+  'dlx',
+  'ls',
+  'list',
+  'outdated',
+  'why',
+  'view',
+  'info',
+])
+
+/**
+ * 判断一个命令 token 是否是"已证明只读"的主命令。
+ *
+ * @param token 命令名（已小写、已去引号）。
+ * @param next 紧邻的下一个 token（用于 `git` / `pnpm` 这类要看子命令的）。
+ * @returns 能证明只读返回 true。
+ */
+function isProvenReadOnlyCommand(token: string, next?: string): boolean {
+  const base = (token.split(/[\\/]/).pop() ?? token).replace(/\.(exe|com|cmd|bat)$/, '')
+  if (PROVEN_READ_ONLY.has(base)) return true
+  if (base === 'git') {
+    const sub = (next ?? '').toLowerCase()
+    // 没有子命令、或子命令不在只读表里 → 不能证明。
+    return sub !== '' && PROVEN_READ_ONLY_GIT.has(sub)
+  }
+  if (base === 'pnpm' || base === 'npm' || base === 'yarn') {
+    const sub = (next ?? '').toLowerCase()
+    return sub !== '' && PROVEN_READ_ONLY_PKG.has(sub)
+  }
+  return false
+}
+
+/**
+ * 判断一个执行段是否能**证明**不会删除任何东西。
+ *
+ * ## 为什么需要它（2026-11-02 架构调整）
+ *
+ * 五轮复审的共同根因：判定逻辑是"找删除证据"，找不到就放行。
+ * 于是任何我没预料到的写法都是漏洞，而写法是无穷的。
+ *
+ * 这个函数是**正向证明**：只有落在已知安全的形态里才返回 true。
+ * 调用方（`mentionsOnly`）在它返回 false 时要求审批 ——
+ * 未知的默认归宿从"放行"变成"问"。
+ *
+ * ## 判据
+ *
+ * 1. 展开命令替换（`$(…)` / 反引号）后，**每一段**的主命令都能证明只读；
+ * 2. 段内不含任何删除构造（动词、参数级标记、方法调用、`system(`）。
+ *
+ * @param segment 一个执行段（已按分隔符切开）。
+ * @param depth 递归深度（防循环）。
+ * @returns 能证明无害返回 true。
+ */
+function provenHarmless(segment: string, depth = 0): boolean {
+  if (depth > 4) return false
+
+  const text = segment.trim()
+  if (text === '') return false
+
+  /*
+   * ## 容器操作不是文件删除（2026-11-02 架构调整时发现）
+   *
+   * `Map.delete(k)` / `Set.delete(v)` / `cache.delete(key)` 是内存数据结构
+   * 的操作，不碰文件系统。而 `containsDeleteCommand` 看到 `.delete(` 就命中，
+   * 于是 `node -e 'const m=new Map(); m.delete("k")'` 被判成删除。
+   *
+   * 第六轮复审专门测过这一点。在正向证明里把它排除掉：
+   * 如果**唯一**的删除嫌疑来自容器方法调用，就不算否决理由。
+   */
+  const containerOnly = isContainerDeleteOnly(text)
+
+  /*
+   * `system(` / `exec(` 是"把字符串当命令执行"的通用通道 ——
+   * awk / perl / 某些 DSL 都支持。看不清内容就不放行。
+   *
+   * 这条要排在容器判定**之前**：`m.delete(system('x'))` 里的 `system`
+   * 会被执行，不能因为外层是容器调用就放过。
+   */
+  if (/\b(?:system|popen|execSync|spawnSync)\s*\(/i.test(text)) return false
+
+  /*
+   * 纯容器操作：`m.delete("k")` 是内存操作，不碰文件系统。
+   *
+   * 这里要**直接返回 true**，而不是像下面那样"跳过否决"——
+   * 因为主命令 `m` 不在只读白名单里，走到末尾仍会被判 unverifiable。
+   *
+   * `isContainerDeleteOnly` 已确保"移除容器调用后没有其它删除痕迹"，
+   * 所以 `m.delete(k); fs.rmSync(x)` 不会到这里。
+   */
+  if (containerOnly) return true
+
+  // 段内任何删除构造都直接否决。
+  if (containsDeleteCommand(text)) return false
+  /*
+   * ## `git` 的 `--delete` 删的是**引用**，不是文件
+   *
+   * `git branch --delete old` 与 `git branch -d old` 等价 —— 删的是分支，
+   * 工作区文件不受影响。但 `--delete` 在 `DELETE_ARGUMENT_MARKERS` 里
+   * （`rsync --delete` 用它删文件），于是长写法被误拦而短写法放行。
+   *
+   * 判据：主命令是 `git` 且子命令在只读表里 → 忽略参数级标记。
+   * `git clean -fdx` 不在只读表里，仍会走完整判定。
+   */
+  const isGitReadOnly = (() => {
+    const tokens = tokenize(text)
+    const first = tokens[0]?.toLowerCase()
+    if (first === undefined) return false
+    const base = (first.split(/[\\/]/).pop() ?? first).replace(/\.(exe|com|cmd|bat)$/, '')
+    return base === 'git' && isProvenReadOnlyCommand('git', tokens[1]?.toLowerCase())
+  })()
+
+  if (!isGitReadOnly && tokenize(text).some((t) => isDeleteArgumentMarker(t))) return false
+  if (hasCallStyleDelete(blankQuotedContent(text))) return false
+
+  /*
+   * ## 两种"看着像删除但不会删文件"的形态
+   *
+   * `delete obj.key` —— JS 的 `delete` **运算符**，删的是对象属性，
+   * 不碰文件系统。它与命令 `del` 只差一个字母，但语义完全不同。
+   *
+   * `rsync -a src/ dst/` —— **不带** `--delete` 时只做复制。
+   * 而 `rsync --delete` 会删目标端多余文件（参数级标记已挡住那种）。
+   */
+  if (/^delete\s+[\w$.]+\s*(\[[^\]]*\])?$/.test(text)) return true
+  if (/^rsync\b/i.test(text) && !/--(?:del|delete)/i.test(text)) return true
+
+  /*
+   * 命令替换里的内容会被执行 —— 递归证明。
+   */
+  for (const substitution of commandSubstitutions(text)) {
+    if (!provenHarmless(substitution, depth + 1)) return false
+  }
+
+  /*
+   * 主命令判定。把替换抹掉后看剩下的第一个 token。
+   *
+   * ## 命令名要按 `(` 截断
+   *
+   * `tokenize` 不把 `(` 当分隔符，于是 `console.log(1)` 会成为**一个** token，
+   * 与白名单里的 `console.log` 对不上 —— 内侧无害的 `node -e 'console.log(1)'`
+   * 因此被判 unverifiable（实测）。
+   *
+   * 这里取第一个 token 时截到 `(` 为止，与 shell 的"命令名 + 参数"形态一致。
+   */
+  const stripped = text.replace(/\$\([^)]*\)/g, ' ').replace(/`[^`]*`/g, ' ').trim()
+  const tokens = tokenize(stripped)
+  const rawFirst = tokens[0]?.toLowerCase()
+  const first =
+    rawFirst === undefined ? undefined : (rawFirst.split('(')[0] ?? rawFirst).trim() || undefined
+  if (first === undefined) {
+    // 整段就是一个替换 —— 已在上面递归证明过。
+    return commandSubstitutions(text).length > 0
+  }
+
+  /*
+   * `python -m <module>`：模块名不是文件，按已知只读模块判断。
+   *
+   * `python -m pytest` 是标准开发命令；`python -m 任意模块` 可能删文件。
+   */
+  if (/^(?:python[0-9.]*|py)$/.test(first) && tokens[1]?.toLowerCase() === '-m') {
+    const module = (tokens[2] ?? '').toLowerCase()
+    return module !== '' && PROVEN_READ_ONLY_PY_MODULE.has(module)
+  }
+
+  /*
+   * 取子命令时注意：`console.log(1)` 的第一个 token 没有第二个，
+   * 而 `git status` 有。用同一个 token 列表即可。
+   */
+  return isProvenReadOnlyCommand(first, tokens[1]?.toLowerCase())
+}
+
+/**
+ * 判断文本里**唯一**的删除嫌疑是否来自容器方法调用。
+ *
+ * ## 为什么需要（2026-11-02 架构调整）
+ *
+ * `Map.delete(k)` / `Set.delete(v)` / `cache.delete(key)` 是内存操作，
+ * 不碰文件系统。但 `containsDeleteCommand` 与 `hasCallStyleDelete` 看到
+ * `.delete(` 就命中 —— 第六轮复审专门测过这类误判。
+ *
+ * ## 判据
+ *
+ * 1. 文本含 `<容器名>.delete(` 形态；
+ * 2. 且**移除**这些调用后，不再有任何删除构造。
+ *
+ * 两条都满足才算"只是容器操作"。这样
+ * `const m = new Map(); m.delete('k'); fs.rmSync('x')` 仍会被否决
+ * —— 它的删除嫌疑不只来自容器。
+ *
+ * @param text 命令文本。
+ * @returns 只有容器删除返回 true。
+ */
+function isContainerDeleteOnly(text: string): boolean {
+  /*
+   * 常见的容器/缓存变量名与标准容器类。
+   *
+   * 刻意收窄：只认这些明确是内存结构的名字。`.delete(` 前面是任意标识符
+   * 时不算 —— 那可能是 `fs` 的包装、也可能是别的危险对象。
+   */
+  const pattern =
+    /\b(?:map|set|weakmap|weakset|cache\w*|\w*map|\w*set|\w*cache|m|s|registry|store|pool|queue|list|dict|tree|index|memo)\s*\.\s*delete\s*\(/gi
+
+  if (!pattern.test(text)) return false
+
+  /*
+   * 移除容器调用后，再检查是否还有删除痕迹。
+   */
+  const without = text.replace(pattern, ' ')
+
+  if (containsDeleteCommand(without)) return false
+  if (hasCallStyleDelete(blankQuotedContent(without))) return false
+  if (tokenize(without).some((t) => isDeleteArgumentMarker(t))) return false
+
+  return true
+}
+
+/**
+ * 判断一段**表达式**（不是命令）是否只读。
+ *
+ * ## 为什么与 `provenHarmless` 分开
+ *
+ * `node -p 'process.version'` 的内层是表达式 —— `process.version` 不是
+ * 命令名，所以 `provenHarmless` 的白名单判定不适用。
+ *
+ * 但表达式同样可能删东西：`node -p 'require("fs").rmSync("x")'`。
+ *
+ * 判据：不含任何删除构造、不含能执行字符串的调用（`eval` / `Function` /
+ * `system`）、不含命令替换。
+ *
+ * @param text 表达式文本。
+ * @returns 能证明只读返回 true。
+ */
+function isReadOnlyExpression(text: string): boolean {
+  const t = text.trim()
+  if (t === '') return false
+
+  if (containsDeleteCommand(t)) return false
+  if (tokenize(t).some((token) => isDeleteArgumentMarker(token))) return false
+  if (hasCallStyleDelete(blankQuotedContent(t))) return false
+  if (/\b(?:system|popen|execSync|spawnSync|eval|Function)\s*\(/i.test(t)) return false
+  if (commandSubstitutions(t).length > 0) return false
+
+  /*
+   * 含 `require(` / `import(` 的表达式能加载任意模块（`fs` 就在其中）——
+   * 静态看不出它要干什么。`require("fs").rmSync(...)` 已被上面的
+   * `hasCallStyleDelete` 挡住，但 `require("fs")` 赋给变量再调用就看不到，
+   * 所以整体不放行。
+   */
+  if (/\b(?:require|import)\s*\(/.test(t)) return false
+
+  return true
+}
+
+/**
+ * 在参数位置表达删除的标记。
  */
 const DELETE_ARGUMENT_MARKERS = [
   '-delete',
@@ -1327,6 +1674,20 @@ export function parseCommand(command: string): CommandVerdict {
   // 这是一条完整的绕过通道（而且是很常见的写法），不能靠动词表兜住。
   const wrapped = unwrapExecutedCommand(text)
   if (wrapped !== null) {
+    /*
+     * ## 表达式先按表达式判（2026-11-02 架构调整）
+     *
+     * `node -p 'process.version'` 的内层是**表达式**，不是命令。
+     * 若直接 `parseCommand(wrapped)`，`process.version` 会被当成命令名 ——
+     * 既不在只读白名单、又"无法证明"，于是被判删除（实测）。
+     *
+     * 而 `node -p 'require("fs").rmSync("x")'` 必须继续拦住。
+     *
+     * 所以：能用 `isReadOnlyExpression` 证明只读时直接放行，
+     * 否则才走 `parseCommand` 的完整判定。
+     */
+    if (isReadOnlyExpression(wrapped)) return { destructive: false }
+
     const inner = parseCommand(wrapped)
     if (inner.destructive) return inner
 
@@ -1393,8 +1754,23 @@ export function parseCommand(command: string): CommandVerdict {
    * 引号内，但它**会被执行**。而 `const note = "file.Delete()"` 的同样字样
    * 只是普通字符串。两者的区别是前者有执行包装器在跑那段字符串。
    */
-  const outsideQuotesHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(quotedBlanked))
-  const anyHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(commentFree))
+  /*
+   * ## 容器操作不参与匹配（2026-11-02 架构调整时发现）
+   *
+   * `Map.delete(k)` / `Set.delete(v)` / `cache.delete(key)` 是内存操作。
+   * 若直接在原文上匹配 `DELETE_PATTERNS`，`node -e 'm.delete("k")'`
+   * 会被当成删除 —— 第六轮复审专门测过这类误判。
+   *
+   * 这里先算出"只有容器删除"的标记，命中时把容器调用从匹配文本里抹掉。
+   */
+  const containerOnly = isContainerDeleteOnly(commentFree)
+  const containerPattern =
+    /\b(?:weakmap|weakset|map|set|cache\w*|\w+map|\w+set|\w+cache|m|s|registry|store|pool|queue|list|dict|tree|index|memo)\s*\.\s*delete\s*\(/gi
+  const matchSource = containerOnly ? commentFree.replace(containerPattern, ' ') : commentFree
+  const matchBlanked = containerOnly ? quotedBlanked.replace(containerPattern, ' ') : quotedBlanked
+
+  const outsideQuotesHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(matchBlanked))
+  const anyHit = DELETE_PATTERNS.find((entry) => entry.pattern.test(matchSource))
 
   /**
    * 是否在用包装器执行引号里的内容。
@@ -1531,8 +1907,13 @@ export function parseCommand(command: string): CommandVerdict {
      * 两者会被真的执行，判据不该因为前面多了个 `require(...)` 就变。
      * 用与 `isPlainlyHarmless` 相同的 `hasCallStyleDelete`，
      * 且同样先抹掉字符串字面量再匹配。
+     *
+     * ## 容器操作要排除
+     *
+     * `Map.delete(k)` / `cache.delete(key)` 是内存操作。若这里不排除，
+     * `node -e 'm.delete("k")'` 会被当成删除（第六轮复审测过）。
      */
-    if (hasCallStyleDelete(blankQuotedContent(text))) {
+    if (!isContainerDeleteOnly(text) && hasCallStyleDelete(blankQuotedContent(text))) {
       return { destructive: true, kind: 'delete', recursive: false, target: null }
     }
 
@@ -1578,10 +1959,48 @@ export function parseCommand(command: string): CommandVerdict {
      * 既有判定**（包装器解包、`node -e`、不透明执行、参数级删除等），
      * 不再有"第二套缩水规则"。
      */
-    for (const segment of splitOutsideQuotes(text).slice(1)) {
-      if (segment.trim() === '') continue
-      if (parseCommand(segment).destructive) {
-        return { destructive: true, kind: 'delete', recursive: false, target: null }
+    /*
+     * ## 兜底：不能证明无害就要求审批（2026-11-02 架构调整）
+     *
+     * 这里原来是 `return { destructive: false }` —— 整个五轮复审的根因。
+     *
+     * "没找到删除证据"和"证明不会删除"是两件事。旧的默认值把它们混为一谈，
+     * 于是任何我没预料到的写法都自动放行，而写法是无穷的：
+     * `awk system()`、`busybox rm`、`xargs sh -c`、base64 管道…
+     *
+     * 现在：走到兜底说明既没识别出删除、也没能正向证明无害 ——
+     * 那是**未知**，未知必须问人。
+     *
+     * 判据用 `provenHarmless`（逐段正向证明）。能证明的放行，
+     * 其余标为 `unverifiable` 交给审批，并在审计里写明原因。
+     *
+     * ## 但执行包装器要先看**内容**（开发高频写法）
+     *
+     * `node -e 'console.log(1)'` / `python -c 'print(1)'` / `sh -c 'echo hi'`
+     * 是每天都在用的写法。它们"能执行任意代码"所以不能整体进白名单，
+     * 但内容明显无害时不该弹卡 —— 否则审批疲劳会让保护失效。
+     *
+     * 所以先解包：内层用同样的正向证明判断。`node -e 'fs.rmSync(\'x\')'`
+     * 的内层会被认出删除，照样拦。
+     */
+    for (const segment of splitOutsideQuotes(text)) {
+      const inner = unwrapExecutedCommand(segment)
+      if (inner !== null && provenHarmless(inner)) continue
+      /*
+       * `-p` / `--print` 的内层是**表达式**，不是命令：
+       * `node -p 'process.version'` 里 `process.version` 不是命令名，
+       * 因此 `provenHarmless` 会判它"主命令不在白名单"。
+       *
+       * 表达式另用一条判据：只要不含任何删除痕迹就放行。
+       * `node -p 'require("fs").rmSync("x")'` 会被这条挡住。
+       */
+      if (inner !== null && isReadOnlyExpression(inner)) continue
+      if (provenHarmless(segment)) continue
+      return {
+        destructive: true,
+        kind: 'delete',
+        recursive: RECURSIVE_FLAGS.some((flag) => tokens.includes(flag)),
+        target: targetFromPattern(text, 'unverifiable command') ?? null,
       }
     }
 

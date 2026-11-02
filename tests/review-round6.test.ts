@@ -22,10 +22,21 @@ describe('N-f: interpreter binaries with an executable suffix', () => {
     })
   }
 
-  // 跑脚本文件仍然放行。
-  it('allows a script file through a suffixed binary', () => {
-    expect(parseCommand('python.exe script.py').destructive).toBe(false)
-    expect(parseCommand('node.exe app.js').destructive).toBe(false)
+  /*
+   * ## 行为变更（2026-11-02 架构调整）：脚本文件现在要求审批
+   *
+   * 原来注释写"跑脚本文件仍然放行"。新架构改为**看不到就问** ——
+   * 脚本内容静态不可见，可能是 `shutil.rmtree()`。
+   *
+   * 这条本来测的是"`.exe` 后缀不影响判定"，现在改为确认后缀归一化后
+   * 仍与不带后缀的判定一致（两者都要求审批）。
+   */
+  it('requires approval for a script file through a suffixed binary', () => {
+    expect(parseCommand('python.exe script.py').destructive).toBe(true)
+    expect(parseCommand('node.exe app.js').destructive).toBe(true)
+    // 后缀不该改变判定 —— 与不带后缀时一致。
+    expect(parseCommand('python script.py').destructive).toBe(true)
+    expect(parseCommand('node app.js').destructive).toBe(true)
   })
 })
 

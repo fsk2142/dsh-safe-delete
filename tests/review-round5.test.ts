@@ -59,12 +59,32 @@ describe('N-d: interpreter path prefix and no-space flags', () => {
     })
   }
 
-  // 带路径但只是跑脚本文件，仍然放行。
-  const allowed = ['/usr/bin/python script.py', '/usr/local/bin/node app.js']
+  /*
+   * ## 行为变更（2026-11-02 架构调整）：执行脚本文件现在要求审批
+   *
+   * 这两条原来断言"带路径但只是跑脚本文件 → 放行"。
+   *
+   * 新架构的判据是「能**证明**无害才放行」。而 `python script.py` /
+   * `node app.js` 执行的是**外部文件**，内容静态不可见 —— 脚本里可以是
+   * `shutil.rmtree()` 或 `fs.rmSync()`，字符串层面看不出来。
+   *
+   * 实测过两个替代方案：
+   *
+   * - 读脚本内容再判：本仓库三个脚本**全部**被判 destructive
+   *   （正文里提到删除字样就命中），需要专门调优，属于新的技术债；
+   * - 把脚本路径当"用户自己的代码"放行：与保护目标直接冲突。
+   *
+   * 所以选择保守：**要求审批**。代价是 `node scripts/build.mjs` 这类
+   * 日常命令会弹一次卡；收益是脚本里的删除不会绕过保护。
+   *
+   * 如果将来要实现"读脚本内容分析"，应当作为独立特性设计，
+   * 而不是靠放宽这条判据。
+   */
+  const requiresApproval = ['/usr/bin/python script.py', '/usr/local/bin/node app.js']
 
-  for (const command of allowed) {
-    it(`allows ${JSON.stringify(command)}`, () => {
-      expect(parseCommand(command).destructive).toBe(false)
+  for (const command of requiresApproval) {
+    it(`requires approval for ${JSON.stringify(command)} (script content is not visible)`, () => {
+      expect(parseCommand(command).destructive).toBe(true)
     })
   }
 })

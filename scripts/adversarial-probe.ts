@@ -58,7 +58,23 @@ const probes: Probe[] = [
   { label: 'rsync --delete', text: 'rsync -a --delete src/ dst/', expect: 'BLOCK' },
   { label: 'perl unlink', text: "perl -e 'unlink q(/tmp/x)'", expect: 'ASK' },
   { label: 'PowerShell .Delete() 方法', text: '(Get-Item C:\\x).Delete()', expect: 'ASK' },
-  { label: '环境变量拼接构造命令（静态不可判）', text: '$c = "Re" + "move-Item"; & $c -Recurse C:\\x', expect: 'KNOWN_GAP' },
+  /*
+   * ## 这条从"已知边界"升级为"要求审批"（2026-11-02 架构调整）
+   *
+   * `$c = "Re" + "move-Item"; & $c -Recurse C:\x` 是**运行时拼出来的命令**，
+   * 静态完全看不出它会删东西。
+   *
+   * 旧架构把它记为 KNOWN_GAP（放行），理由就是"静态不可判"。
+   * 但"静态不可判"恰恰是**应当问人**的情形 —— 不是放行的理由。
+   *
+   * 新架构的兜底规则是"不能证明无害就要求审批"，所以它变成 ASK。
+   * 这一类从此不再是"已知边界"，而是被覆盖的未知。
+   */
+  {
+    label: '环境变量拼接构造命令（静态不可判 → 改为问人）',
+    text: '$c = "Re" + "move-Item"; & $c -Recurse C:\\x',
+    expect: 'ASK',
+  },
 ]
 
 let block = 0
