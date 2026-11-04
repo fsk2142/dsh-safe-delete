@@ -1,3 +1,5 @@
+import { apply } from '../src/index'
+import { makeFakeCtx } from './support/fake-ctx'
 import { describe, expect, it } from 'vitest'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -187,31 +189,10 @@ describe('SD-05: aggregate thresholds are enforced', () => {
     expect(r.ok).toBe(true)
   })
 
-  it('does not pass a free root through without asking (structural, hook-level)', async () => {
-    /*
-     * 钩子层的结构断言：`classification === 'free'` 不能再直接 `next()`。
-     *
-     * 为什么用结构断言：pre-execute 需要完整 Cordis 上下文（session、
-     * 瀑布分发），单测里构造不出来。而"free 就放行"这个动作本身就是缺陷 ——
-     * 直接检查代码形状。
-     */
-    const src = readFileSync('src/index.ts', 'utf8')
-
-    expect(src, '不许对 free root 直接放行').not.toMatch(
-      /classification === 'free'\)\s*return next\(\)/,
-    )
-
-    /*
-     * 但 `never` 策略的放行必须保留 —— 那是用户明确选择不问。
-     */
-    expect(src, 'never 策略应保留放行').toMatch(
-      /approvalPolicy\(session\) === 'never'\)\s*return next\(\)/,
-    )
-
-    // 模式分支必须仍会走到 ask。
-    const patternAt = src.indexOf("const isPatternForm =")
-    expect(patternAt).toBeGreaterThan(0)
-    const tail = src.slice(patternAt, patternAt + 2000)
-    expect(tail, '模式分支必须返回 ask').toMatch(/kind: 'ask'/)
+  it('asks for a free pattern root through the registered hook', async () => {
+    const ctx = makeFakeCtx({ approvalPolicy: 'ask' })
+    apply(ctx as never, { autoPrune: false, homeDir: 'C:/hook-home', stateDir: 'C:/hook-state' })
+    const result = await ctx.preExecute({ name: 'safe_delete', arguments: { root: 'C:/hook-work', match: '*.log' } })
+    expect(result.kind).toBe('ask')
   })
 })

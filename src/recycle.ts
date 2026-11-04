@@ -360,7 +360,7 @@ export function parseRecycleManyOutput(stdout: string): { ok: number; fail: numb
   const errors = lines
     .filter((line) => line.startsWith('ERR: '))
     .map((line) => line.slice('ERR: '.length).trim())
-  const summary = lines.find((line) => /OK=\d+\s+FAIL=\d+/.test(line))
+  const summary = lines.find((line) => /^OK=\d+\s+FAIL=\d+\s*$/.test(line.trim()))
   if (summary === undefined) {
     return { ok: 0, fail: Math.max(1, errors.length), errors }
   }

@@ -169,6 +169,8 @@ export declare const name = "dsh-safe-delete";
 export declare const inject: string[];
 /** 插件配置。 */
 export interface SafeDeleteConfig {
+  /** Destination accepted by the runtime configuration schema. */
+  deleteDestination?: DeleteDestination;
   /** 安全区状态目录；默认 `<DSH_HOME>/.dsh-safe-delete`。 */
   stateDir?: string;
   /**

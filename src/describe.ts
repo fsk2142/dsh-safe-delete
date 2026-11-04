@@ -9,7 +9,7 @@
  *   - 顶层条目排序：输出稳定，测试才能断言。
  */
 
-import { lstatSync, readdirSync, statSync } from 'node:fs'
+import { lstatSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
 import type { TargetDescription } from './types'
@@ -87,7 +87,7 @@ export function shallowBytes(dir: string): number {
   }
   for (const name of entries) {
     try {
-      const st = statSync(path.join(dir, name))
+      const st = lstatSync(path.join(dir, name))
       // 目录本身的大小没有意义，只用文件大小；子目录展开会让成本退回 O(文件数)。
       if (st.isFile()) total += st.size
     } catch {

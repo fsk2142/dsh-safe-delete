@@ -67,6 +67,8 @@ const SHELL_TOOLS: Record<string, 'command' | 'code' | 'text'> = {
 
 /** 插件配置。 */
 export interface SafeDeleteConfig {
+  /** Destination accepted by the runtime configuration schema. */
+  deleteDestination?: DeleteDestination
   /** 安全区状态目录；默认 `<DSH_HOME>/.dsh-safe-delete`。 */
   stateDir?: string
   /**
@@ -486,6 +488,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
        *
        * `never` 策略仍然直接放行：那不是漏审，而是用户明确选择了不问。
        */
+      const hookDestination = normalizeDestination(unwrap(raw['deleteDestination']))
       const isPatternForm = typeof args.root === 'string' && args.root.trim() !== ''
       if (isPatternForm) {
         const rootPath = path.resolve(String(args.root))
@@ -497,7 +500,15 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 保留这个分支 —— 切到 never 的人正是想不被打断地干活，
          * 强制 ask 会让删除能力被无声废掉。
          */
-        if (approvalPolicy(session) === 'never') return next()
+        if (approvalPolicy(session) === 'never') {
+          // Pattern targets and sizes are unresolved here. Recycling them may be
+          // irreversible, so never cannot safely substitute for explicit approval.
+          if (hookDestination === 'recycle-bin') return {
+            kind: 'deny',
+            reason: 'refusing a potentially unrecoverable pattern delete because the approval policy is never; matched item sizes cannot be checked before execution',
+          }
+          return next()
+        }
 
         const bits: string[] = [`root ${rootPath}`]
         if (typeof args.match === 'string') bits.push(`match "${args.match}"`)
@@ -514,7 +525,14 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         const text =
           `Delete files matched under this path? ` +
           bits.join('; ') +
-          '. The root directory itself is kept — only matched items inside it move into the safe zone. ' +
+          '. The root directory itself is kept. ' +
+          (hookDestination === 'recycle-bin'
+            ? 'Matched items go to the system recycle bin, not the safe zone. ' +
+              (hookPermanentDeleteRisk.risky
+                ? `System policy will permanently delete them: ${hookPermanentDeleteRisk.reason ?? 'recycling is disabled'}. `
+                : 'Matched sizes are unknown before execution; items exceeding recycle-bin capacity may be permanently deleted. ') +
+              'safe_zone_restore cannot restore these items. '
+            : 'Only matched items inside it move into the safe zone. ') +
           'The exact count is computed during execution and covered by this one approval.'
         /*
          * 返回 `ask`，由工具管线发起审批。
@@ -528,7 +546,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       /*
        * 目的地要在描述目标**之前**算好：它决定要不要做全树统计。
        */
-      const hookDestination = normalizeDestination(unwrap(raw['deleteDestination']))
+
 
       const plan = (() => {
         try {
