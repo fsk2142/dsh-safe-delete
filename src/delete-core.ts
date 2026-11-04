@@ -13,7 +13,7 @@
  * @module dsh-safe-delete/delete-core
  */
 
-import { existsSync, statfsSync } from 'node:fs'
+import { lstatSync, statfsSync } from 'node:fs'
 import path from 'node:path'
 
 import { appendAudit } from './audit'
@@ -189,6 +189,7 @@ export function decideGate(
   const reasons: string[] = []
 
   if (requiresApproval(classification)) reasons.push(`it is a ${classification} path`)
+  if (description.statsIncomplete) reasons.push('target statistics are incomplete; some entries could not be inspected')
 
   const countLimit = ctx.confirmFileCount
   if (countLimit > 0 && description.fileCount > countLimit) {
@@ -340,7 +341,7 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
   if (refusal !== undefined) return { ok: false, error: refusal }
 
   // 2. 存在性。
-  if (!existsSync(target)) return { ok: false, target, error: `not found: ${target}` }
+  if (lstatSync(target, { throwIfNoEntry: false }) === undefined) return { ok: false, target, error: `not found: ${target}` }
 
   // 3. 描述。
   /*
@@ -744,7 +745,7 @@ export function describeRecycled(
  */
 export function hardRefusal(target: string, stateDir: string): string | undefined {
   if (isDriveRoot(target)) return `refusing to trash a filesystem root "${target}"`
-  if (isInsideStateDir(target, stateDir)) {
+  if (isInsideStateDir(target, stateDir) || isInsideStateDir(stateDir, target)) {
     return `refusing to delete "${target}": it is the safe zone's own state directory`
   }
   return undefined

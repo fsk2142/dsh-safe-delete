@@ -536,7 +536,7 @@ export function detectPermanentDeleteRisk(
   if (platform !== 'win32') return { risky: false }
 
   const read = options.readRegistry ?? readRegistryViaReg
-  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer'
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer'
   let raw: string | undefined
   try {
     raw = read(key, 'NoRecycleFiles')
@@ -589,14 +589,16 @@ export function detectPermanentDeleteRisk(
  * 两者必须分开，否则每次都会重试一次失败的读取。
  */
 let quotaLimitCache: number | null | undefined
-let quotaCacheKey: string | undefined
+let quotaCacheReader: ((key: string) => number | undefined) | undefined
+let quotaCacheLister: (() => string[]) | undefined
 
 /**
  * 清空配额缓存（测试用；生产路径不需要）。
  */
 export function resetQuotaCache(): void {
   quotaLimitCache = undefined
-  quotaCacheKey = undefined
+  quotaCacheReader = undefined
+  quotaCacheLister = undefined
 }
 
 /**
@@ -604,21 +606,20 @@ export function resetQuotaCache(): void {
  *
  * @param readCapacity 单个卷的读取函数。
  * @param listKeys 列卷函数。
- * @param cacheKey 注入点不同则不复用缓存（测试用）。
  * @returns 上限字节数；读不到返回 `null`。
  */
 function quotaLimitBytes(
   readCapacity: (volumeKey: string) => number | undefined,
   listKeys: () => string[],
-  cacheKey: string,
 ): number | null {
-  if (quotaCacheKey === cacheKey && quotaLimitCache !== undefined) return quotaLimitCache
+  if (quotaCacheReader === readCapacity && quotaCacheLister === listKeys && quotaLimitCache !== undefined) return quotaLimitCache
 
   let keys: string[]
   try {
     keys = listKeys()
   } catch {
-    quotaCacheKey = cacheKey
+    quotaCacheReader = readCapacity
+    quotaCacheLister = listKeys
     quotaLimitCache = null
     return null
   }
@@ -635,7 +636,8 @@ function quotaLimitBytes(
     if (smallestMb === undefined || mb < smallestMb) smallestMb = mb
   }
 
-  quotaCacheKey = cacheKey
+  quotaCacheReader = readCapacity
+  quotaCacheLister = listKeys
   quotaLimitCache = smallestMb === undefined ? null : smallestMb * 1024 * 1024
   return quotaLimitCache
 }
@@ -671,13 +673,8 @@ export function detectQuotaRisk(
 
   const readCapacity = options.readCapacityMb ?? readCapacityViaReg
   const listKeys = options.listVolumeKeys ?? listBitBucketVolumeKeys
-  /*
-   * 缓存键把注入的函数也编进去：测试里不同用例用不同替身，
-   * 不能相互污染缓存；生产路径下两者都是默认实现，键恒定。
-   */
-  const cacheKey = `${String(listKeys)}${String(readCapacity)}`
-
-  const limitBytes = quotaLimitBytes(readCapacity, listKeys, cacheKey)
+  // Function identity matters: equal source text can capture different capacities.
+  const limitBytes = quotaLimitBytes(readCapacity, listKeys)
   if (limitBytes === null) return undefined
   if (sizeBytes <= limitBytes) return undefined
 

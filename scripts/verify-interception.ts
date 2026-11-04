@@ -79,7 +79,15 @@ const cases: Case[] = [
 
   // ── 必须放行：正常操作，不能误伤 ──
   { name: '读目录', tool: 'pwsh', args: { command: 'Get-ChildItem C:\\Work' }, expect: 'allow' },
-  { name: '跑构建', tool: 'bash', args: { command: 'npm run build' }, expect: 'allow' },
+  /*
+   * 2026-11-04 第 24 次审查 R24-5：这条用例原来写 `npm run build` 期望 allow。
+   * 但 `35e92a3` 已把 `run` 从包管理器白名单移除（它执行 package.json 里的
+   * 任意命令），所以显式 `run` 现在要审批 —— 用例没跟上，脚本因此 24/25。
+   *
+   * 改用不带 `run` 的 `npm build`：它命中白名单里的 `build` 子命令，
+   * 仍代表「跑构建不该被误伤」这个意图。
+   */
+  { name: '跑构建', tool: 'bash', args: { command: 'npm build' }, expect: 'allow' },
   { name: 'git status', tool: 'bash', args: { command: 'git status' }, expect: 'allow' },
   { name: '写普通工作区文件', tool: 'write', args: { file_path: 'C:\\Work\\proj\\src\\index.ts', content: 'x' }, expect: 'allow' },
   { name: 'str_replace_editor view', tool: 'str_replace_editor', args: { command: 'view', path: path.join(dshHome, 'cordis.patch.yml') }, expect: 'allow' },

@@ -82,7 +82,8 @@
     "dead-code": "node scripts/find-dead-code.mjs .",
     "sync:install": "node scripts/sync-install.mjs",
     "clean:tmp": "node scripts/clean-tmp.mjs",
-    "check:conflict": "node scripts/check-conflict.mjs"
+    "check:conflict": "node scripts/check-conflict.mjs",
+    "gate": "node scripts/gate.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-api-remotes": ">=0.2.0-rc.2",

@@ -27,6 +27,8 @@ interface TargetDescription {
    * 为 `true` 时 `bytes` 与 `fileCount` 都是 0，**不代表目标真的是空的** ——
    * 只是没去数。显示层必须据此改写文案，不能报「0 个文件」。
    */
+  /** Traversal hit its work limit or could not inspect part of the tree. */
+  statsIncomplete?: boolean;
   statsOmitted?: boolean;
 }
 //#endregion

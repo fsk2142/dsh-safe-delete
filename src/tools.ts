@@ -8,7 +8,7 @@
  * 正确性：先证明目标存在且不是禁区，再描述，再（必要时）问人，最后才移动。
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 
 import { appendAudit, appendAuditBatch, readAudit, type AuditRecord } from './audit'
@@ -410,7 +410,9 @@ async function deleteMany(
       immediatelyRejected.push({ target: resolved, error: refusal })
       continue
     }
-    if (!existsSync(resolved)) {
+    let targetExists = false
+    try { lstatSync(resolved); targetExists = true } catch { /* includes a missing link itself */ }
+    if (!targetExists) {
       immediatelyRejected.push({ target: resolved, error: 'not found' })
       continue
     }
@@ -422,7 +424,16 @@ async function deleteMany(
       resolved,
       normalizeDestination(ctx.destination) === 'recycle-bin' ? { stats: false } : {},
     )
-    plans.push({ target: resolved, description, gate: decideGate(resolved, description, ctx) })
+    /*
+     * 回收站模式下两项阈值都失效（R24-3）：用户选了「不统计换速度」，
+     * 而这两个阈值依赖统计结果。单路径已在 `deletePath` 里归零，
+     * 批量路径必须同样处理，否则「一次删几千个」仍会按原始阈值弹卡。
+     */
+    const gateCtx =
+      normalizeDestination(ctx.destination) === 'recycle-bin'
+        ? { ...ctx, confirmFileCount: 0, confirmBytes: 0 }
+        : ctx
+    plans.push({ target: resolved, description, gate: decideGate(resolved, description, gateCtx) })
   }
 
   // 2. 预览：只列出会移动什么、哪些需要确认。
@@ -463,15 +474,25 @@ async function deleteMany(
    */
   const allBytes = plans.reduce((sum, p) => sum + p.description.bytes, 0)
   const allFiles = plans.reduce((sum, p) => sum + p.description.fileCount, 0)
+  /*
+   * 合计阈值同样按目的地归零（2026-11-04 第 24 次审查 R24-3）。
+   *
+   * 上一版只归零了逐条的 `decideGate`，这段合计算式仍读原始 `ctx` ——
+   * 于是「批量删 3000 个」在回收站模式下照样弹「合计超过 5000 条」，
+   * 与 README 的承诺相反。
+   */
+  const aggregateRecycleMode = normalizeDestination(ctx.destination) === 'recycle-bin'
+  const aggregateFileLimit = aggregateRecycleMode ? 0 : ctx.confirmFileCount
+  const aggregateByteLimit = aggregateRecycleMode ? 0 : ctx.confirmBytes
   const aggregateReasons: string[] = []
-  if (ctx.confirmFileCount > 0 && allFiles > ctx.confirmFileCount) {
+  if (aggregateFileLimit > 0 && allFiles > aggregateFileLimit) {
     aggregateReasons.push(
-      `the batch totals ${allFiles} entries, exceeding the limit of ${ctx.confirmFileCount}`,
+      `the batch totals ${allFiles} entries, exceeding the limit of ${aggregateFileLimit}`,
     )
   }
-  if (ctx.confirmBytes > 0 && allBytes > ctx.confirmBytes) {
+  if (aggregateByteLimit > 0 && allBytes > aggregateByteLimit) {
     aggregateReasons.push(
-      `the batch totals ${allBytes} bytes, exceeding the limit of ${ctx.confirmBytes}`,
+      `the batch totals ${allBytes} bytes, exceeding the limit of ${aggregateByteLimit}`,
     )
   }
 
@@ -609,14 +630,36 @@ async function deleteMany(
     const recycle = ctx.recycler ?? recycleManyToSystemBin
     const outcome = await recycle(plans.map((p) => p.target))
     if (outcome.ok) {
-      const auditRecords: Array<Omit<AuditRecord, 'at'>> = plans.map((p) => ({
+      /*
+       * 只对**真的进了回收站**的条目写审计（R24-2）。
+       *
+       * `outcome.failed` 里有逐条失败原因，但上一版没有任何调用方读它 ——
+       * 部分失败时全部条目都被记成「已删除」，审计与事实不符。
+       */
+      const failedTargets = new Set(
+        (outcome.failed ?? []).map((line) => line.split(' : ')[0]?.trim() ?? ''),
+      )
+      const succeededPlans = plans.filter((p) => !failedTargets.has(p.target))
+      const auditRecords: Array<Omit<AuditRecord, 'at'>> = succeededPlans.map((p) => ({
         event: 'delete',
         target: p.target,
         tool: 'safe_delete',
         detail: `destination=recycle-bin cls=${p.gate.classification}`,
       }))
+      if (failedTargets.size > 0) {
+        auditRecords.push({
+          event: 'delete',
+          target: `${failedTargets.size} item(s)`,
+          tool: 'safe_delete',
+          detail: `destination=recycle-bin failed: ${(outcome.failed ?? []).slice(0, 3).join('; ')}`,
+        })
+      }
       appendAuditBatch(ctx.stateDir, auditRecords)
-      const lines = plans.map((p) => `${p.target}  →  system recycle bin`)
+      const lines = succeededPlans.map((p) => `${p.target}  →  system recycle bin`)
+      if (failedTargets.size > 0) {
+        lines.push('', `Not recycled (${failedTargets.size}):`)
+        for (const line of (outcome.failed ?? []).slice(0, 5)) lines.push(`  ${line}`)
+      }
       if (failed.length > 0) {
         lines.push('', `Skipped (${failed.length}):`)
         for (const item of failed) lines.push(`  ${item.target} — ${item.error}`)

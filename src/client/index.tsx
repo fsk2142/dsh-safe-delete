@@ -684,7 +684,29 @@ export function SafeZoneSettings(): ReactElement {
     } else if (reply.error.includes('settings/conflict') && remote.describe !== undefined) {
       try {
         const snapshot = unwrapRemote(await remote.describe())
-        if (snapshot.ok) setRevision(pickNamespace(snapshot.value).revision)
+        if (snapshot.ok) {
+          const view = pickNamespace(snapshot.value)
+          if (view.revision !== undefined) {
+            setRevision(view.revision)
+            // 重试会提交整张表单，修订号与未编辑字段必须来自同一份新快照。
+            // 用户的草稿仍保留；字节草稿还要固定刷新前的有效单位。
+            setValues((prev) => {
+              const merged = { ...view.value }
+              for (const spec of FIELDS) {
+                const draftKey = `${spec.key}.draft`
+                const unitKey = `${spec.key}.unit`
+                const draft = prev[draftKey]
+                const unit = prev[unitKey]
+                if (typeof draft === 'string') merged[draftKey] = draft
+                if (typeof unit === 'string') merged[unitKey] = unit
+                else if (typeof draft === 'string' && spec.kind === 'bytes') {
+                  merged[unitKey] = naturalBytesUnit(numericOf(prev, spec.key, spec.fallback))
+                }
+              }
+              return merged
+            })
+          }
+        }
       } catch { /* Retain the conflict and the user's draft when refresh fails. */ }
     }
     return result
@@ -1167,7 +1189,9 @@ export function SafeZoneSettings(): ReactElement {
       setMessage('这个宿主没有暴露设置接口，无法触发清理。')
       return
     }
-    if (cleaning) return
+    // 清理也写同一个命名空间：与保存/去向共用同步守卫，避免旧 revision 竞争。
+    if (savingRef.current) return
+    savingRef.current = true
     setCleaning(true)
     setMessage('')
     setSaved(false)
@@ -1196,6 +1220,7 @@ export function SafeZoneSettings(): ReactElement {
     } catch (error) {
       setMessage(`清理请求失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
+      savingRef.current = false
       setCleaning(false)
       // 无论成功失败都退出确认态：成功了界面会随插件重载刷新，失败则让用户
       // 重新走一遍确认，而不是停在那里、再点一下就又发一次请求。

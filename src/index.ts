@@ -29,7 +29,7 @@ import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
-import { detectPermanentDeleteRisk } from './recycle'
+import { detectPermanentDeleteRisk, detectQuotaRisk } from './recycle'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
@@ -269,6 +269,14 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   //
   // 工具侧的 `requestApproval` 因此恒为 `'allowed-once'`：走到工具执行体，说明
   // 管线已经把 `ask` 解决了（要么策略放行，要么用户点了允许一次）。
+  /**
+   * 删除会被系统永久执行的风险 —— apply 时算一次，钩子与工具共用同一个结论。
+   *
+   * 钩子必须自己拿到它：工具内部那条路是恒放行的桩（见下方 requestApproval
+   * 的注释）。同一个值两处用，避免两处判定漂移。
+   */
+  const hookPermanentDeleteRisk = detectPermanentDeleteRisk()
+
   const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 
   /**
@@ -344,7 +352,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
      * 不接线的话 ctx.permanentDeleteRisk 永远是 undefined，
      * 检测函数会被 tree-shake 掉，README 的承诺就成了空话。
      */
-    permanentDeleteRisk: detectPermanentDeleteRisk(),
+    permanentDeleteRisk: hookPermanentDeleteRisk,
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined
@@ -527,9 +535,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           let fileCount = 0
           let bytes = 0
           let statsOmitted = false
+          /** 每个目标的字节数，与 `resolved` 等长；钩子的配额判定要用。 */
+          const targetSizes: number[] = []
           const dangerousPaths: string[] = []
           const dangerousReasons: string[] = []
           const resolved: string[] = []
+          const recycleMode = hookDestination === 'recycle-bin'
 
           for (const raw of targets.paths) {
             const target = path.resolve(raw)
@@ -548,10 +559,18 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             if (description.statsOmitted === true) statsOmitted = true
             fileCount += description.fileCount
             bytes += description.bytes
+            targetSizes.push(description.bytes)
+            /*
+             * 回收站模式下阈值归零（2026-11-04 第 24 次审查 R24-3）。
+             *
+             * 钩子是管线级审批，实际决定用户看不看得见卡片 —— 它不归零的话，
+             * 批量删几千个仍会按原始阈值弹「超过 5000 条」，与 README 里
+             * 「回收站模式下两项确认不生效」的承诺相反。
+             */
             const gate = decideGate(target, description, {
               env,
-              confirmFileCount: numeric('confirmFileCount', 5000),
-              confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
+              confirmFileCount: recycleMode ? 0 : numeric('confirmFileCount', 5000),
+              confirmBytes: recycleMode ? 0 : numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
             })
             if (gate.needsApproval) {
               dangerousPaths.push(target)
@@ -560,8 +579,9 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           }
 
           // 合并阈值判定：整批的条目数与字节数（单条都在阈值内、合起来超了也要问）。
-          const countLimit = numeric('confirmFileCount', 5000)
-          const bytesLimit = numeric('confirmBytes', 2 * 1024 * 1024 * 1024)
+          // 回收站模式下两项合计阈值同样失效（R24-3）。
+          const countLimit = recycleMode ? 0 : numeric('confirmFileCount', 5000)
+          const bytesLimit = recycleMode ? 0 : numeric('confirmBytes', 2 * 1024 * 1024 * 1024)
           const reasons = [...new Set(dangerousReasons)]
           if (countLimit > 0 && fileCount > countLimit) {
             reasons.push(`${fileCount} entries in this batch exceeds the limit of ${countLimit}`)
@@ -570,13 +590,43 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             reasons.push(`${bytes} bytes in this batch exceeds the limit of ${bytesLimit}`)
           }
 
-          return { resolved, fileCount, bytes, reasons, statsOmitted, needsApproval: reasons.length > 0 }
+          return { resolved, fileCount, bytes, reasons, statsOmitted, targetSizes, needsApproval: reasons.length > 0 }
         } catch {
           return undefined
         }
       })()
 
       if (plan === undefined) return next()
+
+      /*
+       * ## 不可恢复删除必须先问（R24-1）
+       *
+       * 这条判定要排在 `needsApproval` 之前：普通文件（free 分类、不超阈值）
+       * 的 `needsApproval` 是 false，直接放行会绕过「永久删除」这道闸门。
+       */
+      const riskVerdict = decideHookRisk({
+        destination: hookDestination,
+        ...(hookPermanentDeleteRisk === undefined ? {} : { permanentDeleteRisk: hookPermanentDeleteRisk }),
+        targets: plan.resolved,
+        sizes: plan.targetSizes,
+      })
+      if (riskVerdict.kind === 'ask') {
+        /*
+         * `never` 策略下管线会驳回 ask，卡片不出现 —— 那等于把删除能力废掉。
+         * 但这里与「危险路径」不同：这次删除**不可恢复**，宁可不做也不能
+         * 静默执行。所以 never 下明确拒绝，而不是降级放行。
+         */
+        if (approvalPolicy(session) === 'never') {
+          return {
+            kind: 'deny',
+            reason:
+              `refusing an unrecoverable delete because the approval policy is 'never': ` +
+              `${riskVerdict.reason.split('\n')[0]}`,
+          }
+        }
+        return { kind: 'ask', reason: riskVerdict.reason }
+      }
+
       if (!plan.needsApproval) return next()
 
       // 审批策略是 never 时不要返回 ask：管线会直接驳回，卡片不会出现，
@@ -1213,6 +1263,75 @@ async function maybeRunRequestedClean(
       /* logger 也不可用就算了 */
     }
   }
+}
+
+/**
+ * 钩子层的「这次删除会不可恢复」判定。
+ *
+ * ## 为什么必须在钩子层（2026-11-04 第 24 次审查 R24-1，P0）
+ *
+ * 工具内部的 `requestApproval` 在生产接线里是**恒 `'allowed-once'`** 的桩
+ * （见下方注释）—— 它的前提是「管线已经把 ask 解决了」。所以在工具内部
+ * 「问人」等于不问。
+ *
+ * 上一版把 `permanentDeleteRisk` 与配额风险的审批写在 `deletePath` /
+ * `deleteMany` 里，于是策略锁定的机器上删一个普通文件走的是：
+ *
+ * ```
+ * 钩子：free 分类、不超阈值 → next()（不弹卡）
+ * 工具：permanentDeleteRisk.risky → requestApproval → 桩恒返回 allowed-once
+ * 结果：永久删除，用户零提示
+ * ```
+ *
+ * README 承诺的「会先弹窗，不同意就放弃」因此不存在。这条判定必须提到
+ * 钩子 —— 那里才是真正能拦住调用、能弹卡的地方。
+ *
+ * @param input 目的地、风险与目标。
+ * @returns `ask` 要求审批；`next` 放行。
+ */
+export function decideHookRisk(input: {
+  destination: DeleteDestination
+  permanentDeleteRisk?: { risky: boolean; reason?: string }
+  targets: readonly string[]
+  /** 与 `targets` 等长的大小（字节）。 */
+  sizes: readonly number[]
+}): { kind: 'ask'; reason: string } | { kind: 'next' } {
+  /*
+   * 只有回收站模式才可能「不可恢复」：安全区模式的条目还能取回，
+   * 回收站根本没参与，判风险只会造成无意义弹卡。
+   */
+  if (input.destination !== 'recycle-bin') return { kind: 'next' }
+
+  if (input.permanentDeleteRisk?.risky === true) {
+    return {
+      kind: 'ask',
+      reason:
+        `This delete will PERMANENTLY remove ${input.targets.length} item(s) — the recycle bin is not in effect.\n\n` +
+        `Reason: ${input.permanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}\n\n` +
+        `Approve only if you accept that the data cannot be recovered.`,
+    }
+  }
+
+  /*
+   * 超配额的单文件会被 Windows 永久删除。这里按**钩子已知的大小**判断 ——
+   * 钩子本来就算过 description，所以不需要额外遍历。
+   */
+  const oversized = input.targets.filter((_, i) => {
+    const size = input.sizes[i]
+    return typeof size === 'number' && size > 0 && detectQuotaRisk(size) !== undefined
+  })
+  if (oversized.length > 0) {
+    const sample = oversized.slice(0, 3).map((p) => `"${p}"`).join(', ')
+    const rest = oversized.length > 3 ? ` (+${oversized.length - 3} more)` : ''
+    return {
+      kind: 'ask',
+      reason:
+        `This delete will PERMANENTLY remove ${oversized.length} file(s) larger than the recycle bin's per-volume limit: ` +
+        `${sample}${rest}.\n\nApprove only if you accept that they cannot be recovered.`,
+    }
+  }
+
+  return { kind: 'next' }
 }
 
 /**

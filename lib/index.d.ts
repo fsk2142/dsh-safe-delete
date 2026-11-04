@@ -1,4 +1,4 @@
-import { r as DeleteDestination } from "./delete-core-pYAC2LJG.js";
+import { r as DeleteDestination } from "./delete-core-DD4kb2Za.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**
@@ -214,6 +214,45 @@ export interface PluginContext {
  * 插件入口。任何注册异常都在这里被吞掉并记日志 —— 见文件头「fail-soft」。
  */
 export declare function apply(ctx: PluginContext, config?: SafeDeleteConfig): void;
+/**
+ * 钩子层的「这次删除会不可恢复」判定。
+ *
+ * ## 为什么必须在钩子层（2026-11-04 第 24 次审查 R24-1，P0）
+ *
+ * 工具内部的 `requestApproval` 在生产接线里是**恒 `'allowed-once'`** 的桩
+ * （见下方注释）—— 它的前提是「管线已经把 ask 解决了」。所以在工具内部
+ * 「问人」等于不问。
+ *
+ * 上一版把 `permanentDeleteRisk` 与配额风险的审批写在 `deletePath` /
+ * `deleteMany` 里，于是策略锁定的机器上删一个普通文件走的是：
+ *
+ * ```
+ * 钩子：free 分类、不超阈值 → next()（不弹卡）
+ * 工具：permanentDeleteRisk.risky → requestApproval → 桩恒返回 allowed-once
+ * 结果：永久删除，用户零提示
+ * ```
+ *
+ * README 承诺的「会先弹窗，不同意就放弃」因此不存在。这条判定必须提到
+ * 钩子 —— 那里才是真正能拦住调用、能弹卡的地方。
+ *
+ * @param input 目的地、风险与目标。
+ * @returns `ask` 要求审批；`next` 放行。
+ */
+export declare function decideHookRisk(input: {
+  destination: DeleteDestination;
+  permanentDeleteRisk?: {
+    risky: boolean;
+    reason?: string;
+  };
+  targets: readonly string[];
+  /** 与 `targets` 等长的大小（字节）。 */
+  sizes: readonly number[];
+}): {
+  kind: 'ask';
+  reason: string;
+} | {
+  kind: 'next';
+};
 /**
  * 拼审批卡片上的那句「删除后会发生什么」。
  *

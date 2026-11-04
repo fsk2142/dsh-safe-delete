@@ -13,18 +13,18 @@ const original = readFileSync(TARGET, 'utf8')
 const mutations = [
   {
     label: '去掉盘符根检查',
-    from: "if (isDriveRoot(target)) {",
-    to: 'if (false) {',
+    from: 'if (isDriveRoot(target)) return',
+    to: 'if (false) return',
   },
   {
     label: '去掉安全区自身检查',
-    from: 'if (isInsideStateDir(target, ctx.stateDir)) {',
+    from: 'if (isInsideStateDir(target, stateDir) || isInsideStateDir(stateDir, target)) {',
     to: 'if (false) {',
   },
   {
     label: '去掉存在性检查',
-    from: 'if (!existsSync(target)) return { ok: false, target, error: `not found: ${target}` }',
-    to: 'if (false) return { ok: false, target, error: `not found: ${target}` }',
+    from: 'if (lstatSync(target, { throwIfNoEntry: false }) === undefined) return',
+    to: 'if (false) return',
   },
   {
     label: '去掉审批环节（危险路径直接放行）',

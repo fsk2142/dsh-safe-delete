@@ -141,7 +141,7 @@ function entryDir(stateDir: string, id: string): string {
 function rollbackEntry(entryRoot: string, dest: string, target: string): void {
   // 1. 内容搬回原处。目标位置若已被占用（极少见），搬回会失败，此时不动它。
   try {
-    if (existsSync(dest) && !existsSync(target)) {
+    if (lstatSync(dest, { throwIfNoEntry: false }) !== undefined && lstatSync(target, { throwIfNoEntry: false }) === undefined) {
       renameSync(dest, target)
     }
   } catch {

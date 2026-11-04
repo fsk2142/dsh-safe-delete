@@ -185,7 +185,12 @@ const checks = [
   ['读取 revision', /revision/],
   // 变量名可能随重构改变（remote / activeRemote / settingsRemote），
   // 关键是**三参数形状**：命名空间、ops 数组、修订号。
-  ['mutate(ns, ops, revision) 三参数', /\w*mote\??\.mutate\(NAMESPACE, ops, revision\)/],
+  /*
+     * 2026-11-04 第 24 次审查 R24-6：原来的 `\??` 只容忍可选链 `?`，
+     * 不容忍 TS 非空断言 `!`（`remote.mutate!(`）。`81d29f7` 引入 `!` 之后
+     * 这条检查变成误报 —— 而它自己就是门禁的一部分。
+     */
+    ['mutate(ns, ops, revision) 三参数', /\w*mote\s*[!?]?\.mutate!?\(NAMESPACE, ops, revision\)/],
   ['ops 形如 {op, path, value}', /op: 'set' as const/],
   ['拆远程信封', /unwrapRemote\(result\)/],
   ['形状不可信时先验再读', /typeof entry !== 'object'/],
