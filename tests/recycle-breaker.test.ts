@@ -86,7 +86,11 @@ describe('recycle breaker', { timeout: 30_000 }, () => {
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.reason).toMatch(/unavailable/i)
-      expect(outcome.reason).toMatch(/stay in the safe zone/i)
+      /*
+     * 文案已改：同一句话现在也用于回收站模式的审计（那里没有「安全区」可言），
+     * 所以说的是中性事实「没有永久删除任何东西」。
+     */
+    expect(outcome.reason).toMatch(/nothing was permanently deleted/i)
     }
     // 短路必须快 —— 真实 shell 调用至少几百毫秒。
     expect(elapsed).toBeLessThan(100)

@@ -29,6 +29,7 @@ import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
+import { detectPermanentDeleteRisk } from './recycle'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
@@ -338,6 +339,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
      * 删除永远走安全区 —— 一个只在文档里存在的开关。
      */
     destination: normalizeDestination(unwrap(raw['deleteDestination'])),
+    /*
+     * 永久删除风险在 apply 时算一次。命中时删除前必须问人 ——
+     * 不接线的话 ctx.permanentDeleteRisk 永远是 undefined，
+     * 检测函数会被 tree-shake 掉，README 的承诺就成了空话。
+     */
+    permanentDeleteRisk: detectPermanentDeleteRisk(),
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined
@@ -798,7 +805,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         ok: true,
         text:
           result.kind === 'preview'
-            ? describePreview(result, retentionDays)
+            ? describePreview(result, retentionDays, normalizeDestination(unwrap(raw['deleteDestination'])))
             : result.kind === 'recycled'
               ? describeRecycled(result)
               : describeMoved(result, retentionDays),

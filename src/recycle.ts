@@ -25,8 +25,10 @@
  * 宁可占着磁盘，也不能在用户不知情的情况下永久抹掉数据。
  */
 
-import { execFileSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { execFile, execFileSync } from 'node:child_process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 /** 移入回收站的结果。 */
 export type RecycleOutcome =
@@ -40,7 +42,12 @@ export type RecycleOutcome =
  * 说清「几个进去了、几个没进去」，而不是笼统报失败。
  */
 export type RecycleManyOutcome =
-  | { ok: true; recycled: number }
+  | {
+      ok: true
+      recycled: number
+      /** 部分失败时的逐条错误（成功的不受影响）。 */
+      failed?: string[]
+    }
   | { ok: false; reason: string; recycled: number; unsupported?: boolean }
 
 /**
@@ -140,7 +147,7 @@ export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
       ok: false,
       reason:
         `recycle bin unavailable after ${consecutiveFailures} consecutive failures; ` +
-        'entries stay in the safe zone. Restart DSH to retry.',
+        'nothing was permanently deleted. Restart DSH to retry.',
     }
   }
 
@@ -310,12 +317,21 @@ function waitForGone(absPath: string, timeoutMs: number): void {
  * @param absPaths 真实绝对路径。
  * @returns PowerShell 脚本正文。
  */
-export function buildRecycleManyScript(absPaths: readonly string[]): string {
-  const quote = (p: string): string => `'${p.replace(/'/g, "''")}'`
+export function buildRecycleManyScript(): string {
   return [
     "$ErrorActionPreference = 'Stop'",
     'Add-Type -AssemblyName Microsoft.VisualBasic',
-    `$targets = @(${absPaths.map(quote).join(',')})`,
+    /*
+     * ## 路径从文件读，不内联进命令行（2026-11-04 审查 Critical-2）
+     *
+     * Windows 的 `CreateProcess` 命令行上限是 32767 字符。把路径内联进
+     * `-Command` 时，500 条 × 约 92 字符 ≈ 49k 就超了，`execFileSync` 直接抛错，
+     * 用户一次删几千个会静默回落安全区（慢路径）。
+     *
+     * 从 UTF-8 文件读，命令行长度与路径数**无关**。
+     * `-LiteralPath` 保证通配符不被展开；空行跳过。
+     */
+    '$targets = @(Get-Content -LiteralPath $listPath -Encoding UTF8 | Where-Object { $_ -ne "" })',
     '$ok = 0; $fail = 0',
     'foreach ($t in $targets) {',
     '  try {',
@@ -359,7 +375,7 @@ export function parseRecycleManyOutput(stdout: string): { ok: number; fail: numb
  * @param absPaths 真实绝对路径（不聚合、不改名）。
  * @returns 结果；`recycled` 为真正送进回收站的条数。
  */
-export function recycleManyToSystemBin(absPaths: readonly string[]): RecycleManyOutcome {
+export async function recycleManyToSystemBin(absPaths: readonly string[]): Promise<RecycleManyOutcome> {
   if (absPaths.length === 0) return { ok: true, recycled: 0 }
 
   if (process.platform !== 'win32') {
@@ -379,38 +395,94 @@ export function recycleManyToSystemBin(absPaths: readonly string[]): RecycleMany
     }
   }
 
-  const script = buildRecycleManyScript(absPaths)
   /*
-   * 超时按条目数放大：一个进程处理 N 条，每条约 160ms，留一倍余量。
+   * 路径写进临时文件，脚本从文件读 —— 命令行长度与路径数无关。
+   *
+   * 用 `mkdtempSync` 拿一个独占目录，避免并发两次删除时互相覆盖路径清单。
    */
-  const timeout = Math.max(COMMAND_TIMEOUT_MS, 5_000 + 400 * absPaths.length)
-  let stdout = ''
+  let listDir: string
   try {
-    stdout = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      timeout,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    })
+    listDir = mkdtempSync(path.join(tmpdir(), 'dsd-recycle-'))
   } catch (error) {
-    recordRecycleFailure()
     const message = error instanceof Error ? error.message : String(error)
-    return { ok: false, recycled: 0, reason: `SendToRecycleBin failed: ${message}` }
+    return { ok: false, recycled: 0, reason: `could not create the path list: ${message}` }
   }
+  const listPath = path.join(listDir, 'paths.txt')
 
-  const parsed = parseRecycleManyOutput(stdout)
-  if (parsed.fail > 0 || parsed.ok === 0) {
+  try {
+    writeFileSync(listPath, absPaths.join('\n'), 'utf8')
+    const script = buildRecycleManyScript()
+    /*
+     * 超时按条目数放大：一个进程处理 N 条，每条约 160ms，留一倍余量。
+     */
+    const timeout = Math.max(COMMAND_TIMEOUT_MS, 5_000 + 400 * absPaths.length)
+
+    /*
+     * ## 异步执行，不阻塞宿主（2026-11-04 审查 Critical-3）
+     *
+     * `execFileSync` 会把 DSH 宿主进程整个卡住：1 万条按 162ms/项 ≈ 27 分钟，
+     * 期间模型和界面都动不了。这正是 2026-10-30 那起事故的形态。
+     *
+     * 用回调版包成 Promise：宿主事件循环照常转，只让这次删除自己等。
+     */
+    const stdout = await new Promise<string>((resolve, reject) => {
+      execFile(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          // 用 `& { }` 把 listPath 作为变量注入，脚本正文本身不含任何路径。
+          // 先切 UTF-8 输出，否则 5.1 在中文系统上用 GBK 写 stdout（见上）。
+          `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $listPath = '${listPath.replace(/'/g, "''")}'; ${script}`,
+        ],
+        { timeout, encoding: 'utf8', windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+        (error, out) => {
+          if (error !== null) reject(error)
+          else resolve(String(out))
+        },
+      )
+    })
+
+    const parsed = parseRecycleManyOutput(stdout)
+    /*
+     * ## 部分成功也照实报告（2026-11-04 审查 Important-7）
+     *
+     * 上一版把 `fail > 0` 当整体失败，调用方于是回落到安全区并把**全部**路径
+     * 再处理一遍 —— 已经进回收站的那些会报 "not found"，用户看到的是
+     * 「删除 1 条」而实际 99 条已在回收站里。
+     *
+     * 现在：只要有成功的就按成功返回，末位附上失败明细，让调用方只处理
+     * 真正没做成的那些。
+     */
+    if (parsed.ok > 0) {
+      consecutiveFailures = 0
+      if (parsed.fail === 0) return { ok: true, recycled: parsed.ok }
+      return {
+        ok: true,
+        recycled: parsed.ok,
+        failed: parsed.errors,
+      }
+    }
+
     recordRecycleFailure()
     const detail = parsed.errors.length > 0 ? `: ${parsed.errors.slice(0, 3).join('; ')}` : ''
     return {
       ok: false,
-      recycled: parsed.ok,
-      reason: `${parsed.fail} of ${absPaths.length} item(s) could not be recycled${detail}`,
+      recycled: 0,
+      reason: `${parsed.fail} item(s) could not be recycled${detail}`,
+    }
+  } catch (error) {
+    recordRecycleFailure()
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, recycled: 0, reason: `SendToRecycleBin failed: ${message}` }
+  } finally {
+    try {
+      rmSync(listDir, { recursive: true, force: true })
+    } catch {
+      /* 清理临时目录失败不影响结果 */
     }
   }
-
-  consecutiveFailures = 0
-  return { ok: true, recycled: parsed.ok }
 }
 
 /**
@@ -483,5 +555,101 @@ export function detectPermanentDeleteRisk(
     risky: true,
     reason:
       'the NoRecycleFiles policy is enabled: Windows will permanently delete instead of using the recycle bin',
+  }
+}
+
+/**
+ * 单个文件是否超过该卷回收站容量上限。
+ *
+ * ## 为什么要查这个（2026-11-04 审查 Important-9）
+ *
+ * Windows 在条目**超过回收站上限**时会**永久删除并返回成功**。插件无法阻止，
+ * 也无法事后感知 —— 只能事前问。
+ *
+ * 上限读 `BitBucket\Volume\*\MaxCapacity`（MB）。读不到时不判风险：
+ * 不能因为一次读注册表失败就拦住所有删除。
+ *
+ * 只对**单个文件**判断：目录的递归大小在回收站模式下刻意不统计。
+ *
+ * @param sizeBytes 目标大小（调用方已 statSync）。
+ * @param options 注入点（测试用）。
+ * @returns 超限时的说明；未超限或无法判定时返回 `undefined`。
+ */
+export function detectQuotaRisk(
+  sizeBytes: number,
+  options: {
+    platform?: NodeJS.Platform
+    readCapacityMb?: (volumeKey: string) => number | undefined
+    listVolumeKeys?: () => string[]
+  } = {},
+): string | undefined {
+  const platform = options.platform ?? process.platform
+  if (platform !== 'win32') return undefined
+  if (sizeBytes <= 0) return undefined
+
+  const readCapacity = options.readCapacityMb ?? readCapacityViaReg
+  let keys: string[]
+  try {
+    keys = (options.listVolumeKeys ?? listBitBucketVolumeKeys)()
+  } catch {
+    return undefined
+  }
+
+  let smallest: number | undefined
+  for (const key of keys) {
+    let mb: number | undefined
+    try {
+      mb = readCapacity(key)
+    } catch {
+      mb = undefined
+    }
+    if (mb === undefined || mb <= 0) continue
+    if (smallest === undefined || mb < smallest) smallest = mb
+  }
+  if (smallest === undefined) return undefined
+
+  const limitBytes = smallest * 1024 * 1024
+  if (sizeBytes <= limitBytes) return undefined
+
+  return (
+    `the file is larger than the recycle bin's per-volume limit ` +
+    `(${Math.round(smallest)} MB): Windows will delete it permanently instead of recycling it`
+  )
+}
+
+/** 列出 BitBucket 下的卷键（形如 `{GUID}` 或卷名）。 */
+function listBitBucketVolumeKeys(): string[] {
+  const root = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BitBucket\\Volume'
+  try {
+    const out = execFileSync('reg', ['query', root], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+    return out
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('HKEY_CURRENT_USER\\') || line.startsWith('HKEY_'))
+  } catch {
+    return []
+  }
+}
+
+/** 读一个卷键的 `MaxCapacity`（MB）。 */
+function readCapacityViaReg(volumeKey: string): number | undefined {
+  try {
+    const out = execFileSync('reg', ['query', volumeKey, '/v', 'MaxCapacity'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+    const line = out.split(/\r?\n/).find((l) => l.includes('MaxCapacity'))
+    if (line === undefined) return undefined
+    const parts = line.trim().split(/\s+/)
+    const raw = parts[parts.length - 1] ?? ''
+    const value = raw.startsWith('0x') ? Number.parseInt(raw, 16) : Number(raw)
+    return Number.isFinite(value) ? value : undefined
+  } catch {
+    return undefined
   }
 }

@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { buildRecycleManyScript, parseRecycleManyOutput } from '../src/recycle'
 
 describe('buildRecycleManyScript', () => {
-  it('handles every path in one loop with SendToRecycleBin', () => {
-    const script = buildRecycleManyScript(['C:\\a\\x.txt', 'C:\\b\\y.txt'])
+  it('handles a path list from a file with SendToRecycleBin', () => {
+    const script = buildRecycleManyScript()
 
     expect(script).toContain('SendToRecycleBin')
     // 不弹确认框：模态对话框会把后台进程挂住。
@@ -15,17 +15,12 @@ describe('buildRecycleManyScript', () => {
     expect(script.match(/foreach/g)?.length).toBe(1)
   })
 
-  it('escapes single quotes so a path cannot break out of the string', () => {
-    const script = buildRecycleManyScript(["C:\\b\\o'brien.txt"])
-    expect(script).toContain("o''brien.txt")
-    expect(script).not.toContain("'C:\\b\\o'brien.txt'")
-  })
-
-  it('escapes every path it is given', () => {
-    const script = buildRecycleManyScript(['C:\\a.txt', 'C:\\b.txt', 'C:\\c.txt'])
-    expect(script).toContain("'C:\\a.txt'")
-    expect(script).toContain("'C:\\b.txt'")
-    expect(script).toContain("'C:\\c.txt'")
+  it('reads the list from $listPath instead of inlining paths', () => {
+    const script = buildRecycleManyScript()
+    expect(script).toMatch(/\$listPath/)
+    expect(script).toMatch(/Get-Content/)
+    // 脚本正文不含任何具体路径 —— 命令行长度因此与路径数无关。
+    expect(script).not.toContain('C:\\')
   })
 })
 

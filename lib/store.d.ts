@@ -1,4 +1,4 @@
-import { r as Recycler } from "./recycle-CzS3QCvA.js";
+import { r as Recycler } from "./recycle-BdCSNZGO.js";
 import { n as TargetDescription, r as TrashEntry } from "./types-Da7quFYt.js";
 //#region src/store.d.ts
 /** 移入选项。 */

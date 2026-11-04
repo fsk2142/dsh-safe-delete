@@ -19,6 +19,8 @@ import {
   deletePath,
   describeMoved,
   describeRecycled,
+  approvalFailureText,
+  hardRefusal,
   normalizeDestination,
   type DeleteDestination,
   describePreview,
@@ -30,7 +32,7 @@ import { readCleanupJob, requestCleanup } from './cleanup'
 import { describeTarget } from './describe'
 import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
-import type { Recycler, RecycleManyOutcome } from './recycle'
+import type { PermanentDeleteRisk, Recycler, RecycleManyOutcome } from './recycle'
 import { recycleManyToSystemBin } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
@@ -159,6 +161,12 @@ export interface ToolDeps {
    * 回收站模式下整批交给它一次，而不是每条一次进程。
    */
   recyclerMany?: (absPaths: readonly string[]) => RecycleManyOutcome
+  /**
+   * 预先算好的「删除会被永久执行」风险。
+   *
+   * 由插件入口在 apply 时算一次传进来：命中时删除前必须问人。
+   */
+  permanentDeleteRisk?: PermanentDeleteRisk
   /** 当前时间（测试可注入）。 */
   now?: () => number
 }
@@ -389,6 +397,18 @@ async function deleteMany(
 
   for (const target of paths) {
     const resolved = path.resolve(target)
+    /*
+     * 硬拒绝在批量路径上同样生效（2026-11-04 审查 Important-4）。
+     *
+     * 这两条判定原来只在 `deletePath` 里，批量走的是这里 —— 而回收站分支又
+     * 跳过了 `stageInto` 的自保护。结果 `paths: [stateDir]` 只要一次审批就能
+     * 把安全区自己（旧删除的唯一副本）送进回收站。
+     */
+    const refusal = hardRefusal(resolved, ctx.stateDir)
+    if (refusal !== undefined) {
+      immediatelyRejected.push({ target: resolved, error: refusal })
+      continue
+    }
     if (!existsSync(resolved)) {
       immediatelyRejected.push({ target: resolved, error: 'not found' })
       continue
@@ -472,13 +492,29 @@ async function deleteMany(
     const listed = plans.length > needing.length ? plans : needing
     const sample = listed.slice(0, 5).map((p) => p.target)
     const more = listed.length > sample.length ? `\n  …and ${listed.length - sample.length} more` : ''
+    /*
+     * ## 文案必须按目的地改写（2026-11-04 审查 Important-5）
+     *
+     * 上一版无条件写「全部进安全区，N 天内可用 safe_zone_restore 恢复」。
+     * 回收站模式这是**假的**：不发往安全区，恢复要用系统回收站。
+     * 而这张卡是「一次删几千个」唯一看到的确认，说错代价很大。
+     *
+     * 统计被跳过时也不能报「Total 0 entries, 0 B」—— 那是在谎报目标为空。
+     */
+    const recycleCard = normalizeDestination(ctx.destination) === 'recycle-bin'
+    const statsOmitted = plans.some((p) => p.description.statsOmitted === true)
+    const totalText = statsOmitted ? '' : ` Total ${allFiles} entries, ${humanBytes(allBytes)}.`
+    const outcomeText = recycleCard
+      ? 'Approving covers the whole batch. Everything goes into the system recycle bin — ' +
+        'restore from there; the safe zone will not track these.'
+      : `Approving covers the whole batch. Everything goes into the safe zone and can be restored ` +
+        `with safe_zone_restore for ${ctx.retentionDays} day(s).`
     const text =
-      `Delete ${listed.length} item(s) in one batch? ` +
-      `Total ${allFiles} entries, ${humanBytes(allBytes)}.\n` +
+      `Delete ${listed.length} item(s) in one batch?` +
+      `${totalText}\n` +
       `Why this needs your OK: ${reasons.join('; ')}.\n` +
       `Items:\n  ${sample.join('\n  ')}${more}\n\n` +
-      `Approving covers the whole batch. Everything goes into the safe zone and can be restored ` +
-      `with safe_zone_restore for ${ctx.retentionDays} day(s).`
+      outcomeText
     void totalBytes
     void totalFiles
 
@@ -530,8 +566,25 @@ async function deleteMany(
    * 失败回落安全区（下面的 `moveManyToSafeZone` 照常执行），绝不静默永久删除。
    */
   if (normalizeDestination(ctx.destination) === 'recycle-bin' && plans.length > 0) {
+    /*
+     * 永久删除风险在批量路径上同样要问（2026-11-04 审查 Critical-1 第二层）。
+     *
+     * 只接线 `deletePath` 不够：`deleteMany` 是「一次删几千个」那条路，不经过
+     * `deletePath`，于是策略命中的机器上批量删除依然静默永久删。
+     */
+    if (ctx.permanentDeleteRisk?.risky === true) {
+      const outcome = await ctx.requestApproval(
+        `This delete will PERMANENTLY remove ${plans.length} item(s) — the recycle bin is not in effect.\n\n` +
+          `Reason: ${ctx.permanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}\n\n` +
+          `Approve only if you accept that the data cannot be recovered.`,
+      )
+      if (outcome !== 'allowed-once') {
+        return { ok: false, text: '', error: approvalFailureText(outcome, `${plans.length} item(s)`) }
+      }
+    }
+
     const recycle = ctx.recycler ?? recycleManyToSystemBin
-    const outcome = recycle(plans.map((p) => p.target))
+    const outcome = await recycle(plans.map((p) => p.target))
     if (outcome.ok) {
       const auditRecords: Array<Omit<AuditRecord, 'at'>> = plans.map((p) => ({
         event: 'delete',
@@ -775,6 +828,9 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
          */
         ...(deps.destination === undefined ? {} : { destination: deps.destination }),
         ...(deps.recyclerMany === undefined ? {} : { recycler: deps.recyclerMany }),
+        ...(deps.permanentDeleteRisk === undefined
+          ? {}
+          : { permanentDeleteRisk: deps.permanentDeleteRisk }),
         // 容量层已移除，所以没有容量相关的字段要传。
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
@@ -809,7 +865,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       if (resolvedPaths.length === 1) {
         const result = await deletePath({ ...base, path: resolvedPaths[0] as string }, deleteCtx)
         if (!result.ok) return { ok: false, text: '', error: result.error }
-        if (result.kind === 'preview') return { ok: true, text: describePreview(result, deps.retentionDays) }
+        if (result.kind === 'preview') return { ok: true, text: describePreview(result, deps.retentionDays, normalizeDestination(deps.destination)) }
         if (result.kind === 'recycled') return { ok: true, text: describeRecycled(result) }
         return { ok: true, text: describeMoved(result, deps.retentionDays) }
       }

@@ -88,8 +88,16 @@ describe('safe_delete with paths in recycle-bin mode', () => {
 
     const result = (await tool.execute({ paths: [dir] } as never)) as { text: string }
 
-    // 统计被跳过时不能声称「0 entries」—— 那是在谎报目标为空。
-    expect(result.text).not.toMatch(/\b0 entries\b/)
+    /*
+     * 统计被跳过时必须换成「顶层 N 个条目」的说法。
+     *
+     * 原来只断言 
+ot /0 entries/ —— 那在 stats 开启时也成立（会显示
+     * 「1 entries, 1 B」），等于两种模式都通过，测不出任何东西。
+     * 现在正向断言那个只可能来自跳过统计的措辞。
+     */
+    expect(result.text).toMatch(/top-level entries/)
+    expect(result.text).not.toMatch(/\\d+ entries,/)
   })
 
   it('falls back to the safe zone when the recycler fails', async () => {

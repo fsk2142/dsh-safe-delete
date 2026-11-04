@@ -1,5 +1,5 @@
-import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler } from "./recycle-CzS3QCvA.js";
-import { b as ClassifyEnv, r as DeleteDestination } from "./delete-core-CwAfOTI9.js";
+import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./recycle-BdCSNZGO.js";
+import { C as ClassifyEnv, r as DeleteDestination } from "./delete-core-pYAC2LJG.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -89,6 +89,12 @@ export interface ToolDeps {
    * 回收站模式下整批交给它一次，而不是每条一次进程。
    */
   recyclerMany?: (absPaths: readonly string[]) => RecycleManyOutcome;
+  /**
+   * 预先算好的「删除会被永久执行」风险。
+   *
+   * 由插件入口在 apply 时算一次传进来：命中时删除前必须问人。
+   */
+  permanentDeleteRisk?: PermanentDeleteRisk;
   /** 当前时间（测试可注入）。 */
   now?: () => number;
 }

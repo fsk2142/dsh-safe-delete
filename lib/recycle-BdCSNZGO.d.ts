@@ -42,6 +42,8 @@ type RecycleOutcome = {
 type RecycleManyOutcome = {
   ok: true;
   recycled: number;
+  /** 部分失败时的逐条错误（成功的不受影响）。 */
+  failed?: string[];
 } | {
   ok: false;
   reason: string;

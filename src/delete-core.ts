@@ -21,6 +21,7 @@ import { classifyPath, normalize as normalizeForCompare, requiresApproval, type 
 import { describeTarget } from './describe'
 import { moveToSafeZone } from './store'
 import {
+  detectQuotaRisk,
   recycleManyToSystemBin,
   type PermanentDeleteRisk,
   type RecycleManyOutcome,
@@ -75,7 +76,7 @@ export interface DeleteContext {
    *
    * 真实实现要起 PowerShell 子进程；测试里跑真实回收站既慢又会污染系统回收站。
    */
-  recycler?: (absPaths: readonly string[]) => RecycleManyOutcome
+  recycler?: (absPaths: readonly string[]) => RecycleManyOutcome | Promise<RecycleManyOutcome>
   /**
    * 预先算好的「删除会被永久执行」风险。
    *
@@ -145,7 +146,7 @@ export type DeleteResult =
     }
 
 /** 驱动盘根判定。 */
-function isDriveRoot(p: string): boolean {
+export function isDriveRoot(p: string): boolean {
   const resolved = path.resolve(p)
   return path.parse(resolved).root === resolved
 }
@@ -166,7 +167,7 @@ function isDriveRoot(p: string): boolean {
  * @param stateDir 安全区目录。
  * @returns 在安全区内返回 true。
  */
-function isInsideStateDir(target: string, stateDir: string): boolean {
+export function isInsideStateDir(target: string, stateDir: string): boolean {
   const state = normalizeForCompare(stateDir)
   const t = normalizeForCompare(target)
   return t === state || t.startsWith(state + path.sep)
@@ -335,12 +336,8 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
   const target = path.resolve(raw)
 
   // 1. 禁区：盘符根、安全区自身。
-  if (isDriveRoot(target)) {
-    return { ok: false, error: `refusing to trash a filesystem root "${target}"` }
-  }
-  if (isInsideStateDir(target, ctx.stateDir)) {
-    return { ok: false, error: `refusing to delete "${target}": it is the safe zone's own state directory` }
-  }
+  const refusal = hardRefusal(target, ctx.stateDir)
+  if (refusal !== undefined) return { ok: false, error: refusal }
 
   // 2. 存在性。
   if (!existsSync(target)) return { ok: false, target, error: `not found: ${target}` }
@@ -372,15 +369,26 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
    * 关键设计：**不为此额外弹一次审批**。它只并入下面那一次确认，
    * 或者在没有其它风险时也不打扰 —— 用户明确要求"除非超限或有预警，别随时弹"。
    */
-  const forecast = await forecastSpace(
-    description,
-    {
-      stateDir: ctx.stateDir,
-      ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
-    },
-    target,
-  )
-  const risks = describeSpaceRisks(forecast)
+  /*
+   * ## 回收站模式不做空间预估（2026-11-04 审查 Important-6）
+   *
+   * 空间预估回答的是「搬进安全区会不会放不下」。回收站模式**不搬进安全区**，
+   * 于是这个判断全是假的：stateDir 在 C、目标在 D 时 `blockedByPolicy` 为真，
+   * 每条删除都会多问一次「这次移动会被拒绝」—— 而实际什么都没移动。
+   *
+   * 回收站模式因此跳过整段预估与风险提示。
+   */
+  const forecast = recycleMode
+    ? undefined
+    : await forecastSpace(
+        description,
+        {
+          stateDir: ctx.stateDir,
+          ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+        },
+        target,
+      )
+  const risks = forecast === undefined ? [] : describeSpaceRisks(forecast)
 
   /*
    * 只有"目标盘真的放不下"才**拒绝**；其余风险只是告知，随确认卡一起给出。
@@ -388,7 +396,7 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
    * 判断必须用结构化字段（`forecast.copyWillNotFit`），不能去匹配文案里的
    * 关键词 —— 那会在改一句话之后悄悄失效。
    */
-  if (forecast.copyWillNotFit) {
+  if (forecast?.copyWillNotFit === true) {
     const free = forecast.freeBytes === undefined ? 'less than needed' : humanBytes(forecast.freeBytes)
     return {
       ok: false,
@@ -438,8 +446,25 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
       }
     }
 
+    /*
+     * 单文件超过回收站上限时 Windows 会**永久删除并返回成功**（Important-9）。
+     * 只能事前问：目录刻意不量（回收站模式跳过统计），只判单文件。
+     */
+    if (description.isDirectory === false) {
+      const quotaRisk = detectQuotaRisk(description.bytes)
+      if (quotaRisk !== undefined) {
+        const outcome = await ctx.requestApproval(
+          `This delete will PERMANENTLY remove ${target} — ${quotaRisk}.\n\n` +
+            `Approve only if you accept that the data cannot be recovered.`,
+        )
+        if (outcome !== 'allowed-once') {
+          return { ok: false, target, error: approvalFailureText(outcome, target) }
+        }
+      }
+    }
+
     const recycler = ctx.recycler ?? recycleManyToSystemBin
-    const recycled = recycler([target])
+    const recycled = await recycler([target])
     if (recycled.ok) {
       appendAudit(ctx.stateDir, {
         event: 'delete',
@@ -470,8 +495,16 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     ...(reason === undefined ? {} : { reason }),
     /*
      * 把已经算好的描述传下去：`stageInto` 就不必再遍历一遍整棵树。
+     *
+     * ## 但统计被跳过的那份不能传（2026-11-04 审查 Important-8）
+     *
+     * 回收站模式用的 `description` 里 `bytes`/`fileCount` 是 0（没数）。
+     * 一旦回落到安全区，条目就真的**进了**安全区 —— 此时把 0 写进索引，
+     * 状态页会显示「0 条目 0 B」，prune 与容量判断也会低估。
+     *
+     * 所以只有统计完整的描述才往下传；被跳过时让 `stageInto` 自己量。
      */
-    description,
+    ...(description.statsOmitted === true ? {} : { description }),
   })
 
   appendAudit(ctx.stateDir, {
@@ -591,12 +624,24 @@ function moreText(d: TargetDescription): string {
  * @returns 人看的尺寸描述。
  */
 function sizeText(d: TargetDescription): string {
-  if (d.statsOmitted === true) return `${d.topEntries.length}+ top-level entries`
+  if (d.statsOmitted === true) {
+    /*
+     * 不写 `N+`：`topEntries` 明确截断到 20 条，所以 N 是**已知**的
+     * 顶层条目数（与上限的较小值）。写成 `3+` 会把一个确切数字说成下界。
+     */
+    return d.truncated
+      ? `${d.topEntries.length}+ top-level entries`
+      : `${d.topEntries.length} top-level entries`
+  }
   return d.isDirectory ? `${d.fileCount} entries, ${humanBytes(d.bytes)}` : `file, ${humanBytes(d.bytes)}`
 }
 
 /** 把预览结论拼成人看的文本。 */
-export function describePreview(result: Extract<DeleteResult, { kind: 'preview' }>, retentionDays: number): string {
+export function describePreview(
+  result: Extract<DeleteResult, { kind: 'preview' }>,
+  retentionDays: number,
+  destination: DeleteDestination = 'safe-zone',
+): string {
   const d = result.description
   const top =
     d.topEntries.length > 0
@@ -607,7 +652,13 @@ export function describePreview(result: Extract<DeleteResult, { kind: 'preview' 
     `${d.isDirectory ? 'directory' : 'file'}: ${sizeText(d)}${top}\n\n` +
     `classification: ${result.gate.classification}` +
     (result.gate.needsApproval ? ` — will need your approval (${result.gate.reasons.join('; ')})` : ' — moves without asking') +
-    `\nretention: ${retentionDays} days`
+    /*
+     * 括号是必须的：`+` 比 `?:` 结合得更紧。不加括号时整个前半段会被当成
+     * 条件表达式的一部分，返回的就只剩末行。
+     */
+    (destination === 'recycle-bin'
+      ? '\nwill go into the system recycle bin — restore from there; the safe zone will not track it'
+      : `\nretention: ${retentionDays} days`)
   )
 }
 
@@ -661,4 +712,27 @@ export function describeRecycled(
     `  Restore it from the recycle bin itself — this deletion is not tracked in the safe zone, ` +
     `so safe_zone_restore cannot bring it back.`
   )
+}
+
+/**
+ * 硬拒绝：这些目标**永远**不许删，批量路径也一样。
+ *
+ * ## 为什么必须共享（2026-11-04 审查 Important-4）
+ *
+ * 这两条判定原来只写在 `deletePath` 里。批量删除走 `deleteMany`，它两条都没有；
+ * 而回收站分支又跳过了 `stageInto` 自带的自保护（那里也会拒绝安全区自身）。
+ *
+ * 于是 `paths: [stateDir]` 在改前被逐条拒绝，改后只要一次审批就能把**安全区
+ * 自己**（旧删除的唯一副本）送进回收站 —— 数据丢失级别的回归。
+ *
+ * @param target 已 resolve 的目标路径。
+ * @param stateDir 安全区根目录。
+ * @returns 拒绝原因；可以删时返回 `undefined`。
+ */
+export function hardRefusal(target: string, stateDir: string): string | undefined {
+  if (isDriveRoot(target)) return `refusing to trash a filesystem root "${target}"`
+  if (isInsideStateDir(target, stateDir)) {
+    return `refusing to delete "${target}": it is the safe zone's own state directory`
+  }
+  return undefined
 }

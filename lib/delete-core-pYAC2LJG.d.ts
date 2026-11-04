@@ -1,4 +1,4 @@
-import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle-CzS3QCvA.js";
+import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle-BdCSNZGO.js";
 import { n as TargetDescription, r as TrashEntry, t as Classification } from "./types-Da7quFYt.js";
 //#region src/classify.d.ts
 /** 分类所需的路径事实。 */
@@ -68,7 +68,7 @@ interface DeleteContext {
    *
    * 真实实现要起 PowerShell 子进程；测试里跑真实回收站既慢又会污染系统回收站。
    */
-  recycler?: (absPaths: readonly string[]) => RecycleManyOutcome;
+  recycler?: (absPaths: readonly string[]) => RecycleManyOutcome | Promise<RecycleManyOutcome>;
   /**
    * 预先算好的「删除会被永久执行」风险。
    *
@@ -135,6 +135,25 @@ type DeleteResult = {
   description: TargetDescription;
   gate: GateDecision;
 };
+/** 驱动盘根判定。 */
+declare function isDriveRoot(p: string): boolean;
+/**
+ * 判断目标是否落在安全区自己的状态目录里。
+ *
+ * ## 大小写必须归一化（2026-11-01 审查 SD-06）
+ *
+ * Windows 上 `C:\X\STATE` 与 `C:\X\state` 是同一个目录，而 `startsWith`
+ * 区分大小写。第一版直接比较，于是大写写法能把"目标是安全区自己"
+ * 判成 false —— 自保护被绕过。
+ *
+ * 复用 `classify.ts` 里已有的归一化（那里早就是这么做的），
+ * 避免两处规则漂移。
+ *
+ * @param target 待判定路径。
+ * @param stateDir 安全区目录。
+ * @returns 在安全区内返回 true。
+ */
+declare function isInsideStateDir(target: string, stateDir: string): boolean;
 /**
  * 判定这一步要不要人确认，以及为什么。
  *
@@ -244,7 +263,7 @@ declare function humanBytes(bytes: number): string;
 /** 把预览结论拼成人看的文本。 */
 declare function describePreview(result: Extract<DeleteResult, {
   kind: 'preview';
-}>, retentionDays: number): string;
+}>, retentionDays: number, destination?: DeleteDestination): string;
 /** 把移动结论拼成人看的文本。 */
 declare function describeMoved(result: Extract<DeleteResult, {
   kind: 'moved';
@@ -262,5 +281,21 @@ declare function describeMoved(result: Extract<DeleteResult, {
 declare function describeRecycled(result: Extract<DeleteResult, {
   kind: 'recycled';
 }>): string;
+/**
+ * 硬拒绝：这些目标**永远**不许删，批量路径也一样。
+ *
+ * ## 为什么必须共享（2026-11-04 审查 Important-4）
+ *
+ * 这两条判定原来只写在 `deletePath` 里。批量删除走 `deleteMany`，它两条都没有；
+ * 而回收站分支又跳过了 `stageInto` 自带的自保护（那里也会拒绝安全区自身）。
+ *
+ * 于是 `paths: [stateDir]` 在改前被逐条拒绝，改后只要一次审批就能把**安全区
+ * 自己**（旧删除的唯一副本）送进回收站 —— 数据丢失级别的回归。
+ *
+ * @param target 已 resolve 的目标路径。
+ * @param stateDir 安全区根目录。
+ * @returns 拒绝原因；可以删时返回 `undefined`。
+ */
+declare function hardRefusal(target: string, stateDir: string): string | undefined;
 //#endregion
-export { forecastSpace as _, DeleteResult as a, ClassifyEnv as b, approvalFailureText as c, deletePath as d, describeApprovalRequest as f, describeSpaceRisks as g, describeRecycled as h, DeleteRequest as i, boundReason as l, describePreview as m, DeleteContext as n, GateDecision as o, describeMoved as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, decideGate as u, humanBytes as v, normalizeDestination as y };
+export { ClassifyEnv as C, normalizeDestination as S, forecastSpace as _, DeleteResult as a, isDriveRoot as b, approvalFailureText as c, deletePath as d, describeApprovalRequest as f, describeSpaceRisks as g, describeRecycled as h, DeleteRequest as i, boundReason as l, describePreview as m, DeleteContext as n, GateDecision as o, describeMoved as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, decideGate as u, hardRefusal as v, isInsideStateDir as x, humanBytes as y };

@@ -1,4 +1,4 @@
-import { r as Recycler } from "./recycle-CzS3QCvA.js";
+import { r as Recycler } from "./recycle-BdCSNZGO.js";
 //#region src/cleanup-run.d.ts
 /** worker 的执行结果。 */
 export interface WorkerResult {
