@@ -20,6 +20,11 @@ import { appendAudit } from './audit'
 import { classifyPath, normalize as normalizeForCompare, requiresApproval, type ClassifyEnv } from './classify'
 import { describeTarget } from './describe'
 import { moveToSafeZone } from './store'
+import {
+  recycleManyToSystemBin,
+  type PermanentDeleteRisk,
+  type RecycleManyOutcome,
+} from './recycle'
 import type { Classification, TargetDescription, TrashEntry } from './types'
 
 /** 删除请求。 */
@@ -56,6 +61,27 @@ export interface DeleteContext {
    * 毫无效果，跨卷删除永远以 different volumes 拒绝 —— 一个只在文档里存在的开关。
    */
   crossVolumeCopy?: boolean
+  /**
+   * 删除去向。
+   *
+   * - `safe-zone`（默认）：移入安全区，保留期内可用 `safe_zone_restore` 取回；
+   * - `recycle-bin`：直接交给系统回收站，保留原始路径，不做全树统计。
+   *
+   * 缺省按 `safe-zone` 处理（旧调用方不受影响）。
+   */
+  destination?: DeleteDestination
+  /**
+   * 批量交给回收站的实现（测试可注入）。
+   *
+   * 真实实现要起 PowerShell 子进程；测试里跑真实回收站既慢又会污染系统回收站。
+   */
+  recycler?: (absPaths: readonly string[]) => RecycleManyOutcome
+  /**
+   * 预先算好的「删除会被永久执行」风险。
+   *
+   * 命中时**先问人**，用户不同意就放弃本次删除 —— 绝不静默永久删除。
+   */
+  permanentDeleteRisk?: PermanentDeleteRisk
   /** 需要人工确认时调用；返回是否放行。 */
   requestApproval: (reason: string) => Promise<ApprovalOutcome>
   /** 当前时间（测试可注入）。 */
@@ -75,6 +101,22 @@ export interface GateDecision {
   reasons: string[]
 }
 
+/** 删除去向。 */
+export type DeleteDestination = 'safe-zone' | 'recycle-bin'
+
+/**
+ * 把配置里的原始值净化为合法去向。
+ *
+ * 旧配置、手改配置、拼错的字符串都会落到 `undefined` —— 一律按安全区处理，
+ * 因为那是「删除可反悔」的那一条路。
+ *
+ * @param raw 配置里的原始值。
+ * @returns 合法去向。
+ */
+export function normalizeDestination(raw: unknown): DeleteDestination {
+  return raw === 'recycle-bin' ? 'recycle-bin' : 'safe-zone'
+}
+
 /** 删除结果。 */
 export type DeleteResult =
   | { ok: true; kind: 'preview'; target: string; description: TargetDescription; gate: GateDecision }
@@ -87,6 +129,19 @@ export type DeleteResult =
       description: TargetDescription
       gate: GateDecision
       pruned: TrashEntry[]
+    }
+  | {
+      /**
+       * 直接送进了系统回收站。
+       *
+       * 没有 `entry`：安全区索引里没有它的记录，取回要用系统回收站，
+       * 而不是 `safe_zone_restore`。
+       */
+      ok: true
+      kind: 'recycled'
+      target: string
+      description: TargetDescription
+      gate: GateDecision
     }
 
 /** 驱动盘根判定。 */
@@ -291,7 +346,12 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
   if (!existsSync(target)) return { ok: false, target, error: `not found: ${target}` }
 
   // 3. 描述。
-  const description = describeTarget(target)
+  /*
+   * 回收站模式跳过目录的全树统计（`stats: false`）：那是删除路径上唯一
+   * 与文件数成正比的成本，而该模式不做按大小的确认，也不需要那两个数字。
+   */
+  const recycleMode = normalizeDestination(ctx.destination) === 'recycle-bin'
+  const description = describeTarget(target, recycleMode ? { stats: false } : {})
   const gate = decideGate(target, description, ctx)
 
   // 4. 预览：只说不做。
@@ -355,11 +415,63 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
    * 全量的（见 `boundReason` 的注释）。
    */
   const reason = boundReason(request.reason)
+
+  /*
+   * ## 目的地分支（2026-11-04）
+   *
+   * 回收站模式：直接把**真实路径**交给系统回收站，不建安全区条目 ——
+   * 因此回收站里记录的是原位置，还原能回到删除的地方。
+   *
+   * 两条硬规则：
+   *   1. 检测到「删除会被永久执行」时**先问人**，不同意就整个放弃；
+   *   2. 回收失败**回落安全区**，绝不静默永久删除。
+   */
+  if (normalizeDestination(ctx.destination) === 'recycle-bin') {
+    if (ctx.permanentDeleteRisk?.risky === true) {
+      const outcome = await ctx.requestApproval(
+        `This delete will PERMANENTLY remove ${target} — the recycle bin is not in effect.\n\n` +
+          `Reason: ${ctx.permanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}\n\n` +
+          `Approve only if you accept that the data cannot be recovered.`,
+      )
+      if (outcome !== 'allowed-once') {
+        return { ok: false, target, error: approvalFailureText(outcome, target) }
+      }
+    }
+
+    const recycler = ctx.recycler ?? recycleManyToSystemBin
+    const recycled = recycler([target])
+    if (recycled.ok) {
+      appendAudit(ctx.stateDir, {
+        event: 'delete',
+        target,
+        tool: 'safe_delete',
+        detail: `destination=recycle-bin cls=${gate.classification}${reason === undefined ? '' : ` reason=${reason}`}`,
+      })
+      return { ok: true, kind: 'recycled', target, description, gate }
+    }
+
+    /*
+     * 回落：回收站不可用（熔断 / 平台不支持 / 本次失败）。
+     *
+     * 审计里记下原因，这样用户能看到「本想进回收站，结果进了安全区」。
+     */
+    appendAudit(ctx.stateDir, {
+      event: 'delete',
+      target,
+      tool: 'safe_delete',
+      detail: `destination=recycle-bin fell back to safe zone: ${recycled.reason}`,
+    })
+  }
+
   const entry = await moveToSafeZone(ctx.stateDir, target, {
     retentionDays: ctx.retentionDays,
     now: ctx.now(),
     ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
     ...(reason === undefined ? {} : { reason }),
+    /*
+     * 把已经算好的描述传下去：`stageInto` 就不必再遍历一遍整棵树。
+     */
+    description,
   })
 
   appendAudit(ctx.stateDir, {
@@ -522,5 +634,31 @@ export function describeMoved(result: Extract<DeleteResult, { kind: 'moved' }>, 
     (result.pruned.length > 0
       ? `\n  pruned ${result.pruned.length} expired/over-cap entr${result.pruned.length === 1 ? 'y' : 'ies'}`
       : '')
+  )
+}
+
+/**
+ * 把「直接进回收站」的结论拼成人看的文本。
+ *
+ * 与 `describeMoved` 的关键差别：**没有条目 id**，因为安全区索引里没有它 ——
+ * 取回要去系统回收站，不是 `safe_zone_restore`。这一点必须写明，否则模型会
+ * 编一个 id 去调恢复工具。
+ *
+ * @param result 删除结果。
+ * @returns 人看的文本。
+ */
+export function describeRecycled(
+  result: Extract<DeleteResult, { kind: 'recycled' }>,
+): string {
+  const d = result.description
+  const top =
+    d.topEntries.length > 0
+      ? `\n  ${d.topEntries.slice(0, 10).join('\n  ')}${d.truncated ? moreText(d) : ''}`
+      : ''
+  return (
+    `moved to the system recycle bin: ${result.target}\n` +
+    `  ${d.isDirectory ? 'directory' : 'file'}: ${sizeText(d)}${top}\n` +
+    `  Restore it from the recycle bin itself — this deletion is not tracked in the safe zone, ` +
+    `so safe_zone_restore cannot bring it back.`
   )
 }

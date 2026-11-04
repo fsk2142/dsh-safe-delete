@@ -28,7 +28,7 @@ import { isUnresolvableTarget, parseCommand } from './command'
 import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
-import { decideGate, deletePath, describeMoved, describePreview, humanBytes } from './delete-core'
+import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes } from './delete-core'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
@@ -759,7 +759,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       if (!result.ok) return { ok: false, text: result.error }
       return {
         ok: true,
-        text: result.kind === 'preview' ? describePreview(result, retentionDays) : describeMoved(result, retentionDays),
+        text:
+          result.kind === 'preview'
+            ? describePreview(result, retentionDays)
+            : result.kind === 'recycled'
+              ? describeRecycled(result)
+              : describeMoved(result, retentionDays),
       }
     },
     listSafeZone: async () => listSafeZone(stateDir),

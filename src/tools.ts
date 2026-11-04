@@ -18,6 +18,7 @@ import {
   decideGate,
   deletePath,
   describeMoved,
+  describeRecycled,
   describePreview,
   humanBytes,
   type DeleteContext,
@@ -737,9 +738,9 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       if (resolvedPaths.length === 1) {
         const result = await deletePath({ ...base, path: resolvedPaths[0] as string }, deleteCtx)
         if (!result.ok) return { ok: false, text: '', error: result.error }
-        return result.kind === 'preview'
-          ? { ok: true, text: describePreview(result, deps.retentionDays) }
-          : { ok: true, text: describeMoved(result, deps.retentionDays) }
+        if (result.kind === 'preview') return { ok: true, text: describePreview(result, deps.retentionDays) }
+        if (result.kind === 'recycled') return { ok: true, text: describeRecycled(result) }
+        return { ok: true, text: describeMoved(result, deps.retentionDays) }
       }
 
       // 多路径：合并成一次审批，批量执行（索引只写一次），汇总结果。

@@ -66,6 +66,34 @@ export const Config = z.object({
    */
   autoPrune: z.boolean().default(true).volatile(),
 
+  /**
+   * 删除去向。
+   *
+   * ## 两种模式的取舍（2026-11-04）
+   *
+   * | | `safe-zone`（默认） | `recycle-bin` |
+   * |---|---|---|
+   * | 目录全树统计 | 做 | **不做** |
+   * | 卡片显示 | 共 N 个文件 / X MB | 顶层 N 个条目 |
+   * | `confirmFileCount` / `confirmBytes` | 生效 | **不生效** |
+   * | 大量删除速度 | 与文件数成正比 | 与文件数无关 |
+   * | 恢复方式 | 插件内按条目恢复 | 系统回收站，保留原路径 |
+   *
+   * 回收站模式跳过统计是为了速度：统计要递归遍历整棵树，且发生在审批卡片
+   * 出现**之前**。代价是「删太多先问一次」那两道阈值失去数据来源。
+   *
+   * 未知值一律按 `safe-zone` 处理（见 `normalizeDestination`）—— 那是
+   * 「删除可反悔」的那条路。
+   */
+  /*
+   * 用 `union` + `const` 而不是 `enum`：本仓库用的 schemastery 版本没有
+   * `z.enum`（类型上就没有这个方法），而 `union`/`const` 是它支持的。
+   */
+  deleteDestination: z
+    .union([z.const('safe-zone'), z.const('recycle-bin')])
+    .default('safe-zone')
+    .volatile(),
+
   /** 单次删除的条目数阈值；超过就额外确认一次。0 表示不启用。 */
   confirmFileCount: z.number().default(5000).volatile(),
 
