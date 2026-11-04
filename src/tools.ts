@@ -33,6 +33,7 @@ import { describeTarget } from './describe'
 import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
 import type { PermanentDeleteRisk, Recycler, RecycleManyOutcome } from './recycle'
+import { detectQuotaRisk } from './recycle'
 import { recycleManyToSystemBin } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
@@ -580,6 +581,28 @@ async function deleteMany(
       )
       if (outcome !== 'allowed-once') {
         return { ok: false, text: '', error: approvalFailureText(outcome, `${plans.length} item(s)`) }
+      }
+    }
+
+    /*
+     * 配额风险在批量路径上同样要问（2026-11-04 自检）。
+     *
+     * 上一版只接在 `deletePath` 里，批量删一个超大文件会静默永久删除。
+     * 只判单个文件：目录的递归大小在这个模式下刻意不统计。
+     */
+    const oversized = plans.filter(
+      (p) => p.description.isDirectory === false && detectQuotaRisk(p.description.bytes) !== undefined,
+    )
+    if (oversized.length > 0) {
+      const sample = oversized.slice(0, 3).map((p) => p.target)
+      const rest = oversized.length > sample.length ? ` (+${oversized.length - sample.length} more)` : ''
+      const outcome = await ctx.requestApproval(
+        `This delete will PERMANENTLY remove ${oversized.length} file(s) larger than the recycle bin's limit.\n\n` +
+          `Files: ${sample.join(', ')}${rest}\n\n` +
+          `Approve only if you accept that they cannot be recovered.`,
+      )
+      if (outcome !== 'allowed-once') {
+        return { ok: false, text: '', error: approvalFailureText(outcome, `${oversized.length} oversized file(s)`) }
       }
     }
 

@@ -349,7 +349,20 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
    */
   const recycleMode = normalizeDestination(ctx.destination) === 'recycle-bin'
   const description = describeTarget(target, recycleMode ? { stats: false } : {})
-  const gate = decideGate(target, description, ctx)
+  /*
+   * ## 回收站模式下两个阈值都失效（2026-11-04 自检）
+   *
+   * 用户明确选了「不统计换速度」，而这两个阈值依赖统计结果。目录的
+   * `fileCount` 是 0 时阈值自然不触发，但**单文件**的 `bytes` 是真实值 ——
+   * 于是删一个大文件仍会问「超过大小上限」，与约定不符。
+   *
+   * 传 0 等于关闭这两个阈值；`classifyPath` 的保护区判定不受影响。
+   */
+  const gate = decideGate(
+    target,
+    description,
+    recycleMode ? { ...ctx, confirmFileCount: 0, confirmBytes: 0 } : ctx,
+  )
 
   // 4. 预览：只说不做。
   if (request.preview === true) {
