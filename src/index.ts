@@ -28,7 +28,7 @@ import { isUnresolvableTarget, parseCommand } from './command'
 import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
-import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes } from './delete-core'
+import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
@@ -505,10 +505,16 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         return { kind: 'ask', reason: text }
       }
 
+      /*
+       * 目的地要在描述目标**之前**算好：它决定要不要做全树统计。
+       */
+      const hookDestination = normalizeDestination(unwrap(raw['deleteDestination']))
+
       const plan = (() => {
         try {
           let fileCount = 0
           let bytes = 0
+          let statsOmitted = false
           const dangerousPaths: string[] = []
           const dangerousReasons: string[] = []
           const resolved: string[] = []
@@ -519,7 +525,15 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             // 不要用 description.exists 做门控：路径危险度与目标存不存在无关。
             // 删除一个不存在的家目录路径也该先问人（而且 deletePath 会在
             // 存在性检查后直接报 not found，根本走不到审批）。
-            const description = describeTarget(target)
+            /*
+             * 回收站模式跳过全树统计：这是审批卡片出现前唯一的 O(文件数) 成本，
+             * 而该模式不做按大小的确认（见 deleteDestination 的配置说明）。
+             */
+            const description = describeTarget(
+              target,
+              hookDestination === 'recycle-bin' ? { stats: false } : {},
+            )
+            if (description.statsOmitted === true) statsOmitted = true
             fileCount += description.fileCount
             bytes += description.bytes
             const gate = decideGate(target, description, {
@@ -544,7 +558,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             reasons.push(`${bytes} bytes in this batch exceeds the limit of ${bytesLimit}`)
           }
 
-          return { resolved, fileCount, bytes, reasons, needsApproval: reasons.length > 0 }
+          return { resolved, fileCount, bytes, reasons, statsOmitted, needsApproval: reasons.length > 0 }
         } catch {
           return undefined
         }
@@ -567,17 +581,35 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       const more = plan.resolved.length > shown.length ? ` (+${plan.resolved.length - shown.length} more)` : ''
       const listText = shown.map((p) => `"${p}"`).join(', ') + more
       const subject = isBatch ? `${plan.resolved.length} item(s): ${listText}` : `"${plan.resolved[0] as string}"`
-      const sizeText = ` Total ${plan.fileCount} entries, ${plan.bytes} bytes.`
+      const destination = hookDestination
+      const reason = buildInterceptReason({
+        resolved: plan.resolved,
+        fileCount: plan.fileCount,
+        bytes: plan.bytes,
+        reasons: plan.reasons,
+        retentionDays,
+        destination,
+        statsOmitted: plan.statsOmitted === true,
+      })
 
       return {
         kind: 'ask',
-        reason:
-          `Delete ${subject}?${sizeText} ` +
-          `Why this needs your OK: ${plan.reasons.join('; ')}. ` +
-          `It will be moved into the safe zone and can be restored for ${retentionDays} days.`,
+        reason,
         displayReason: {
-          en: `Delete ${subject}? ${plan.reasons.join('; ')}. Moves into the safe zone, restorable for ${retentionDays} days.`,
-          zh: `删除${isBatch ? `这 ${plan.resolved.length} 项` : ''}${subject}？${plan.reasons.join('；')}。会移入安全区，${retentionDays} 天内可以取回。`,
+          en: buildInterceptReason({
+            resolved: plan.resolved,
+            fileCount: plan.fileCount,
+            bytes: plan.bytes,
+            reasons: plan.reasons,
+            retentionDays,
+            destination,
+            statsOmitted: plan.statsOmitted === true,
+            english: true,
+          }),
+          zh:
+            destination === 'recycle-bin'
+              ? `删除${isBatch ? `这 ${plan.resolved.length} 项` : ''}${subject}？${plan.reasons.join('；')}。会直接移入系统回收站，取回要用回收站本身。`
+              : `删除${isBatch ? `这 ${plan.resolved.length} 项` : ''}${subject}？${plan.reasons.join('；')}。会移入安全区，${retentionDays} 天内可以取回。`,
         },
       }
     }
@@ -1169,4 +1201,48 @@ async function maybeRunRequestedClean(
       /* logger 也不可用就算了 */
     }
   }
+}
+
+/**
+ * 拼审批卡片上的那句「删除后会发生什么」。
+ *
+ * ## 为什么要按目的地改写（2026-11-04）
+ *
+ * 旧文案硬编码「移入安全区，N 天内可恢复」。回收站模式下这是**假的**：
+ * 文件不进安全区，`safe_zone_restore` 也找不回它，取回要去系统回收站。
+ * 承诺与实际不符比不说更糟 —— 用户会照着一个错误的心智去决策。
+ *
+ * 统计被跳过时同样不能报「共 N 个文件」：那个数字是 0，报出来就是谎报目标为空。
+ *
+ * @param input 目标、统计值、理由与目的地。
+ * @returns 审批文案。
+ */
+export function buildInterceptReason(input: {
+  resolved: readonly string[]
+  fileCount: number
+  bytes: number
+  reasons: readonly string[]
+  retentionDays: number
+  destination: DeleteDestination
+  statsOmitted?: boolean
+  /** 输出英文版（`displayReason.en` 用）。 */
+  english?: boolean
+}): string {
+  const isBatch = input.resolved.length > 1
+  const shown = input.resolved.slice(0, 5)
+  const more = input.resolved.length > shown.length ? ` (+${input.resolved.length - shown.length} more)` : ''
+  const listText = shown.map((p) => `"${p}"`).join(', ') + more
+  const subject = isBatch ? `${input.resolved.length} item(s): ${listText}` : `"${input.resolved[0] as string}"`
+
+  const sizeText = input.statsOmitted === true ? '' : ` Total ${input.fileCount} entries, ${input.bytes} bytes.`
+  const why = `Why this needs your OK: ${input.reasons.join('; ')}.`
+  const outcome =
+    input.destination === 'recycle-bin'
+      ? 'It will be moved into the system recycle bin — restore it from there, the safe zone will not track it.'
+      : `It will be moved into the safe zone and can be restored for ${input.retentionDays} days.`
+
+  if (input.english === true) {
+    return `Delete ${subject}? ${input.reasons.join('; ')}. ${outcome}`
+  }
+  return `Delete ${subject}?${sizeText} ${why} ${outcome}`
 }
