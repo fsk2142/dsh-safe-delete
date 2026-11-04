@@ -34,6 +34,21 @@ type RecycleOutcome = {
   unsupported?: boolean;
 };
 /**
+ * 批量移入回收站的结果。
+ *
+ * 与单条版本的区别是带 `recycled` 计数：一批里可能部分成功，调用方要能
+ * 说清「几个进去了、几个没进去」，而不是笼统报失败。
+ */
+type RecycleManyOutcome = {
+  ok: true;
+  recycled: number;
+} | {
+  ok: false;
+  reason: string;
+  recycled: number;
+  unsupported?: boolean;
+};
+/**
  * 可替换的回收站实现。
  *
  * 为什么允许注入：真实实现要起 PowerShell / osascript 子进程，一次几百毫秒到几秒。
@@ -48,5 +63,20 @@ type Recycler = (absPath: string) => RecycleOutcome;
  * @returns 结果；失败时带原因，调用方**不可**据此永久删除。
  */
 declare function moveToSystemRecycleBin(absPath: string): RecycleOutcome;
+/**
+ * 系统是否被配置成「删除即永久删除」。
+ *
+ * ## 为什么必须检测（2026-11-04）
+ *
+ * Windows 的回收站可以被策略关掉：`NoRecycleFiles` 为 1 时，Shell 的删除
+ * 动词**直接永久删除并返回成功**。对一个承诺「删除可反悔」的插件，这是最坏的
+ * 情形 —— 用户以为进了回收站，其实没有了。
+ *
+ * 命中时调用方必须**先问人**，用户不同意就放弃这次删除。
+ */
+type PermanentDeleteRisk = {
+  risky: boolean;
+  reason?: string;
+};
 //#endregion
-export { moveToSystemRecycleBin as n, Recycler as t };
+export { moveToSystemRecycleBin as i, RecycleManyOutcome as n, Recycler as r, PermanentDeleteRisk as t };

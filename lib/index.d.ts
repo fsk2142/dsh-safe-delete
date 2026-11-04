@@ -1,3 +1,4 @@
+import { r as DeleteDestination } from "./delete-core-CwAfOTI9.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**
@@ -28,6 +29,26 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
    * 默认开。
    */
   autoPrune: z<boolean, boolean, "volatile-defined">;
+  /**
+   * 删除去向。
+   *
+   * ## 两种模式的取舍（2026-11-04）
+   *
+   * | | `safe-zone`（默认） | `recycle-bin` |
+   * |---|---|---|
+   * | 目录全树统计 | 做 | **不做** |
+   * | 卡片显示 | 共 N 个文件 / X MB | 顶层 N 个条目 |
+   * | `confirmFileCount` / `confirmBytes` | 生效 | **不生效** |
+   * | 大量删除速度 | 与文件数成正比 | 与文件数无关 |
+   * | 恢复方式 | 插件内按条目恢复 | 系统回收站，保留原路径 |
+   *
+   * 回收站模式跳过统计是为了速度：统计要递归遍历整棵树，且发生在审批卡片
+   * 出现**之前**。代价是「删太多先问一次」那两道阈值失去数据来源。
+   *
+   * 未知值一律按 `safe-zone` 处理（见 `normalizeDestination`）—— 那是
+   * 「删除可反悔」的那条路。
+   */
+  deleteDestination: z<"safe-zone" | "recycle-bin", "safe-zone" | "recycle-bin", "volatile-defined">;
   /** 单次删除的条目数阈值；超过就额外确认一次。0 表示不启用。 */
   confirmFileCount: z<number, number, "volatile-defined">;
   /** 单次删除的字节数阈值；超过就额外确认一次。0 表示不启用。 */
@@ -85,6 +106,26 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
    * 默认开。
    */
   autoPrune: z<boolean, boolean, "volatile-defined">;
+  /**
+   * 删除去向。
+   *
+   * ## 两种模式的取舍（2026-11-04）
+   *
+   * | | `safe-zone`（默认） | `recycle-bin` |
+   * |---|---|---|
+   * | 目录全树统计 | 做 | **不做** |
+   * | 卡片显示 | 共 N 个文件 / X MB | 顶层 N 个条目 |
+   * | `confirmFileCount` / `confirmBytes` | 生效 | **不生效** |
+   * | 大量删除速度 | 与文件数成正比 | 与文件数无关 |
+   * | 恢复方式 | 插件内按条目恢复 | 系统回收站，保留原路径 |
+   *
+   * 回收站模式跳过统计是为了速度：统计要递归遍历整棵树，且发生在审批卡片
+   * 出现**之前**。代价是「删太多先问一次」那两道阈值失去数据来源。
+   *
+   * 未知值一律按 `safe-zone` 处理（见 `normalizeDestination`）—— 那是
+   * 「删除可反悔」的那条路。
+   */
+  deleteDestination: z<"safe-zone" | "recycle-bin", "safe-zone" | "recycle-bin", "volatile-defined">;
   /** 单次删除的条目数阈值；超过就额外确认一次。0 表示不启用。 */
   confirmFileCount: z<number, number, "volatile-defined">;
   /** 单次删除的字节数阈值；超过就额外确认一次。0 表示不启用。 */
@@ -123,24 +164,6 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
 }>>, "plain">;
 //#endregion
 //#region src/index.d.ts
-/**
- * dsh-safe-delete host half.
- *
- * 让 DSH 里的删除变成可逆操作：裸 shell 删除被拦下并改走安全删除，危险路径的
- * 删除在界面内点一下授权，删掉的内容进安全区、保留期内可原样取回。
- *
- * 这个文件只做**接线**，不含业务判断 —— 判定在 `command.ts` / `classify.ts`，
- * 存储与清理在 `store.ts` / `prune.ts`。这样"什么东西会被删"这件事可以被单独
- * 穷举验证，而不必启动一个 DSH。
- *
- * 三个刻意的约束：
- *   1. 零外部运行时 import（只用 `node:*` 与包内相对路径）。以 `link:` 裸装的
- *      bundle 没有自带 node_modules，import `@deepseek-ai/*` 会在启动时解析失败。
- *   2. fail-soft：注册失败只降级记日志，安全插件自身绝不能成为 DSH 启动失败的原因。
- *   3. 拦截走 `tools/pre-execute` 而不是 `tools.guard` —— guard 只能拒绝，
- *      pre-execute 还能返回 `ask`，而 `ask` 会走到 DSH 自带的界面审批卡片。
- *      这正是 dsh-safety 需要另开终端敲 `allow` 的根因。
- */
 export declare const name = "dsh-safe-delete";
 /** 需要的服务：工具注册表与系统提示。 */
 export declare const inject: string[];
@@ -191,4 +214,29 @@ export interface PluginContext {
  * 插件入口。任何注册异常都在这里被吞掉并记日志 —— 见文件头「fail-soft」。
  */
 export declare function apply(ctx: PluginContext, config?: SafeDeleteConfig): void;
+/**
+ * 拼审批卡片上的那句「删除后会发生什么」。
+ *
+ * ## 为什么要按目的地改写（2026-11-04）
+ *
+ * 旧文案硬编码「移入安全区，N 天内可恢复」。回收站模式下这是**假的**：
+ * 文件不进安全区，`safe_zone_restore` 也找不回它，取回要去系统回收站。
+ * 承诺与实际不符比不说更糟 —— 用户会照着一个错误的心智去决策。
+ *
+ * 统计被跳过时同样不能报「共 N 个文件」：那个数字是 0，报出来就是谎报目标为空。
+ *
+ * @param input 目标、统计值、理由与目的地。
+ * @returns 审批文案。
+ */
+export declare function buildInterceptReason(input: {
+  resolved: readonly string[];
+  fileCount: number;
+  bytes: number;
+  reasons: readonly string[];
+  retentionDays: number;
+  destination: DeleteDestination;
+  statsOmitted?: boolean;
+  /** 输出英文版（`displayReason.en` 用）。 */
+  english?: boolean;
+}): string;
 //#endregion

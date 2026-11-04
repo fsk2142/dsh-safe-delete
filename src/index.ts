@@ -333,6 +333,11 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     confirmFileCount: numeric('confirmFileCount', 5000),
     confirmBytes: numeric('confirmBytes', 2 * 1024 * 1024 * 1024),
     crossVolumeCopy: booleanOf('crossVolumeCopy', false),
+    /*
+     * 删除去向必须透传：不透传的话用户在设置页点的按钮毫无效果，
+     * 删除永远走安全区 —— 一个只在文档里存在的开关。
+     */
+    destination: normalizeDestination(unwrap(raw['deleteDestination'])),
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined

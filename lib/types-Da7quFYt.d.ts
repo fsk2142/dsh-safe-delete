@@ -21,6 +21,13 @@ interface TargetDescription {
   fileCount: number;
   topEntries: string[];
   truncated: boolean;
+  /**
+   * 目录统计被跳过（回收站模式）。
+   *
+   * 为 `true` 时 `bytes` 与 `fileCount` 都是 0，**不代表目标真的是空的** ——
+   * 只是没去数。显示层必须据此改写文案，不能报「0 个文件」。
+   */
+  statsOmitted?: boolean;
 }
 //#endregion
 export { TargetDescription as n, TrashEntry as r, Classification as t };

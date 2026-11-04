@@ -1,5 +1,5 @@
-import { n as moveToSystemRecycleBin, t as Recycler } from "./recycle-DFk8PP0b.js";
-import { t as ClassifyEnv } from "./classify-DBIbYKr1.js";
+import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler } from "./recycle-CzS3QCvA.js";
+import { b as ClassifyEnv, r as DeleteDestination } from "./delete-core-CwAfOTI9.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -77,6 +77,18 @@ export interface ToolDeps {
    * 生产路径不传，默认走 `moveToSystemRecycleBin`。
    */
   recycler?: Recycler;
+  /**
+   * 删除去向（从配置透传）。
+   *
+   * 缺省 `safe-zone`：旧调用方与旧配置都不受影响。
+   */
+  destination?: DeleteDestination;
+  /**
+   * 可替换的「批量移入回收站」实现（仅测试用）。
+   *
+   * 回收站模式下整批交给它一次，而不是每条一次进程。
+   */
+  recyclerMany?: (absPaths: readonly string[]) => RecycleManyOutcome;
   /** 当前时间（测试可注入）。 */
   now?: () => number;
 }
