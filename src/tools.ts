@@ -281,6 +281,17 @@ export function normaliseDeleteTargets(
   const list = Array.isArray(args.paths)
     ? args.paths.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
     : undefined
+
+  /*
+   * `paths` 里混入非字符串（数字、null、对象）时**报错**，与 `exclude` 一致。
+   *
+   * 旧写法直接 filter 掉：用户传 4 个路径、报告说删了 2 个，而没有任何提示
+   * 说明另外 2 个被忽略。对删除工具来说"少删"不会造成数据损失，但会让用户
+   * 以为事情做完了 —— 那本身是个隐患。
+   */
+  if (Array.isArray(args.paths) && list !== undefined && list.length !== args.paths.length) {
+    return { error: '`paths` entries must be non-empty strings' }
+  }
   const root = typeof args.root === 'string' && args.root.trim() !== '' ? args.root.trim() : undefined
   const pattern = typeof args.match === 'string' && args.match.trim() !== '' ? args.match.trim() : undefined
   const olderThanRaw = typeof args.olderThan === 'string' && args.olderThan.trim() !== '' ? args.olderThan.trim() : undefined
