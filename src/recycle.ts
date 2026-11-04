@@ -412,3 +412,76 @@ export function recycleManyToSystemBin(absPaths: readonly string[]): RecycleMany
   consecutiveFailures = 0
   return { ok: true, recycled: parsed.ok }
 }
+
+/**
+ * 系统是否被配置成「删除即永久删除」。
+ *
+ * ## 为什么必须检测（2026-11-04）
+ *
+ * Windows 的回收站可以被策略关掉：`NoRecycleFiles` 为 1 时，Shell 的删除
+ * 动词**直接永久删除并返回成功**。对一个承诺「删除可反悔」的插件，这是最坏的
+ * 情形 —— 用户以为进了回收站，其实没有了。
+ *
+ * 命中时调用方必须**先问人**，用户不同意就放弃这次删除。
+ */
+export type PermanentDeleteRisk = { risky: boolean; reason?: string }
+
+/** 读取注册表值的替身（测试注入）。 */
+export type RegistryReader = (key: string, name: string) => string | undefined
+
+/** 用 `reg query` 读一个值；读不到返回 undefined。 */
+function readRegistryViaReg(key: string, name: string): string | undefined {
+  try {
+    const out = execFileSync('reg', ['query', key, '/v', name], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+    // 输出形如 `    NoRecycleFiles    REG_DWORD    0x1`
+    const line = out.split(/\r?\n/).find((l) => l.includes(name))
+    if (line === undefined) return undefined
+    const parts = line.trim().split(/\s+/)
+    return parts[parts.length - 1]
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 检测「删除会被系统永久执行」的策略。
+ *
+ * @param options.platform 平台（测试注入，默认 `process.platform`）。
+ * @param options.readRegistry 注册表读取替身。
+ * @returns `risky` 为真时调用方必须先问人。
+ */
+export function detectPermanentDeleteRisk(
+  options: {
+    platform?: NodeJS.Platform
+    readRegistry?: RegistryReader
+  } = {},
+): PermanentDeleteRisk {
+  const platform = options.platform ?? process.platform
+  if (platform !== 'win32') return { risky: false }
+
+  const read = options.readRegistry ?? readRegistryViaReg
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer'
+  let raw: string | undefined
+  try {
+    raw = read(key, 'NoRecycleFiles')
+  } catch {
+    // 读不到就当作没有该策略：不能因为一次读注册表失败就拦住所有删除。
+    return { risky: false }
+  }
+  if (raw === undefined) return { risky: false }
+
+  const value = raw.trim().toLowerCase()
+  // 注册表里既可能是 DWORD（0x1 / 1），也可能被手工写成字符串。
+  const enabled = value === '1' || value === '0x1' || value === 'true'
+  if (!enabled) return { risky: false }
+
+  return {
+    risky: true,
+    reason:
+      'the NoRecycleFiles policy is enabled: Windows will permanently delete instead of using the recycle bin',
+  }
+}
