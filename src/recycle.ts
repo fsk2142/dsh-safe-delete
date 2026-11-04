@@ -34,6 +34,16 @@ export type RecycleOutcome =
   | { ok: false; reason: string; unsupported?: boolean }
 
 /**
+ * 批量移入回收站的结果。
+ *
+ * 与单条版本的区别是带 `recycled` 计数：一批里可能部分成功，调用方要能
+ * 说清「几个进去了、几个没进去」，而不是笼统报失败。
+ */
+export type RecycleManyOutcome =
+  | { ok: true; recycled: number }
+  | { ok: false; reason: string; recycled: number; unsupported?: boolean }
+
+/**
  * 可替换的回收站实现。
  *
  * 为什么允许注入：真实实现要起 PowerShell / osascript 子进程，一次几百毫秒到几秒。
@@ -279,4 +289,126 @@ function waitForGone(absPath: string, timeoutMs: number): void {
     const buffer = new SharedArrayBuffer(4)
     Atomics.wait(new Int32Array(buffer), 0, 0, 100)
   }
+}
+
+/**
+ * 生成「一次处理多个路径」的 PowerShell 脚本。
+ *
+ * ## 为什么不聚合进一个暂存目录（2026-11-04 实测否决）
+ *
+ * 把 N 个目标 rename 进 `recycle-batch/<id>/items/` 再交给回收站，回收站里
+ * 只会出现**一个叫 `items` 的文件夹**，原位置记录为那个内部路径 —— 用户点还原，
+ * 文件回到他从没选过的地方，而那里还可能被清理任务删掉。
+ *
+ * 直接对**真实路径**逐条调用，回收站就按原样记录原位置，还原回到删除的地方。
+ *
+ * ## 为什么一个进程
+ *
+ * 每条一次 `powershell.exe` 是 200–500ms 的进程启动开销；实测一个进程内循环
+ * 处理 21 个条目共 3.4 秒（约 162ms/项）。1000 个文件因此是分钟级而不是小时级。
+ *
+ * @param absPaths 真实绝对路径。
+ * @returns PowerShell 脚本正文。
+ */
+export function buildRecycleManyScript(absPaths: readonly string[]): string {
+  const quote = (p: string): string => `'${p.replace(/'/g, "''")}'`
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    'Add-Type -AssemblyName Microsoft.VisualBasic',
+    `$targets = @(${absPaths.map(quote).join(',')})`,
+    '$ok = 0; $fail = 0',
+    'foreach ($t in $targets) {',
+    '  try {',
+    '    if (Test-Path -LiteralPath $t -PathType Container) {',
+    '      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($t, "OnlyErrorDialogs", "SendToRecycleBin")',
+    '    } else {',
+    '      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($t, "OnlyErrorDialogs", "SendToRecycleBin")',
+    '    }',
+    '    $ok++',
+    '  } catch { $fail++; Write-Output "ERR: $t : $($_.Exception.Message)" }',
+    '}',
+    'Write-Output "OK=$ok FAIL=$fail"',
+  ].join('\n')
+}
+
+/**
+ * 解析批量脚本的输出。
+ *
+ * 找不到 `OK=` 汇总行时按**失败**处理：脚本崩溃不该被当成成功。
+ *
+ * @param stdout 脚本标准输出。
+ * @returns 成功数、失败数与逐条错误。
+ */
+export function parseRecycleManyOutput(stdout: string): { ok: number; fail: number; errors: string[] } {
+  const lines = stdout.split(/\r?\n/)
+  const errors = lines
+    .filter((line) => line.startsWith('ERR: '))
+    .map((line) => line.slice('ERR: '.length).trim())
+  const summary = lines.find((line) => /OK=\d+\s+FAIL=\d+/.test(line))
+  if (summary === undefined) {
+    return { ok: 0, fail: Math.max(1, errors.length), errors }
+  }
+  const ok = Number(/OK=(\d+)/.exec(summary)?.[1] ?? '0')
+  const fail = Number(/FAIL=(\d+)/.exec(summary)?.[1] ?? '0')
+  return { ok, fail, errors }
+}
+
+/**
+ * 把多个真实路径一次性交给系统回收站。
+ *
+ * @param absPaths 真实绝对路径（不聚合、不改名）。
+ * @returns 结果；`recycled` 为真正送进回收站的条数。
+ */
+export function recycleManyToSystemBin(absPaths: readonly string[]): RecycleManyOutcome {
+  if (absPaths.length === 0) return { ok: true, recycled: 0 }
+
+  if (process.platform !== 'win32') {
+    return {
+      ok: false,
+      recycled: 0,
+      reason: `recycle-bin destination is only implemented on win32 (current: ${process.platform})`,
+      unsupported: true,
+    }
+  }
+
+  if (recycleIsTripped()) {
+    return {
+      ok: false,
+      recycled: 0,
+      reason: `recycle bin unavailable after ${consecutiveFailures} consecutive failures. Restart DSH to retry.`,
+    }
+  }
+
+  const script = buildRecycleManyScript(absPaths)
+  /*
+   * 超时按条目数放大：一个进程处理 N 条，每条约 160ms，留一倍余量。
+   */
+  const timeout = Math.max(COMMAND_TIMEOUT_MS, 5_000 + 400 * absPaths.length)
+  let stdout = ''
+  try {
+    stdout = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+  } catch (error) {
+    recordRecycleFailure()
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, recycled: 0, reason: `SendToRecycleBin failed: ${message}` }
+  }
+
+  const parsed = parseRecycleManyOutput(stdout)
+  if (parsed.fail > 0 || parsed.ok === 0) {
+    recordRecycleFailure()
+    const detail = parsed.errors.length > 0 ? `: ${parsed.errors.slice(0, 3).join('; ')}` : ''
+    return {
+      ok: false,
+      recycled: parsed.ok,
+      reason: `${parsed.fail} of ${absPaths.length} item(s) could not be recycled${detail}`,
+    }
+  }
+
+  consecutiveFailures = 0
+  return { ok: true, recycled: parsed.ok }
 }
