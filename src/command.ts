@@ -450,6 +450,8 @@ function isPureAssignment(text: string): boolean {
     if (containsDeleteCommand(inner)) return false
     if (tokenize(inner).some((t) => isDeleteArgumentMarker(t))) return false
     if (hasCallStyleDelete(blankQuotedContent(inner))) return false
+    // Shell backticks execute unknown programs too; declarations are JS templates.
+    if (!/^(?:const|let|var)\s/.test(trimmed) && !provenHarmless(inner)) return false
     return true
   }
 
@@ -490,6 +492,7 @@ function isPureAssignment(text: string): boolean {
      * 所以直接复用它：它返回的每段都会被 shell 真的执行。
      */
     for (const substitution of commandSubstitutions(`"${inner}"`)) {
+      if (!provenHarmless(substitution)) return false
       if (containsDeleteCommand(substitution)) return false
       if (tokenize(substitution).some((t) => isDeleteArgumentMarker(t))) return false
       if (hasCallStyleDelete(blankQuotedContent(substitution))) return false
@@ -511,6 +514,8 @@ function isPureAssignment(text: string): boolean {
    */
   const constructor = /^new\s+[A-Z][\w$]*\s*\(([\s\S]*)\)$/.exec(body)
   if (constructor !== null) {
+    // Pure arguments do not prove an arbitrary constructor has no side effects.
+    if (!/^new\s+(?:Map|Set|WeakMap|WeakSet|Array|Date)\s*\(/.test(body)) return false
     return isPureLiteralValue((constructor[1] ?? '').trim())
   }
 
@@ -1033,7 +1038,6 @@ const PROVEN_READ_ONLY = new Set([
   'pwd',
   'whoami',
   'date',
-  'env',
   'which',
   'cat',
   'type',
@@ -1197,18 +1201,37 @@ const PROVEN_READ_ONLY_GIT = new Set([
  * 而 `pnpm remove` / `pnpm uninstall` 会改文件系统（并删目录）。
  */
 const PROVEN_READ_ONLY_PKG = new Set([
+  /*
+   * 已知只读 / 高频的开发子命令。
+   *
+   * `build` 与 `start` 收在这里是有意的：它们是每天都会跑的构建入口，
+   * 拦下来只会造成审批疲劳 —— 而审批疲劳会让人无脑点同意，反而更危险。
+   *
+   * 代价要说清：`pnpm build` 最终执行的是 package.json 里那个脚本，
+   * 理论上它可以是 `rimraf`。这里赌的是「构建脚本不删东西」这个惯例。
+   * 真要删东西，脚本名通常是 clean / reset 这类，不在此列。
+   */
   'typecheck',
   'test',
   'lint',
-  'run',
-  'exec',
-  'dlx',
+  'build',
+  'start',
   'ls',
   'list',
   'outdated',
   'why',
   'view',
   'info',
+  /*
+   * 刻意不收 `run`（2026-11-04 自检）。
+   *
+   * `pnpm run <script>` 执行 package.json 里写的**任意命令** —— 一个
+   * `"clean": "rimraf dist"` 的脚本会真的删目录。它与 `exec`/`dlx` 同类。
+   *
+   * 注意 `pnpm build`（不带 run）与 `pnpm run build` 是两条不同路径：
+   * 前者命中上面 `build` 那一项，后者因为含 `run` 而不在白名单里 ——
+   * 于是「显式 run 一个没被认定为安全的脚本」仍然要问。
+   */
 ])
 
 /**
@@ -1383,6 +1406,8 @@ function provenHarmless(segment: string, depth = 0): boolean {
    * 取子命令时注意：`console.log(1)` 的第一个 token 没有第二个，
    * 而 `git status` 有。用同一个 token 列表即可。
    */
+  // env with operands executes another program; only the bare query is safe.
+  if (first === 'env') return tokens.length === 1
   return isProvenReadOnlyCommand(first, tokens[1]?.toLowerCase())
 }
 

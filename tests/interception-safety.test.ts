@@ -122,7 +122,6 @@ describe('interception must not block ordinary work', () => {
       'git branch --delete old',
       'ls -la',
       'Get-ChildItem C:\\Work',
-      'npm run clean',
     ]) {
       expect(parseCommand(command).destructive, command).toBe(false)
     }
@@ -133,5 +132,24 @@ describe('interception must not block ordinary work', () => {
     const verdict = parseCommand('rm -rf "/tmp/real target"')
     expect(verdict.destructive).toBe(true)
     expect(verdict.destructive && verdict.target).toBe('/tmp/real target')
+  })
+})
+
+/*
+ * `npm run clean` 现在要求审批（2026-11-04 自检）。
+ *
+ * 它原来在这条「不该误判」的清单里。但 `run` 会执行 package.json 里的
+ * 任意脚本，而 `clean` 恰恰是最常见的删除类脚本名 —— 放行它等于让
+ * 「删目录」通过一个只读清单。
+ *
+ * `npm build`（不带 run）仍在放行清单里，日常构建不受影响。
+ */
+describe('package-manager run is not a read-only shortcut', () => {
+  it('requires review for npm run clean', () => {
+    expect(parseCommand('npm run clean').destructive, 'run 执行任意脚本').toBe(true)
+  })
+
+  it('keeps npm build allowed', () => {
+    expect(parseCommand('npm build').destructive, 'build 是已知子命令').toBe(false)
   })
 })

@@ -14,7 +14,15 @@ describe('parseCommand', () => {
   it('ignores commands with no delete verb', () => {
     expect(parseCommand('Get-ChildItem C:\\Work')).toEqual({ destructive: false })
     expect(parseCommand('git status')).toEqual({ destructive: false })
-    expect(parseCommand('npm run build')).toEqual({ destructive: false })
+    /*
+     * 这里原来用 `npm run build` 举例「没有删除动词的命令」。
+     *
+     * 2026-11-04 自检后 `run` 已从包管理器白名单移除：`npm run <script>`
+     * 执行 package.json 里的任意命令，一个 `"clean": "rimraf dist"` 的脚本
+     * 会真的删目录。所以改用 `npm build` —— 它命中的是白名单里已知的
+     * `build` 子命令，仍然体现「没有删除动词」这个意图。
+     */
+    expect(parseCommand('npm build')).toEqual({ destructive: false })
   })
 
   it('does not treat a non-delete verb as deletion when it merely contains "rm"', () => {
