@@ -575,6 +575,88 @@ export function detectPermanentDeleteRisk(
  * @param options 注入点（测试用）。
  * @returns 超限时的说明；未超限或无法判定时返回 `undefined`。
  */
+/*
+ * 回收站每卷上限的缓存。
+ *
+ * ## 为什么必须缓存（2026-11-04 自检）
+ *
+ * 每次读注册表要 spawn 两次 `reg.exe`，实测 **162.8ms**。而 `deleteMany`
+ * 对**每个文件**判一次配额 —— 删 1000 个文件就是 163 秒，删 5000 个是
+ * 13.6 分钟。这正是「大量删除卡顿」，而且是我自己加配额检测时引入的。
+ *
+ * 上限在运行期不会变（改回收站大小要动系统设置），所以读一次就够了。
+ * 用 `undefined` 表示「还没读过」，`null` 表示「读过了但读不到」——
+ * 两者必须分开，否则每次都会重试一次失败的读取。
+ */
+let quotaLimitCache: number | null | undefined
+let quotaCacheKey: string | undefined
+
+/**
+ * 清空配额缓存（测试用；生产路径不需要）。
+ */
+export function resetQuotaCache(): void {
+  quotaLimitCache = undefined
+  quotaCacheKey = undefined
+}
+
+/**
+ * 读一次「本机最小的回收站每卷上限」（字节）。
+ *
+ * @param readCapacity 单个卷的读取函数。
+ * @param listKeys 列卷函数。
+ * @param cacheKey 注入点不同则不复用缓存（测试用）。
+ * @returns 上限字节数；读不到返回 `null`。
+ */
+function quotaLimitBytes(
+  readCapacity: (volumeKey: string) => number | undefined,
+  listKeys: () => string[],
+  cacheKey: string,
+): number | null {
+  if (quotaCacheKey === cacheKey && quotaLimitCache !== undefined) return quotaLimitCache
+
+  let keys: string[]
+  try {
+    keys = listKeys()
+  } catch {
+    quotaCacheKey = cacheKey
+    quotaLimitCache = null
+    return null
+  }
+
+  let smallestMb: number | undefined
+  for (const key of keys) {
+    let mb: number | undefined
+    try {
+      mb = readCapacity(key)
+    } catch {
+      mb = undefined
+    }
+    if (mb === undefined || mb <= 0) continue
+    if (smallestMb === undefined || mb < smallestMb) smallestMb = mb
+  }
+
+  quotaCacheKey = cacheKey
+  quotaLimitCache = smallestMb === undefined ? null : smallestMb * 1024 * 1024
+  return quotaLimitCache
+}
+
+/**
+ * 单个文件是否超过该卷回收站容量上限。
+ *
+ * ## 为什么要查这个（2026-11-04 审查 Important-9）
+ *
+ * Windows 在条目**超过回收站上限**时会**永久删除并返回成功**。插件无法阻止，
+ * 也无法事后感知 —— 只能事前问。
+ *
+ * 只对**单个文件**判断：目录的递归大小在回收站模式下刻意不统计。
+ *
+ * 上限读取有进程内缓存（见 `quotaLimitCache`），所以对 N 个文件判断只读一次
+ * 注册表。
+ *
+ * @param sizeBytes 目标大小（调用方已 statSync）。
+ * @param options 注入点（测试用）。
+ * @returns 超限时的说明；未超限或无法判定时返回 `undefined`。
+ */
 export function detectQuotaRisk(
   sizeBytes: number,
   options: {
@@ -588,32 +670,20 @@ export function detectQuotaRisk(
   if (sizeBytes <= 0) return undefined
 
   const readCapacity = options.readCapacityMb ?? readCapacityViaReg
-  let keys: string[]
-  try {
-    keys = (options.listVolumeKeys ?? listBitBucketVolumeKeys)()
-  } catch {
-    return undefined
-  }
+  const listKeys = options.listVolumeKeys ?? listBitBucketVolumeKeys
+  /*
+   * 缓存键把注入的函数也编进去：测试里不同用例用不同替身，
+   * 不能相互污染缓存；生产路径下两者都是默认实现，键恒定。
+   */
+  const cacheKey = `${String(listKeys)}${String(readCapacity)}`
 
-  let smallest: number | undefined
-  for (const key of keys) {
-    let mb: number | undefined
-    try {
-      mb = readCapacity(key)
-    } catch {
-      mb = undefined
-    }
-    if (mb === undefined || mb <= 0) continue
-    if (smallest === undefined || mb < smallest) smallest = mb
-  }
-  if (smallest === undefined) return undefined
-
-  const limitBytes = smallest * 1024 * 1024
+  const limitBytes = quotaLimitBytes(readCapacity, listKeys, cacheKey)
+  if (limitBytes === null) return undefined
   if (sizeBytes <= limitBytes) return undefined
 
   return (
     `the file is larger than the recycle bin's per-volume limit ` +
-    `(${Math.round(smallest)} MB): Windows will delete it permanently instead of recycling it`
+    `(${Math.round(limitBytes / (1024 * 1024))} MB): Windows will delete it permanently instead of recycling it`
   )
 }
 

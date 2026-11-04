@@ -668,6 +668,28 @@ export function SafeZoneSettings(): ReactElement {
     return bytes >= GB ? 'GB' : 'MB'
   }
 
+  // All settings writers must advance the same namespace revision. A conflict
+  // refreshes the token for an explicit retry; it never overwrites external edits.
+  const mutateSettings = useCallback(async (
+    remote: SettingsRemote,
+    ops: Parameters<NonNullable<SettingsRemote['mutate']>>[1],
+  ): Promise<unknown> => {
+    const result = await remote.mutate!(NAMESPACE, ops, revision)
+    const reply = unwrapRemote(result)
+    if (reply.ok) {
+      const ack = reply.value
+      if (ack !== null && typeof ack === 'object' && 'revision' in ack && typeof ack.revision === 'number') {
+        setRevision(ack.revision)
+      }
+    } else if (reply.error.includes('settings/conflict') && remote.describe !== undefined) {
+      try {
+        const snapshot = unwrapRemote(await remote.describe())
+        if (snapshot.ok) setRevision(pickNamespace(snapshot.value).revision)
+      } catch { /* Retain the conflict and the user's draft when refresh fails. */ }
+    }
+    return result
+  }, [revision])
+
   const save = useCallback(async (): Promise<void> => {
     if (remote?.mutate === undefined) return
     /*
@@ -771,7 +793,7 @@ export function SafeZoneSettings(): ReactElement {
         path: [key],
         value,
       }))
-      const result = await activeRemote.mutate(NAMESPACE, ops, revision)
+      const result = await mutateSettings(activeRemote, ops)
       // 宿主契约：失败**不 reject**，而是 resolve 成 `{ ok:false, error }`。
       // 不拆信封就会把被拒绝的保存当成成功。
       const unwrapped = unwrapRemote(result)
@@ -798,7 +820,7 @@ export function SafeZoneSettings(): ReactElement {
           // 同样要拆信封（见上方 describe 的说明）。
           const refreshedUnwrapped = unwrapRemote(refreshed)
           const view = pickNamespace(refreshedUnwrapped.ok ? refreshedUnwrapped.value : undefined)
-          setRevision(view.revision)
+          setRevision((prev) => view.revision === undefined ? prev : Math.max(prev ?? view.revision, view.revision))
           const wroteSomething = Object.keys(payload).length > 0
           const confirmed =
             wroteSomething &&
@@ -985,7 +1007,7 @@ export function SafeZoneSettings(): ReactElement {
       savingRef.current = false
       setSaving(false)
     }
-  }, [coerce, remote, revision, values])
+  }, [coerce, remote, revision, values, mutateSettings])
 
   /**
    * 是否有未保存的改动。
@@ -1034,10 +1056,13 @@ export function SafeZoneSettings(): ReactElement {
         setMessage('这个宿主没有暴露设置接口，无法保存。')
         return
       }
+      if (savingRef.current) return
+      savingRef.current = true
+      setSaving(true)
       setMessage('')
       setSaved(false)
       try {
-        const result = await remote.mutate(NAMESPACE, [{ op: 'set', path: [key], value }], revision)
+        const result = await mutateSettings(remote, [{ op: 'set', path: [key], value }])
         const unwrapped = unwrapRemote(result)
         if (!unwrapped.ok) {
           setMessage(`保存失败：${unwrapped.error}`)
@@ -1048,19 +1073,24 @@ export function SafeZoneSettings(): ReactElement {
           if (refreshed !== undefined) {
             const unwrappedRefresh = unwrapRemote(refreshed)
             if (unwrappedRefresh.ok) {
-              const next = (unwrappedRefresh.value as { revision?: number }).revision
-              if (typeof next === 'number') setRevision(next)
+              const next = pickNamespace(unwrappedRefresh.value).revision
+              if (typeof next === 'number') setRevision((prev) => Math.max(prev ?? next, next))
             }
           }
         } catch {
           /* 刷新 revision 失败不影响这次写入 */
         }
+        setValues((prev) => ({ ...prev, [key]: value }))
+        setMessage('已保存，重启 DSH 后生效。')
         setSaved(true)
       } catch (error) {
         setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        savingRef.current = false
+        setSaving(false)
       }
     },
-    [revision],
+    [mutateSettings],
   )
 
 
@@ -1095,6 +1125,7 @@ export function SafeZoneSettings(): ReactElement {
                 <button
                   key={option.value}
                   type="button"
+                  disabled={saving || cleaning}
                   onClick={() => void chooseValue(spec.key, option.value)}
                   style={{
                     padding: '6px 14px',
@@ -1143,11 +1174,7 @@ export function SafeZoneSettings(): ReactElement {
     try {
       // 用时间戳而不是布尔：连续两次点也能区分（同一个值写两次不会触发变更）。
       const stamp = Date.now()
-      const result = await activeRemote.mutate(
-        NAMESPACE,
-        [{ op: 'set', path: ['cleanRequestedAt'], value: stamp }],
-        revision,
-      )
+      const result = await mutateSettings(activeRemote, [{ op: 'set', path: ['cleanRequestedAt'], value: stamp }])
       const unwrapped = unwrapRemote(result)
       if (!unwrapped.ok) {
         setMessage(`清理请求失败：${unwrapped.error}`)
@@ -1159,7 +1186,7 @@ export function SafeZoneSettings(): ReactElement {
         if (refreshed !== undefined) {
           const unwrappedRefresh = unwrapRemote(refreshed)
           const view = pickNamespace(unwrappedRefresh.ok ? unwrappedRefresh.value : undefined)
-          setRevision(view.revision)
+          setRevision((prev) => view.revision === undefined ? prev : Math.max(prev ?? view.revision, view.revision))
         }
       } catch {
         /* revision 刷新失败不影响清理已触发 */
@@ -1174,7 +1201,7 @@ export function SafeZoneSettings(): ReactElement {
       // 重新走一遍确认，而不是停在那里、再点一下就又发一次请求。
       setConfirmingClean(false)
     }
-  }, [cleaning, revision])
+  }, [cleaning, revision, mutateSettings])
 
   /**
    * 状态卡片：加载中/出错也用同一套容器，避免布局跳动。 */
