@@ -49,12 +49,46 @@ interface FieldSpec {
   label: string
   hint: string
   /** 控件类型。 */
-  kind: 'bytes' | 'number' | 'percent' | 'boolean' | 'duration'
+  kind: 'bytes' | 'number' | 'percent' | 'boolean' | 'duration' | 'choice'
   /** 最小值（含）。 */
   min?: number
   max?: number
   /** 配置里读不到该字段时显示的兜底值（与宿主侧默认值保持一致）。 */
   fallback: number
+  /**
+   * `choice` 的候选项。
+   *
+   * 刻意做成**并排按钮**而不是下拉框：两种删除去向的取舍（速度 vs 统计）
+   * 需要被看见。下拉框会把替代项折叠起来，用户就只看得到当前值。
+   */
+  options?: Array<{ value: string; label: string }>
+}
+
+/**
+ * 删除去向的单独控件。
+ *
+ * ## 为什么不放进 FIELDS（2026-11-04）
+ *
+ * 既有测试用 container.querySelector('button') 取「保存」按钮 —— 那是 DOM 里
+ * 的第一个 button。把两个去向按钮放进 FIELDS，它们会排在保存按钮之前，
+ * 测试就会点到「放入安全区」而不是「保存」。
+ *
+ * 单独渲染在保存按钮之后，既不动那些测试的前提，也让这组开关在视觉上
+ * 紧邻「保存」，符合「点了立刻生效」的语义。
+ */
+const DESTINATION_FIELD: FieldSpec = {
+  key: 'deleteDestination',
+  label: '删除去向',
+  hint:
+    '放入安全区：会统计文件数与总大小（大目录删除会慢一些），换来「删太多先问一次」和插件内按条目恢复。' +
+    '直接进回收站：跳过统计，删除速度与文件数无关；代价是超大删除不再额外确认、卡片不显示总大小，' +
+    '取回要去系统回收站。',
+  kind: 'choice',
+  options: [
+    { value: 'safe-zone', label: '放入安全区' },
+    { value: 'recycle-bin', label: '直接进回收站' },
+  ],
+  fallback: 0,
 }
 
 /** 1 GB 的字节数。 */
@@ -294,6 +328,16 @@ let settingsRemote: SettingsRemote | undefined
  *
  * @param remote 假的 settings remote。
  */
+/** 表单字段的只读视图（测试用：断言控件类型与候选项）。 */
+export function __fieldsForTest(): ReadonlyArray<FieldSpec> {
+  return FIELDS
+}
+
+/** 删除去向控件（测试用）。 */
+export function __destinationFieldForTest(): FieldSpec {
+  return DESTINATION_FIELD
+}
+
 export function __setRemoteForTest(remote: SettingsRemote | undefined): void {
   settingsRemote = remote
 }
@@ -978,6 +1022,105 @@ export function SafeZoneSettings(): ReactElement {
   }, [])
 
   /**
+   * `choice` 控件：点一下就把选中的值写进配置。
+   *
+   * 与「保存」按钮的区别：这是**单一枚举值**，没有草稿可编辑，立刻生效比
+   * 让用户再点一次保存更直接。写失败时把原因显示出来，不要静默吞掉。
+   */
+  const chooseValue = useCallback(
+    async (key: string, value: string): Promise<void> => {
+      const remote = currentRemote()
+      if (remote?.mutate === undefined) {
+        setMessage('这个宿主没有暴露设置接口，无法保存。')
+        return
+      }
+      setMessage('')
+      setSaved(false)
+      try {
+        const result = await remote.mutate(NAMESPACE, [{ op: 'set', path: [key], value }], revision)
+        const unwrapped = unwrapRemote(result)
+        if (!unwrapped.ok) {
+          setMessage(`保存失败：${unwrapped.error}`)
+          return
+        }
+        try {
+          const refreshed = remote.describe === undefined ? undefined : await remote.describe()
+          if (refreshed !== undefined) {
+            const unwrappedRefresh = unwrapRemote(refreshed)
+            if (unwrappedRefresh.ok) {
+              const next = (unwrappedRefresh.value as { revision?: number }).revision
+              if (typeof next === 'number') setRevision(next)
+            }
+          }
+        } catch {
+          /* 刷新 revision 失败不影响这次写入 */
+        }
+        setSaved(true)
+      } catch (error) {
+        setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    },
+    [revision],
+  )
+
+
+  /**
+   * 渲染一个 `choice` 字段：并排按钮，点了立刻写配置。
+   *
+   * 抽成函数是因为它要在**保存按钮之后**再渲染一次（见 `DESTINATION_FIELD`
+   * 的注释：放进 FIELDS 会把 `querySelector('button')` 指到错的位置）。
+   */
+  const renderChoiceField = (spec: FieldSpec) => {
+    const chosenValue = String(values[spec.key] ?? '')
+    const selected = spec.options?.some((o) => o.value === chosenValue)
+      ? chosenValue
+      : (spec.options?.[0]?.value ?? '')
+    return (
+      <div
+        key={spec.key}
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '150px minmax(0, 1fr)',
+          columnGap: '16px',
+          rowGap: '6px',
+          alignItems: 'start',
+        }}
+      >
+        <span style={{ fontSize: '13px', lineHeight: '1.4' }}>{spec.label}</span>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            {(spec.options ?? []).map((option) => {
+              const active = option.value === selected
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => void chooseValue(spec.key, option.value)}
+                  style={{
+                    padding: '6px 14px',
+                    fontSize: '13px',
+                    cursor: active ? 'default' : 'pointer',
+                    borderRadius: '6px',
+                    border: '1px solid var(--dsw-alias-border-primary, #ccc)',
+                    background: active
+                      ? 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, #3355ff))'
+                      : 'transparent',
+                    color: active ? '#fff' : 'inherit',
+                    fontWeight: active ? 600 : 400,
+                  }}
+                >
+                  {option.label}
+                </button>
+              )
+            })}
+          </div>
+          <span style={{ fontSize: '12px', opacity: 0.7, lineHeight: '1.5' }}>{spec.hint}</span>
+        </div>
+      </div>
+    )
+  }
+
+  /**
    * 「立即清理」：把安全区条目全部移入系统回收站。
    *
    * ## 实现方式
@@ -1167,6 +1310,12 @@ export function SafeZoneSettings(): ReactElement {
             unit = '%'
           }
 
+          /*
+           * `choice`：并排按钮，点了立刻写配置。
+           *
+           * 不复用下面的数字输入管线（草稿、单位、换算那一套对枚举无意义），
+           * 提前返回一个独立分支更简单，也不会碰到那些状态的边界。
+           */
           return (
             <div
               key={spec.key}
@@ -1336,6 +1485,18 @@ export function SafeZoneSettings(): ReactElement {
           </span>
         ) : null}
       </div>
+
+      {/*
+        删除去向：单独渲染在操作区之后。
+
+        为什么不放进 FIELDS：既有测试用 `container.querySelector('button')`
+        取「保存」按钮，而那是 DOM 里第一个 button。这组开关若排在保存之前，
+        测试就会点到「放入安全区」。放在保存之后既不动那些测试的前提，
+        也让这组开关紧邻「保存」——点一下立刻生效，不需要再按保存。
+      */}
+      <section style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+        {renderChoiceField(DESTINATION_FIELD)}
+      </section>
 
       {/*
         「立即清理」单独一块，放在最下方。
