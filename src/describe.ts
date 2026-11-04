@@ -56,9 +56,24 @@ function walk(dir: string, acc: { bytes: number; fileCount: number }): void {
 /**
  * 描述一个路径。
  *
+ * ## `stats` 选项（2026-11-04）
+ *
+ * 递归统计是「删之前让你看清」的代价：每个条目一次 `lstatSync`，全在审批
+ * 卡片出现**之前**同步跑完。回收站模式不需要这两个数字（它也不做按大小的
+ * 确认），所以允许跳过 —— 目录只读顶层一层，`bytes`/`fileCount` 记 0 并带
+ * `statsOmitted: true`。
+ *
+ * 单文件在两种模式下都 `statSync`：那是一次系统调用，本来就免费，跳过反而
+ * 让「删一个 3 GB 镜像」显示成「0 条目 0 B」。
+ *
  * @param absPath 目标绝对路径。
+ * @param options.stats 是否统计目录内容；缺省 `true`（保持原有行为）。
  */
-export function describeTarget(absPath: string): TargetDescription {
+export function describeTarget(
+  absPath: string,
+  options: { stats?: boolean } = {},
+): TargetDescription {
+  const stats = options.stats !== false
   let st
   try {
     st = statSync(absPath)
@@ -78,7 +93,7 @@ export function describeTarget(absPath: string): TargetDescription {
   }
 
   const acc = { bytes: 0, fileCount: 0 }
-  walk(absPath, acc)
+  if (stats) walk(absPath, acc)
 
   let names: string[] = []
   try {
@@ -94,5 +109,6 @@ export function describeTarget(absPath: string): TargetDescription {
     fileCount: acc.fileCount,
     topEntries: names.slice(0, MAX_TOP_ENTRIES),
     truncated: names.length > MAX_TOP_ENTRIES,
+    ...(stats ? {} : { statsOmitted: true }),
   }
 }
