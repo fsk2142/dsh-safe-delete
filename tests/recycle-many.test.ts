@@ -38,24 +38,37 @@ describe('buildRecycleManyScript', () => {
 })
 
 describe('parseRecycleManyOutput', () => {
-  it('reads the summary line and the per-path errors', () => {
-    const out = ['ERR: C:\\b\\y.txt : denied', 'OK=2 FAIL=1'].join('\n')
+  it('reads counts and per-path errors from the JSON envelope', () => {
+    /*
+     * 2026-11-04 自检：输出从 `ERR: <path> : <msg>` 文本行改成 JSON。
+     *
+     * 原格式让调用方用 `split(' : ')[0]` 反推路径 —— 用字符串拼结构化数据，
+     * 路径里含分隔符就会截断，失败条目被算成成功。JSON 里路径是字段值，
+     * 不存在这个解析问题。
+     */
+    const out = JSON.stringify({
+      ok: 2,
+      fail: 1,
+      errors: [{ path: 'C:\\b\\y.txt', message: 'denied' }],
+    })
     const parsed = parseRecycleManyOutput(out)
 
     expect(parsed.ok).toBe(2)
     expect(parsed.fail).toBe(1)
-    expect(parsed.errors).toEqual(['C:\\b\\y.txt : denied'])
+    expect(parsed.failedPaths).toEqual(['C:\\b\\y.txt'])
+    expect(parsed.errors[0]).toMatch(/denied/)
   })
 
   it('treats a clean run as zero failures', () => {
-    const parsed = parseRecycleManyOutput('OK=3 FAIL=0')
+    const parsed = parseRecycleManyOutput(JSON.stringify({ ok: 3, fail: 0, errors: [] }))
     expect(parsed.ok).toBe(3)
     expect(parsed.fail).toBe(0)
     expect(parsed.errors).toEqual([])
+    expect(parsed.failedPaths).toEqual([])
   })
 
   it('reports failure when the summary line is missing', () => {
-    // 脚本崩了就不会有 OK= 行；不能把它当成成功。
+    // 脚本崩了就不会有合法 JSON；不能把它当成成功。
     const parsed = parseRecycleManyOutput('some unexpected output')
     expect(parsed.ok).toBe(0)
     expect(parsed.fail).toBe(1)

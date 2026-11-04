@@ -47,6 +47,14 @@ export type RecycleManyOutcome =
       recycled: number
       /** 部分失败时的逐条错误（成功的不受影响）。 */
       failed?: string[]
+      /**
+       * 失败条目的**原始路径**。
+       *
+       * 与 `failed` 分开：后者是给人看的描述，这里是给调用方做**精确比对**的。
+       * 曾经让调用方从 `failed` 里 `split(' : ')[0]` 反推路径 —— 那是在用
+       * 字符串拼结构化数据，路径里一旦含分隔符就会截断。
+       */
+      failedPaths?: string[]
     }
   | { ok: false; reason: string; recycled: number; unsupported?: boolean }
 
@@ -381,7 +389,12 @@ export function buildRecycleManyScript(): string {
     "$ErrorActionPreference = 'Stop'",
     /* 路径从文件读：命令行长度与路径数无关（审查 Critical-2）。 */
     "$targets = @(Get-Content -LiteralPath $listPath -Encoding UTF8 | Where-Object { $_ -ne '' })",
-    'if ($targets.Count -eq 0) { Write-Output "OK=0 FAIL=0"; exit 0 }',
+    /*
+     * 空清单是**正常情况**（没有可删的），必须输出合法 JSON 且 fail=0。
+     * 这里曾经漏改，还留着旧的 `OK=0 FAIL=0` 文本 —— parser 改成只认 JSON 后，
+     * 空清单会被判成「解析失败」，一次本来无事发生的清理被记成 1 个失败。
+     */
+    'if ($targets.Count -eq 0) { [pscustomobject]@{ ok = 0; fail = 0; errors = @() } | ConvertTo-Json -Compress -Depth 4; exit 0 }',
     /*
      * 一次遍历分拣「存在」与「不存在」：原实现跑了两遍 Where-Object，
      * 每遍都对同一路径做一次文件系统往返。
@@ -408,12 +421,25 @@ export function buildRecycleManyScript(): string {
      * | 2000 | 419ms | 354ms |
      */
     '$present = [System.Collections.Generic.List[string]]::new()',
+    '$present = [System.Collections.Generic.List[string]]::new()',
     '$missing = [System.Collections.Generic.List[string]]::new()',
     'foreach ($t in $targets) {',
     '  if ([System.IO.File]::Exists($t) -or [System.IO.Directory]::Exists($t)) { $present.Add($t) }',
     '  else { $missing.Add($t) }',
     '}',
-    'if ($present.Count -eq 0) { Write-Output "OK=0 FAIL=$($missing.Count)"; exit 0 }',
+    /*
+     * 错误**收集**到数组，最后一次输出 JSON —— 不再逐行拼 `ERR: ` 文本。
+     *
+     * 理由见 parseRecycleManyOutput：调用方曾经用 `split(' : ')[0]` 从文本行
+     * 里取路径，路径含 ` : ` 时会截断，导致删除失败被记成成功。
+     * 路径作为 JSON 字段值传递，就不存在这个解析问题。
+     */
+    '$errors = [System.Collections.Generic.List[object]]::new()',
+    'foreach ($m in $missing) { $errors.Add([pscustomobject]@{ path = $m; message = "not found" }) }',
+    'if ($present.Count -eq 0) {',
+    '  [pscustomobject]@{ ok = 0; fail = $missing.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
+    '  exit 0',
+    '}',
     /* 类型定义用单引号 here-string 交给 Add-Type。 */
     "$cs = @'\n" + '$CS_BODY_PLACEHOLDER' + '\n' + "'@",
     'Add-Type -TypeDefinition $cs',
@@ -428,25 +454,23 @@ export function buildRecycleManyScript(): string {
     '$op.fFlags = 0x0040 -bor 0x0010 -bor 0x0004 -bor 0x0400',
     '$rc = [DshShFileOp]::SHFileOperationW([ref]$op)',
     'if ($rc -ne 0) {',
-    '  foreach ($p in $present) { Write-Output "ERR: $p : SHFileOperation returned $rc" }',
-    '  Write-Output "OK=0 FAIL=$($present.Count + $missing.Count)"',
+    '  foreach ($p in $present) { $errors.Add([pscustomobject]@{ path = $p; message = "SHFileOperation returned $rc" }) }',
+    '  [pscustomobject]@{ ok = 0; fail = $present.Count + $missing.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
     '  exit 0',
     '}',
     'if ($op.fAnyOperationsAborted) {',
-    '  foreach ($p in $present) { Write-Output "ERR: $p : operation aborted by the shell" }',
-    '  Write-Output "OK=0 FAIL=$($present.Count + $missing.Count)"',
+    '  foreach ($p in $present) { $errors.Add([pscustomobject]@{ path = $p; message = "operation aborted by the shell" }) }',
+    '  [pscustomobject]@{ ok = 0; fail = $present.Count + $missing.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
     '  exit 0',
     '}',
     /* 逐条复核：成功时路径应当已从原处消失。 */
-    /* 复核也只遍历一遍（原实现跑了两遍 Where-Object）。 */
     '$goneCount = 0',
-    '$left = [System.Collections.Generic.List[string]]::new()',
     'foreach ($p in $present) {',
-    '  if ([System.IO.File]::Exists($p) -or [System.IO.Directory]::Exists($p)) { $left.Add($p) }',
-    '  else { $goneCount++ }',
+    '  if ([System.IO.File]::Exists($p) -or [System.IO.Directory]::Exists($p)) {',
+    '    $errors.Add([pscustomobject]@{ path = $p; message = "still present after the shell operation" })',
+    '  } else { $goneCount++ }',
     '}',
-    'foreach ($p in $left) { Write-Output "ERR: $p : still present after the shell operation" }',
-    'Write-Output "OK=$goneCount FAIL=$($left.Count + $missing.Count)"',
+    '[pscustomobject]@{ ok = $goneCount; fail = $errors.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
   ]
     .join('\n')
     .replace('$CS_BODY_PLACEHOLDER', csType)
@@ -460,18 +484,72 @@ export function buildRecycleManyScript(): string {
  * @param stdout 脚本标准输出。
  * @returns 成功数、失败数与逐条错误。
  */
-export function parseRecycleManyOutput(stdout: string): { ok: number; fail: number; errors: string[] } {
-  const lines = stdout.split(/\r?\n/)
-  const errors = lines
-    .filter((line) => line.startsWith('ERR: '))
-    .map((line) => line.slice('ERR: '.length).trim())
-  const summary = lines.find((line) => /^OK=\d+\s+FAIL=\d+\s*$/.test(line.trim()))
-  if (summary === undefined) {
-    return { ok: 0, fail: Math.max(1, errors.length), errors }
+export function parseRecycleManyOutput(stdout: string): {
+  ok: number
+  fail: number
+  errors: string[]
+  /** 失败条目的**原始路径**（供调用方精确比对，不需要再解析字符串）。 */
+  failedPaths: string[]
+} {
+  /*
+   * ## 为什么用 JSON 而不是文本行（2026-11-04 自检）
+   *
+   * 旧实现输出 `ERR: <path> : <message>`，调用方用 `split(' : ')[0]` 取路径。
+   * 路径里只要含 ` : `（合法字符，Windows 允许），解析就截断：
+   *
+   * ```
+   * 错误行: "C:\temp\a : b\x.txt : not found"
+   * 提取:   "C:\temp\a"          ← 截断
+   * ```
+   *
+   * 后果：该路径不在失败集合里 → 被算成成功 → 写进审计。一个真实的删除
+   * 失败被记录成"已删除"，而审计最不该骗人。
+   *
+   * 现在脚本直接输出 JSON：路径是字段值，不参与任何字符串切分。
+   */
+  const trimmed = stdout.trim()
+  if (trimmed === '') {
+    return { ok: 0, fail: 1, errors: ['the recycle script produced no output'], failedPaths: [] }
   }
-  const ok = Number(/OK=(\d+)/.exec(summary)?.[1] ?? '0')
-  const fail = Number(/FAIL=(\d+)/.exec(summary)?.[1] ?? '0')
-  return { ok, fail, errors }
+
+  /* 脚本可能先输出别的行，找第一段可解析的 JSON。 */
+  let parsed: unknown
+  for (const candidate of [trimmed, ...trimmed.split(/\r?\n/).reverse()]) {
+    try {
+      parsed = JSON.parse(candidate)
+      break
+    } catch {
+      /* 继续尝试 */
+    }
+  }
+
+  if (parsed === null || typeof parsed !== 'object') {
+    return { ok: 0, fail: 1, errors: ['could not parse the recycle script output'], failedPaths: [] }
+  }
+
+  const record = parsed as { ok?: unknown; fail?: unknown; errors?: unknown }
+  const ok = typeof record.ok === 'number' && Number.isFinite(record.ok) ? record.ok : 0
+  const rawErrors = Array.isArray(record.errors) ? record.errors : []
+
+  const failedPaths: string[] = []
+  const messages: string[] = []
+  for (const entry of rawErrors) {
+    if (entry === null || typeof entry !== 'object') continue
+    const e = entry as { path?: unknown; message?: unknown }
+    const p = typeof e.path === 'string' ? e.path : ''
+    const m = typeof e.message === 'string' ? e.message : 'unknown error'
+    if (p !== '') failedPaths.push(p)
+    messages.push(p === '' ? m : `${p} : ${m}`)
+  }
+
+  const declaredFail = typeof record.fail === 'number' && Number.isFinite(record.fail) ? record.fail : 0
+  /*
+   * 取声明值与实际错误条目的较大者：脚本说 fail=0 却给了错误明细时，
+   * 不能因为汇总行把失败当成成功。
+   */
+  const fail = Math.max(declaredFail, rawErrors.length)
+
+  return { ok, fail, errors: messages, failedPaths }
 }
 
 /**
@@ -567,6 +645,7 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
         ok: true,
         recycled: parsed.ok,
         failed: parsed.errors,
+        failedPaths: parsed.failedPaths,
       }
     }
 

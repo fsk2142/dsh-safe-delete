@@ -44,6 +44,14 @@ type RecycleManyOutcome = {
   recycled: number;
   /** 部分失败时的逐条错误（成功的不受影响）。 */
   failed?: string[];
+  /**
+   * 失败条目的**原始路径**。
+   *
+   * 与 `failed` 分开：后者是给人看的描述，这里是给调用方做**精确比对**的。
+   * 曾经让调用方从 `failed` 里 `split(' : ')[0]` 反推路径 —— 那是在用
+   * 字符串拼结构化数据，路径里一旦含分隔符就会截断。
+   */
+  failedPaths?: string[];
 } | {
   ok: false;
   reason: string;
