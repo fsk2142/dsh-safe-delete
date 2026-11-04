@@ -501,11 +501,28 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 强制 ask 会让删除能力被无声废掉。
          */
         if (approvalPolicy(session) === 'never') {
-          // Pattern targets and sizes are unresolved here. Recycling them may be
-          // irreversible, so never cannot safely substitute for explicit approval.
-          if (hookDestination === 'recycle-bin') return {
-            kind: 'deny',
-            reason: 'refusing a potentially unrecoverable pattern delete because the approval policy is never; matched item sizes cannot be checked before execution',
+          /*
+           * ## 只在`确实会永久删除`时拒绝（2026-11-04 审计）
+           *
+           * 上一版是「never + 回收站 → 无条件 deny」，理由是 pattern 的目标
+           * 大小在执行前未知。但那个理由只覆盖**配额**这一种风险，而
+           * 「不确定」不等于「一定会永久删除」：
+           *
+           *  - 系统没有 NoRecycleFiles 策略，且目标没超配额 → 条目进回收站，
+           *    仍可恢复。此时拒绝等于把功能废掉 —— 而切到 never 的人正是
+           *    想不被打断地干活。
+           *
+           * 所以对齐非 pattern 分支的规则：**有确定风险才拒绝**。
+           * 配额风险在 pattern 下无法预判（目标未枚举），那部分交给执行期
+           * 的单条判定，不在这里替用户做决定。
+           */
+          if (hookDestination === 'recycle-bin' && hookPermanentDeleteRisk.risky) {
+            return {
+              kind: 'deny',
+              reason:
+                `refusing a permanently-destructive pattern delete because the approval policy is 'never': ` +
+                `${hookPermanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}`,
+            }
           }
           return next()
         }
