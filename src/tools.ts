@@ -202,6 +202,35 @@ const OUTPUT_SCHEMA: JsonSchemaSubset = {
 }
 
 /** 构造一个工具，统一异常转换（绝不把异常抛进工具管线）。 */
+/**
+ * 把调用方传的 `limit` / `n` 夹到合法区间。
+ *
+ * ## 为什么单独抽出来
+ *
+ * 原来两处（`safe_zone_list` 与 `safe_zone_journal`）各写了一遍
+ * `Math.min(200, Math.max(1, Number(x) || 20))`。重复的公式迟早会漂移，
+ * 而这两个数字（默认 20、上限 200）本身就是有含义的约定。
+ *
+ * ## 显式取整
+ *
+ * `Number(x)` 可能是小数（`limit: 1.5`），而 `slice(-1.5)` 会走
+ * `ToIntegerOrInfinity` 隐式截断成 `-1`。结果碰巧合理，但那是运气 ——
+ * 换个消费方式（比如 `Array.from({ length: limit })`）就会出错。
+ *
+ * 边界语义：
+ *   - 非数字 / 缺失 / 0 → 20（默认）
+ *   - 负数 → 1（用户要看东西，给一条比给零条有用）
+ *   - 超过 200 → 200（上限，避免把几万条路径塞进模型上下文）
+ *
+ * @param raw 调用方传的值。
+ * @returns 1..200 之间的整数。
+ */
+function clampLimit(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n === 0) return 20
+  return Math.min(200, Math.max(1, Math.floor(n)))
+}
+
 function makeTool(spec: {
   name: string
   description: string
@@ -996,7 +1025,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
        *
        * 200 与 journal 一致；真要更多就分页或按条件筛。
        */
-      const limit = Math.min(200, Math.max(1, Number(args.limit) || 20))
+      const limit = clampLimit(args.limit)
       const shown = entries.slice(-limit)
       const lines = shown.map(
         (e) =>
@@ -1133,7 +1162,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
     },
     beforeExecute: pruneIfDue,
     async execute(args) {
-      const limit = Math.min(200, Math.max(1, Number(args.n) || 20))
+      const limit = clampLimit(args.n)
       const records = readAudit(deps.stateDir, limit)
       if (records.length === 0) return { ok: true, text: 'journal is empty' }
       return {
