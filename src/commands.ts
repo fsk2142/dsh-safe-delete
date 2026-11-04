@@ -64,7 +64,7 @@ export interface CommandDeps {
   /** 读当前配置。 */
   readConfig: () => Promise<Record<string, unknown>>
   /** 写一项配置。 */
-  writeConfig: (key: string, value: number | boolean) => Promise<{ ok: boolean; error?: string }>
+  writeConfig: (key: string, value: number | boolean | string) => Promise<{ ok: boolean; error?: string }>
   /** 状态摘要。 */
   status: () => Promise<string>
 }

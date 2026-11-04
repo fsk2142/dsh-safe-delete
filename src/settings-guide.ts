@@ -13,7 +13,7 @@ export interface SettingGuide {
   /** 配置键（与 `Config` 中的字段一致）。 */
   key: string
   /** 单位（用于显示与解析）。 */
-  unit: 'bytes' | 'milliseconds' | 'percent' | 'count' | 'days' | 'boolean'
+  unit: 'bytes' | 'milliseconds' | 'percent' | 'count' | 'days' | 'boolean' | 'choice'
   /** 一句话：它管什么。 */
   summary: string
   /** 调大 / 调小分别会发生什么。 */
@@ -21,7 +21,9 @@ export interface SettingGuide {
   /** 合法范围的人话描述。 */
   range: string
   /** 默认值（原始单位）。 */
-  defaultValue: number | boolean
+  defaultValue: number | boolean | string
+  /** choice 的合法取值（其它 unit 不用）。 */
+  choices?: readonly string[]
 }
 
 /** 1 GB 的字节数。 */
@@ -33,6 +35,20 @@ const GB = 1024 * 1024 * 1024
  * 顺序即 `/safe-delete config` 的展示顺序。
  */
 export const SETTING_GUIDES: readonly SettingGuide[] = [
+  {
+    key: 'deleteDestination',
+    unit: 'choice',
+    choices: ['safe-zone', 'recycle-bin'],
+    summary:
+      '删除的文件去安全区还是直接进系统回收站。安全区会统计文件数与总大小（大目录删除慢一些），' +
+      '换来「删太多先问一次」和插件内按条目恢复；回收站跳过统计，速度与文件数无关，' +
+      '但超大删除不再额外确认、取回要去系统回收站。',
+    effect:
+      '改成 recycle-bin：删除更快，但不再统计大小、不触发按大小/条数的确认，恢复要用系统回收站。' +
+      '改成 safe-zone：回到默认行为，保留插件内恢复与两道确认阈值。',
+    range: 'safe-zone 或 recycle-bin；默认 safe-zone',
+    defaultValue: 'safe-zone',
+  },
   {
     key: 'retentionDays',
     unit: 'days',
@@ -116,6 +132,7 @@ export function humanDuration(ms: number): string {
  */
 export function formatSetting(guide: SettingGuide, value: unknown): string {
   if (guide.unit === 'boolean') return value === true ? 'on' : 'off'
+  if (guide.unit === 'choice') return typeof value === 'string' ? value : '(未设置)'
   if (typeof value !== 'number' || !Number.isFinite(value)) return '(未设置)'
   switch (guide.unit) {
     case 'bytes':
@@ -134,7 +151,9 @@ export function formatSetting(guide: SettingGuide, value: unknown): string {
 }
 
 /** 解析结果。 */
-export type ParseSetting = { ok: true; value: number | boolean } | { ok: false; error: string }
+export type ParseSetting =
+  | { ok: true; value: number | boolean | string }
+  | { ok: false; error: string }
 
 /**
  * 解析用户输入的值。
@@ -151,6 +170,16 @@ export function parseSetting(guide: SettingGuide, raw: string): ParseSetting {
     if (['on', 'true', '1', 'yes', '开'].includes(lowered)) return { ok: true, value: true }
     if (['off', 'false', '0', 'no', '关'].includes(lowered)) return { ok: true, value: false }
     return { ok: false, error: `只接受 on 或 off。${guide.summary}` }
+  }
+
+  if (guide.unit === 'choice') {
+    const lowered = text.toLowerCase()
+    const allowed = guide.choices ?? []
+    if (allowed.includes(lowered)) return { ok: true, value: lowered }
+    return {
+      ok: false,
+      error: `只接受 ${allowed.join(' 或 ')}。${guide.summary}`,
+    }
   }
 
   const match = /^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z%]*)$/.exec(text)
