@@ -3,16 +3,29 @@ import { describe, expect, it } from 'vitest'
 import { buildRecycleManyScript, parseRecycleManyOutput } from '../src/recycle'
 
 describe('buildRecycleManyScript', () => {
-  it('handles a path list from a file with SendToRecycleBin', () => {
+  it('recycles the whole list through SHFileOperation', () => {
     const script = buildRecycleManyScript()
 
-    expect(script).toContain('SendToRecycleBin')
-    // 不弹确认框：模态对话框会把后台进程挂住。
-    expect(script).toContain('OnlyErrorDialogs')
-    expect(script).toContain('DeleteDirectory')
-    expect(script).toContain('DeleteFile')
-    // 一个脚本处理全部路径，不是每条一次调用。
-    expect(script.match(/foreach/g)?.length).toBe(1)
+    /*
+     * ## 为什么从 SendToRecycleBin 换成 SHFileOperation（2026-11-04）
+     *
+     * 用户报告：清掉 34,480 个过期条目时，Windows 弹出了「正在准备回收…」
+     * 进度窗口盖在前台。根因是 `FileSystem.DeleteDirectory` 在交互式会话里
+     * 会调 shell 的进度 UI，而 `windowsHide` 管不了它。
+     *
+     * `SHFileOperationW` + `FOF_SILENT | FOF_NOERRORUI` 能真正压掉 UI，
+     * 且支持**一次传多个路径**（实测 20,000 个文件 3.8 秒、无窗口）
+     * 和一次送 3 个目录、原位置各自保留。
+     */
+    expect(script).toContain('SHFileOperationW')
+    // FOF_ALLOWUNDO：没有它 SHFileOperation 是**永久删除**。
+    expect(script).toContain('0x0040')
+    // FOF_SILENT(0x04) / FOF_NOERRORUI(0x400)：压掉 UI。
+    expect(script).toContain('0x0004')
+    expect(script).toContain('0x0400')
+    // 不再用会弹窗的那个 API。
+    expect(script).not.toContain('SendToRecycleBin')
+    expect(script).not.toContain('DeleteDirectory')
   })
 
   it('reads the list from $listPath instead of inlining paths', () => {

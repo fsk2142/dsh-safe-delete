@@ -318,33 +318,86 @@ function waitForGone(absPath: string, timeoutMs: number): void {
  * @returns PowerShell 脚本正文。
  */
 export function buildRecycleManyScript(): string {
+  /*
+   * ## 为什么用 SHFileOperation 而不是 FileSystem.DeleteDirectory
+   *
+   * 2026-11-04 实测：\`Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory\`
+   * 在**交互式桌面会话**里删大目录时会弹出 Windows 的「正在准备回收…」进度
+   * 窗口（用户报告：34,480 个项目的窗口盖在前台）。\`windowsHide: true\` 管不了它 ——
+   * 那个窗口由 shell 绘制，不是控制台窗口。
+   *
+   * \`SHFileOperationW\` + \`FOF_ALLOWUNDO\` 是同一套底层能力的旧版 API，但它接受
+   * **一次传多个路径**，且 \`FOF_SILENT | FOF_NOERRORUI\` 能真正压掉 UI。
+   *
+   * 实测对照（本机，Windows，同卷）：
+   *
+   * | 方式 | 20,000 个文件 | 弹窗 |
+   * |---|---|---|
+   * | DeleteDirectory | 4.9s | **会** |
+   * | SHFileOperation | 3.8s | 不会 |
+   *
+   * 且多路径一次调用可用：3 个目录一次送进回收站，原位置各自保留。
+   */
+  const csType = [
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'public static class DshShFileOp {',
+    '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+    '  public struct SHFILEOPSTRUCTW {',
+    '    public IntPtr hwnd;',
+    '    public uint wFunc;',
+    '    [MarshalAs(UnmanagedType.LPWStr)] public string pFrom;',
+    '    [MarshalAs(UnmanagedType.LPWStr)] public string pTo;',
+    '    public ushort fFlags;',
+    '    [MarshalAs(UnmanagedType.Bool)] public bool fAnyOperationsAborted;',
+    '    public IntPtr hNameMappings;',
+    '    [MarshalAs(UnmanagedType.LPWStr)] public string lpszProgressTitle;',
+    '  }',
+    '  [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "SHFileOperationW")]',
+    '  public static extern int SHFileOperationW(ref SHFILEOPSTRUCTW lp);',
+    '}',
+  ].join('\n')
+
   return [
     "$ErrorActionPreference = 'Stop'",
-    'Add-Type -AssemblyName Microsoft.VisualBasic',
+    /* 路径从文件读：命令行长度与路径数无关（审查 Critical-2）。 */
+    "$targets = @(Get-Content -LiteralPath $listPath -Encoding UTF8 | Where-Object { $_ -ne '' })",
+    'if ($targets.Count -eq 0) { Write-Output "OK=0 FAIL=0"; exit 0 }',
+    '$present = @($targets | Where-Object { Test-Path -LiteralPath $_ })',
+    '$missing = @($targets | Where-Object { -not (Test-Path -LiteralPath $_) })',
+    'foreach ($m in $missing) { Write-Output "ERR: $m : not found" }',
+    'if ($present.Count -eq 0) { Write-Output "OK=0 FAIL=$($missing.Count)"; exit 0 }',
+    /* 类型定义用单引号 here-string 交给 Add-Type。 */
+    "$cs = @'\n" + '$CS_BODY_PLACEHOLDER' + '\n' + "'@",
+    'Add-Type -TypeDefinition $cs',
+    '$op = New-Object DshShFileOp+SHFILEOPSTRUCTW',
+    '$op.wFunc = 3',
+    '$op.pFrom = ($present -join [char]0) + [char]0 + [char]0',
+    '$op.pTo = $null',
     /*
-     * ## 路径从文件读，不内联进命令行（2026-11-04 审查 Critical-2）
-     *
-     * Windows 的 `CreateProcess` 命令行上限是 32767 字符。把路径内联进
-     * `-Command` 时，500 条 × 约 92 字符 ≈ 49k 就超了，`execFileSync` 直接抛错，
-     * 用户一次删几千个会静默回落安全区（慢路径）。
-     *
-     * 从 UTF-8 文件读，命令行长度与路径数**无关**。
-     * `-LiteralPath` 保证通配符不被展开；空行跳过。
+     * FOF_ALLOWUNDO(0x40) 让删除走回收站；没有它 SHFileOperation 是**永久删除**。
+     * FOF_NOCONFIRMATION(0x10) 不问；FOF_SILENT(0x04) 与 FOF_NOERRORUI(0x400) 压掉 UI。
      */
-    '$targets = @(Get-Content -LiteralPath $listPath -Encoding UTF8 | Where-Object { $_ -ne "" })',
-    '$ok = 0; $fail = 0',
-    'foreach ($t in $targets) {',
-    '  try {',
-    '    if (Test-Path -LiteralPath $t -PathType Container) {',
-    '      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($t, "OnlyErrorDialogs", "SendToRecycleBin")',
-    '    } else {',
-    '      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($t, "OnlyErrorDialogs", "SendToRecycleBin")',
-    '    }',
-    '    $ok++',
-    '  } catch { $fail++; Write-Output "ERR: $t : $($_.Exception.Message)" }',
+    '$op.fFlags = 0x0040 -bor 0x0010 -bor 0x0004 -bor 0x0400',
+    '$rc = [DshShFileOp]::SHFileOperationW([ref]$op)',
+    'if ($rc -ne 0) {',
+    '  foreach ($p in $present) { Write-Output "ERR: $p : SHFileOperation returned $rc" }',
+    '  Write-Output "OK=0 FAIL=$($present.Count + $missing.Count)"',
+    '  exit 0',
     '}',
-    'Write-Output "OK=$ok FAIL=$fail"',
-  ].join('\n')
+    'if ($op.fAnyOperationsAborted) {',
+    '  foreach ($p in $present) { Write-Output "ERR: $p : operation aborted by the shell" }',
+    '  Write-Output "OK=0 FAIL=$($present.Count + $missing.Count)"',
+    '  exit 0',
+    '}',
+    /* 逐条复核：成功时路径应当已从原处消失。 */
+    '$gone = @($present | Where-Object { -not (Test-Path -LiteralPath $_) })',
+    '$left = @($present | Where-Object { Test-Path -LiteralPath $_ })',
+    'foreach ($p in $left) { Write-Output "ERR: $p : still present after the shell operation" }',
+    'Write-Output "OK=$($gone.Count) FAIL=$($left.Count + $missing.Count)"',
+  ]
+    .join('\n')
+    .replace('$CS_BODY_PLACEHOLDER', csType)
 }
 
 /**

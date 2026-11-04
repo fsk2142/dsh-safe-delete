@@ -15,8 +15,14 @@ describe('recycle script does not inline paths into the command line', () => {
   it('keeps the script short regardless of how many paths there are', () => {
     const script = buildRecycleManyScript()
 
-    // 脚本本身必须远小于命令行上限 —— 它只读文件，不携带路径。
-    expect(script.length).toBeLessThan(2000)
+    /*
+     * 脚本本身必须远小于命令行上限 —— 它只读文件，不携带路径。
+     *
+     * 2026-11-04 换成 SHFileOperation 后多了 C# 互操作类型定义（约 800 字符），
+     * 但仍是一个**常量**：与路径数量无关。上限放宽到 4000 只为容纳那段定义，
+     * 真正的保护是下面那条「不含任何具体路径」。
+     */
+    expect(script.length).toBeLessThan(4000)
   })
 
   it('reads the path list from a file it is told about', () => {
