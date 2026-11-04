@@ -453,16 +453,46 @@ export function humanBytes(bytes: number): string {
   return `${value.toFixed(1)} ${units[unitIndex]}`
 }
 
+/**
+ * 顶层条目列表后面那行「还有多少」。
+ *
+ * ## 为什么不能直接算差值（2026-11-04）
+ *
+ * 旧代码写 `${d.fileCount - 10} more`。回收站模式跳过统计时 `fileCount` 是 0，
+ * 于是打印出 `-10 more`。统计被跳过时改用不带数字的说法。
+ *
+ * @param d 目标描述。
+ * @returns 以换行开头的追加文本。
+ */
+function moreText(d: TargetDescription): string {
+  if (d.statsOmitted === true) return '\n  … and more'
+  const rest = d.fileCount - d.topEntries.slice(0, 10).length
+  return rest > 0 ? `\n  … and ${rest} more` : '\n  … and more'
+}
+
+/**
+ * 「多少个文件、多大」那一段。
+ *
+ * 统计被跳过时不能报 `0 entries, 0 B` —— 那是谎报目标为空。
+ *
+ * @param d 目标描述。
+ * @returns 人看的尺寸描述。
+ */
+function sizeText(d: TargetDescription): string {
+  if (d.statsOmitted === true) return `${d.topEntries.length}+ top-level entries`
+  return d.isDirectory ? `${d.fileCount} entries, ${humanBytes(d.bytes)}` : `file, ${humanBytes(d.bytes)}`
+}
+
 /** 把预览结论拼成人看的文本。 */
 export function describePreview(result: Extract<DeleteResult, { kind: 'preview' }>, retentionDays: number): string {
   const d = result.description
   const top =
     d.topEntries.length > 0
-      ? `\n  ${d.topEntries.slice(0, 10).join('\n  ')}${d.truncated ? `\n  … and ${d.fileCount - 10} more` : ''}`
+      ? `\n  ${d.topEntries.slice(0, 10).join('\n  ')}${d.truncated ? moreText(d) : ''}`
       : ''
   return (
     `PREVIEW (nothing moved):\n${result.target}\n` +
-    `${d.isDirectory ? 'directory' : 'file'}: ${d.fileCount} entr${d.fileCount === 1 ? 'y' : 'ies'}, ${humanBytes(d.bytes)}${top}\n\n` +
+    `${d.isDirectory ? 'directory' : 'file'}: ${sizeText(d)}${top}\n\n` +
     `classification: ${result.gate.classification}` +
     (result.gate.needsApproval ? ` — will need your approval (${result.gate.reasons.join('; ')})` : ' — moves without asking') +
     `\nretention: ${retentionDays} days`
@@ -482,9 +512,9 @@ export function describeMoved(result: Extract<DeleteResult, { kind: 'moved' }>, 
   // 这个格式复制 id 去调 safe_zone_restore。输出格式是隐含契约。
   const top =
     d.topEntries.length > 0
-      ? `\n  ${d.topEntries.slice(0, 10).join('\n  ')}${d.truncated ? `\n  … and ${d.fileCount - 10} more` : ''}`
+      ? `\n  ${d.topEntries.slice(0, 10).join('\n  ')}${d.truncated ? moreText(d) : ''}`
       : ''
-  const size = d.isDirectory ? `${d.fileCount} entries, ${humanBytes(d.bytes)}` : `file, ${humanBytes(d.bytes)}`
+  const size = sizeText(d)
   return (
     `moved to safe zone: ${result.target}\n` +
     `  id: ${result.entry.id}  ${size}${top}\n` +

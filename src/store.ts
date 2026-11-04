@@ -38,7 +38,7 @@ import { normalize as normalizeForCompare } from './classify'
 import { describeTarget } from './describe'
 import { withIndexLock } from './index-lock'
 import { moveToSystemRecycleBin, type RecycleOutcome, type Recycler } from './recycle'
-import type { TrashEntry } from './types'
+import type { TargetDescription, TrashEntry } from './types'
 
 /** 移入选项。 */
 export interface MoveOptions {
@@ -50,6 +50,17 @@ export interface MoveOptions {
   now?: number
   /** 跨卷时是否允许「复制 + 删源」。默认 false。 */
   crossVolumeCopy?: boolean
+  /**
+   * 调用方**已经算过**的目标描述。
+   *
+   * ## 为什么要有这个字段（2026-11-04）
+   *
+   * `deletePath` 为了审批卡片已经描述过一次目标，`stageInto` 又描述一次 ——
+   * 目录大时这是两遍全树遍历。把结果传下来，`stageInto` 直接用，省掉一半。
+   *
+   * 不传时行为不变（`stageInto` 自己描述），所以批量路径与老调用方不受影响。
+   */
+  description?: TargetDescription
 }
 
 const INDEX_FILE = 'index.json'
@@ -569,7 +580,8 @@ async function stageInto(stateDir: string, absPath: string, opts: MoveOptions): 
   }
 
   const now = opts.now ?? Date.now()
-  const description = describeTarget(target)
+  // 调用方给过描述就直接用，不再重复遍历整棵树（见 MoveOptions.description）。
+  const description = opts.description ?? describeTarget(target)
   if (!description.exists) {
     throw new Error(`not found: ${target}`)
   }
