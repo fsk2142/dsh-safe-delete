@@ -19,6 +19,8 @@ import {
   deletePath,
   describeMoved,
   describeRecycled,
+  normalizeDestination,
+  type DeleteDestination,
   describePreview,
   humanBytes,
   type DeleteContext,
@@ -28,7 +30,8 @@ import { readCleanupJob, requestCleanup } from './cleanup'
 import { describeTarget } from './describe'
 import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
-import type { Recycler } from './recycle'
+import type { Recycler, RecycleManyOutcome } from './recycle'
+import { recycleManyToSystemBin } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
 
@@ -144,6 +147,18 @@ export interface ToolDeps {
    * 生产路径不传，默认走 `moveToSystemRecycleBin`。
    */
   recycler?: Recycler
+  /**
+   * 删除去向（从配置透传）。
+   *
+   * 缺省 `safe-zone`：旧调用方与旧配置都不受影响。
+   */
+  destination?: DeleteDestination
+  /**
+   * 可替换的「批量移入回收站」实现（仅测试用）。
+   *
+   * 回收站模式下整批交给它一次，而不是每条一次进程。
+   */
+  recyclerMany?: (absPaths: readonly string[]) => RecycleManyOutcome
   /** 当前时间（测试可注入）。 */
   now?: () => number
 }
@@ -378,7 +393,14 @@ async function deleteMany(
       immediatelyRejected.push({ target: resolved, error: 'not found' })
       continue
     }
-    const description = describeTarget(resolved)
+    /*
+     * 回收站模式跳过目录的全树统计：这是批量删除里唯一与文件数成正比的成本，
+     * 而该模式不做按大小的确认（见配置项 `deleteDestination` 的说明）。
+     */
+    const description = describeTarget(
+      resolved,
+      normalizeDestination(ctx.destination) === 'recycle-bin' ? { stats: false } : {},
+    )
     plans.push({ target: resolved, description, gate: decideGate(resolved, description, ctx) })
   }
 
@@ -498,6 +520,49 @@ async function deleteMany(
    * **每一个**条目上，索引膨胀是单条路径的 N 倍。
    */
   const boundedReason = boundReason(base.reason)
+
+  /*
+   * ## 回收站模式：整批交给回收站一次（2026-11-04）
+   *
+   * 一次进程处理全部真实路径，而不是每条一次 —— 后者在 Windows 上是
+   * 每条 200–500ms 的进程启动开销。
+   *
+   * 失败回落安全区（下面的 `moveManyToSafeZone` 照常执行），绝不静默永久删除。
+   */
+  if (normalizeDestination(ctx.destination) === 'recycle-bin' && plans.length > 0) {
+    const recycle = ctx.recycler ?? recycleManyToSystemBin
+    const outcome = recycle(plans.map((p) => p.target))
+    if (outcome.ok) {
+      const auditRecords: Array<Omit<AuditRecord, 'at'>> = plans.map((p) => ({
+        event: 'delete',
+        target: p.target,
+        tool: 'safe_delete',
+        detail: `destination=recycle-bin cls=${p.gate.classification}`,
+      }))
+      appendAuditBatch(ctx.stateDir, auditRecords)
+      const lines = plans.map((p) => `${p.target}  →  system recycle bin`)
+      if (failed.length > 0) {
+        lines.push('', `Skipped (${failed.length}):`)
+        for (const item of failed) lines.push(`  ${item.target} — ${item.error}`)
+      }
+      lines.push(
+        '',
+        `Moved ${outcome.recycled} item(s) to the system recycle bin. ` +
+          'Restore them from the recycle bin itself — this deletion is not tracked in the safe zone.',
+      )
+      return { ok: true, text: lines.join('\n') }
+    }
+    // 回落：把原因记进审计，让用户能看到「本想进回收站，结果进了安全区」。
+    appendAuditBatch(ctx.stateDir, [
+      {
+        event: 'delete',
+        target: `${plans.length} item(s)`,
+        tool: 'safe_delete',
+        detail: `destination=recycle-bin fell back to safe zone: ${outcome.reason}`,
+      },
+    ])
+  }
+
   const batch = await moveManyToSafeZone(
     ctx.stateDir,
     plans.map((p) => p.target),
@@ -704,6 +769,12 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         confirmFileCount: deps.confirmFileCount ?? 0,
         confirmBytes: deps.confirmBytes ?? 0,
         ...(deps.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+        /*
+         * 目的地与批量回收站实现都从 deps 透传：
+         * 前者决定走哪条路，后者让测试不必真的调 PowerShell。
+         */
+        ...(deps.destination === undefined ? {} : { destination: deps.destination }),
+        ...(deps.recyclerMany === undefined ? {} : { recycler: deps.recyclerMany }),
         // 容量层已移除，所以没有容量相关的字段要传。
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
