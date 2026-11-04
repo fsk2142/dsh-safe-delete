@@ -171,6 +171,16 @@ export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
     // 走同一个计数入口，保证测试驱动的路径与生产路径是同一份逻辑。
     recordRecycleFailure()
   }
+    /*
+     * 只接受 root 的**子键**：`reg query <root>` 列出的子键都以 root 开头。
+     *
+     * 旧写法是 `line.startsWith('HKEY_')` —— 过宽。虽然当前输出里只有键行
+     * 以 HKEY_ 开头（值行有缩进，被 trim 后以值名开头），但如果某个卷的键里
+     * 恰好有一个**值**名叫 `HKEY_whatever`，它就会被当成卷键，然后拿去读
+     * MaxCapacity，得到一个空结果。
+     *
+     * 加 root + 反斜杠前缀后，只有真正的子键能通过。
+     */
   return outcome
 }
 
@@ -267,9 +277,35 @@ function recycleOnWindows(absPath: string): RecycleOutcome {
 }
 
 function recycleOnMac(absPath: string): RecycleOutcome {
-  const escaped = absPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  /*
+   * ## 为什么路径走 argv 而不是插值进脚本（2026-11-04 自检）
+   *
+   * 旧实现把路径拼进 AppleScript 源码：
+   *
+   * ```applescript
+   * tell application "Finder" to delete POSIX file "<path>"
+   * ```
+   *
+   * 只转义了反斜杠和双引号。路径含**换行 / 回车 / U+2028** 时，
+   * AppleScript 的字符串字面量直接变非法 —— osascript 报语法错，删除失败。
+   * 不是"删错地方"，而是「一个文件永远删不掉，还看不懂为什么」。
+   *
+   * 这是典型的「把数据插值进代码」。改法是让数据走 argv：
+   * `osascript -e 'on run argv' -e '...' -e 'end run' -- <path>`。
+   * 路径完全不进脚本正文，任何字符都安全。
+   *
+   * 对照：Linux 分支一直是对的（`execFileSync(command, [args])`），
+   * 只有这里用了字符串插值。
+   */
+  const script = [
+    'on run argv',
+    '  set targetPath to item 1 of argv',
+    '  tell application "Finder" to delete POSIX file targetPath',
+    'end run',
+  ].join('\n')
+
   try {
-    execFileSync('osascript', ['-e', `tell application "Finder" to delete POSIX file "${escaped}"`], {
+    execFileSync('osascript', ['-e', script, '--', absPath], {
       timeout: COMMAND_TIMEOUT_MS,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -279,9 +315,11 @@ function recycleOnMac(absPath: string): RecycleOutcome {
   waitForGone(absPath, 3000)
   return existsSync(absPath) ? { ok: false, reason: 'Finder returned but the path still exists' } : { ok: true }
 }
-
 /**
  * Linux：优先 `gio trash`（GNOME/现代发行版都有），退回 `trash-put`。
+ *
+ * 路径走 argv —— 与 macOS 分支的旧实现相反，这里从来没有把路径
+ * 拼进 shell 字符串。
  *
  * @param absPath 绝对路径。
  * @returns 结果。
@@ -870,7 +908,14 @@ export function detectQuotaRisk(
 
 /** 列出 BitBucket 下的卷键（形如 `{GUID}` 或卷名）。 */
 function listBitBucketVolumeKeys(): string[] {
-  const root = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BitBucket\\Volume'
+  /*
+   * root 用**完整**前缀，与 `reg query` 输出一致。
+   *
+   * 传 `HKCU\...` 给 reg 是可以的（它会展开），但**输出**里写的是
+   * `HKEY_CURRENT_USER\...`。用缩写去做 startsWith 永远匹配不上 ——
+   * 那会让配额完全读不到，超配额文件静默永久删除。
+   */
+  const root = 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BitBucket\\Volume'
   try {
     const out = execFileSync('reg', ['query', root], {
       encoding: 'utf8',
@@ -880,7 +925,7 @@ function listBitBucketVolumeKeys(): string[] {
     return out
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .filter((line) => line.startsWith('HKEY_CURRENT_USER\\') || line.startsWith('HKEY_'))
+      .filter((line) => line.startsWith(`${root}\\`))
   } catch {
     return []
   }
