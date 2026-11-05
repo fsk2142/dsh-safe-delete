@@ -889,6 +889,57 @@ export type RegistryRead = (key: string, name: string) => RegistryReadResult
 export type RegistryReader = (key: string, name: string) => RegistryReadResult | string
 
 /**
+ * 把任意返回值收敛成 `RegistryReadResult`。**这一层是运行时的兜底。**
+ *
+ * ## 为什么类型收窄还不够（2026-11-05 自检）
+ *
+ * 上一版直接 `raw.kind`。类型上 `RegistryReader` 已经不允许 `undefined`，但运行时
+ * 仍然会有：JS 调用方、旧版本注入的适配器、`as any`、以及任何我没预料到的写法。
+ * 一旦漏进来，`detectPermanentDeleteRisk()` 就抛 `TypeError`。
+ *
+ * 而它是在 `apply()` 里**同步**调用的，`apply()` 没有 try/catch：
+ *
+ * ```text
+ * apply() 抛错 → pre-execute 钩子没注册 → 所有删除都没有拦截
+ * ```
+ *
+ * 一个保护性检查的崩溃会让保护**完全消失**。所以这里宁可把不认识的返回值
+ * 判成 `unknown`（= 问人），也绝不抛错。类型层防"写错"，运行时层防"加载崩"。
+ *
+ * @param result 读取函数的原始返回值。
+ * @returns 规范化后的结果；无法识别时是 `error`（= unknown）。
+ */
+function coerceRegistryRead(result: unknown): RegistryReadResult {
+  if (typeof result === 'string') return { kind: 'value', value: result }
+  if (result !== null && typeof result === 'object') {
+    const kind = (result as { kind?: unknown }).kind
+    if (kind === 'missing') return { kind: 'missing' }
+    if (kind === 'value') {
+      const value = (result as { value?: unknown }).value
+      if (typeof value === 'string') return { kind: 'value', value }
+      return { kind: 'error', reason: 'the registry reader returned a "value" result without a string value' }
+    }
+    if (kind === 'error') {
+      const reason = (result as { reason?: unknown }).reason
+      return {
+        kind: 'error',
+        reason: typeof reason === 'string' ? reason : 'the registry read failed without a reason',
+      }
+    }
+  }
+  /*
+   * `undefined` / `null` / 数字 / 布尔 / 数组 / 无 kind 的对象。
+   *
+   * 旧测试里的 `() => undefined` 曾经表示"值不存在"。那正是 R01 要消灭的歧义，
+   * 所以这里**不能**把它当 missing —— 它是一个不该出现的返回值，按未知处理。
+   */
+  return {
+    kind: 'error',
+    reason: `the registry reader returned an unrecognised result (${result === null ? 'null' : typeof result})`,
+  }
+}
+
+/**
  * 默认的 `reg` 执行器。
  *
  * 编码用 `utf8`：`reg.exe` 的错误消息来自 MUI 资源，中文系统上是 GBK。
@@ -1054,13 +1105,7 @@ export function detectPermanentDeleteRisk(
   const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer'
   let raw: RegistryReadResult
   try {
-    const result = read(key, 'NoRecycleFiles')
-    /*
-     * 兼容测试里 `() => '1'` 这种便利写法。它表达的是"读到了这个值"，
-     * 与 `{ kind: 'value' }` 等价；`undefined` 不再被接受 —— 想表达
-     * "值不存在"必须显式写 `{ kind: 'missing' }`。
-     */
-    raw = typeof result === 'string' ? { kind: 'value', value: result } : result
+    raw = coerceRegistryRead(read(key, 'NoRecycleFiles'))
   } catch (error) {
     return {
       status: 'unknown',

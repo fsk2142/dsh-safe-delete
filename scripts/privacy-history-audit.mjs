@@ -141,7 +141,12 @@ const rules = [
     fixtureSkippable: false,
   },
   {
-    label: '对话痕迹（用户原话）',
+    /*
+     * 标签与 `privacy-audit.mjs` 保持一致，且**刻意不含触发词**：
+     * 这个标签会写进基线文件的 `rule` 字段，含触发词就会让基线文件自己被判成泄露
+     * （2026-11-05 自检踩过，见 README「两套隐私扫描的分工」）。
+     */
+    label: '对话痕迹',
     pattern: /用户原话|用户说[：:]|你说[：:]|报障[：:]|经用户确认|用户已同意|用户明确指出|用户报障/,
     severity: 'medium',
     fixtureSkippable: true,

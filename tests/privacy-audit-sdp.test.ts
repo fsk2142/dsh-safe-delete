@@ -138,46 +138,29 @@ describe('privacy-audit: does not leak, does not re-read', () => {
     expect(loop, '规则循环里不该直接调 git show').not.toMatch(/readStaged\(/)
   })
 
-  it('keeps this repo itself clean, with a narrow baseline-file exemption (R05)', () => {
+  it('keeps this repo itself clean, and keeps rule labels free of trigger words', () => {
     /*
-     * ## 这条防的是什么（2026-11-05 第三轮复审 R05 的连带问题）
+     * ## 这条防的是什么（2026-11-05 自检）
      *
-     * 新增 `scripts/privacy-history-baseline.json` 之后，gate 的隐私审计红了：
-     * 那个文件的每一条都记着**规则标签**，而「对话痕迹」这条规则的标签本身
-     * 就含触发词。一个只用来登记"哪条已接受"的元数据文件，被自己的规则判成了
-     * 泄露。
+     * 新增 `scripts/privacy-history-baseline.json` 之后，gate 的隐私审计红了，
+     * 历史扫描还把它报成 3 处**新增**命中。根因不是那个文件，而是**规则标签
+     * 自己含触发词**：标签原名叫「对话痕迹」后面跟了个括号补充，而括号里的词
+     * 正是该规则的一个分支 —— 于是任何要写出规则名的地方（基线、报告、文档）
+     * 都会再撞一次。
      *
-     * 修法必须是**按规则、按文件**的最小豁免，不能把整份文件加进 `SCANNERS`
-     * —— 那会连凭据规则一起放过，正是 R03 要消灭的口子。这条测试锁住两件事：
-     * 豁免确实存在（否则 CI 永远红），且它只挂在那一条规则上。
+     * 第一版修法是给那个文件加 `ignoreFiles`。那是给症状打补丁：每多一个要写
+     * 规则名的文件，就多一条豁免。正确修法是把触发词从**标识**里拿掉。
      *
-     * ## 触发词必须运行时拼接
-     *
-     * 这份测试本身也被同一个审计扫。把标签字面量写进来，审计就会因为**这条
-     * 测试**变红（第一次写的时候正是这样）—— 那不是"绕过审计"，而是夹具：
-     * 被检查的是"规则标签长什么样"，不是"真的有对话内容被写进仓库"。
+     * 这条测试锁住三件事：
+     *   1. 本仓库当前审计通过（否则 CI 永远红）；
+     *   2. 没有为基线文件开"按文件"的特例（那会连凭据一起放过，正是 R03 的口子）；
+     *   3. 两个扫描器的规则标签都不含自己的触发词。
      */
     const { readFileSync } = require('node:fs') as typeof import('node:fs')
-    const src = readFileSync('scripts/privacy-audit.mjs', 'utf8')
-
-    // 拼出规则标签，源码里不存在那个连续字面量。
-    const traceLabel = ['对话痕迹', '（', '用户', '原话', '）'].join('')
-
-    // 基线文件的豁免必须出现在「对话痕迹」这条规则里。
-    const traceStart = src.indexOf(`label: '${traceLabel}'`)
-    expect(traceStart, '应能找到对话痕迹规则').toBeGreaterThan(0)
-    const traceBlock = src.slice(traceStart, src.indexOf('},', traceStart))
-    expect(traceBlock, '基线文件应在这条规则上豁免').toMatch(/privacy-history-baseline\.json/)
-
-    // 但它**不能**出现在 SCANNERS 名单里 —— 那会连凭据一起跳过。
-    const scannersStart = src.indexOf('const SCANNERS = new Set([')
-    const scannersBlock = src.slice(scannersStart, src.indexOf('])', scannersStart))
-    expect(scannersBlock, '基线文件不能被整份加入 SCANNERS').not.toMatch(/privacy-history-baseline/)
 
     /*
      * 端到端：这个仓库当前必须审计通过。
-     *
-     * 单看源码结构不够 —— 拿真实仓库跑一遍才知道豁免够不够、宽不宽。
+     * 单看源码结构不够 —— 拿真实仓库跑一遍才知道到底红不红。
      */
     try {
       execFileSync(process.execPath, ['scripts/privacy-audit.mjs'], {
@@ -187,6 +170,56 @@ describe('privacy-audit: does not leak, does not re-read', () => {
     } catch (error) {
       const e = error as { stdout?: string; stderr?: string }
       expect.fail(`本仓库的隐私审计必须通过，实际失败：\n${e.stdout ?? ''}${e.stderr ?? ''}`)
+    }
+
+    /*
+     * 不为这份文件开按文件的特例。
+     *
+     * 用拼接避开把文件名写成连续字面量 —— 那本身没有触发词，但保持与其它夹具
+     * 一致的写法，免得以后有人照抄成"把文件名加进 SCANNERS"。
+     */
+    const baselineFile = ['privacy', '-history', '-baseline', '.json'].join('')
+    const src = readFileSync('scripts/privacy-audit.mjs', 'utf8')
+    const scannersStart = src.indexOf('const SCANNERS = new Set([')
+    const scannersBlock = src.slice(scannersStart, src.indexOf('])', scannersStart))
+    expect(scannersBlock, '基线文件不能整份进 SCANNERS').not.toContain(baselineFile)
+
+    /*
+     * 标签不含触发词 —— 这才是根因的修复。
+     *
+     * 逐个扫描器提取 `label: '...'`，断言没有任何标签含触发词。标签是给人看的
+     * 短名字，不该与它检测的内容同形 —— 否则任何写出规则名的文件都会被判泄露。
+     *
+     * ## 触发词为什么要在运行时拼
+     *
+     * 这份测试本身也被同一条规则扫。把触发词写成字面量，审计就会因为**这条
+     * 测试**变红。那不是绕过审计，而是夹具：源码里不该存在那些连续字面量，
+     * 否则它们又成了"写出规则名的文件都会踩到"的东西 —— 与这条测试要防的
+     * 缺陷是同一个形态。
+     */
+    const triggerWords = [
+      '用户' + '原话',
+      '用户' + '说',
+      '报' + '障' + '：',
+      '经' + '用户确认',
+      '用户已' + '同意',
+      '用户明确' + '指出',
+      '用户' + '报障',
+    ]
+
+    for (const script of ['scripts/privacy-audit.mjs', 'scripts/privacy-history-audit.mjs']) {
+      const text = readFileSync(script, 'utf8')
+      const labels = [...text.matchAll(/label: '([^']+)'/g)].map((m) => m[1])
+      expect(labels.length, `${script} 应能提取到规则标签`).toBeGreaterThan(0)
+      for (const label of labels) {
+        for (const word of triggerWords) {
+          expect(
+            label.includes(word),
+            `${script} 的标签「${label}」含触发词「${word}」：` +
+              '任何写出规则名的文件（基线、报告、文档）都会被判成泄露',
+          ).toBe(false)
+        }
+      }
     }
   }, 60_000)
 })

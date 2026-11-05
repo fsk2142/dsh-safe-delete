@@ -290,6 +290,32 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 | `tests/review3-r01-registry-adapter.test.ts` | T01 访问拒绝 → unknown；T02 确认不存在 → safe；T03 `reg.exe` 起不来 → unknown；T04 输出解析不了 / 值名相近 → unknown；外加真实 `reg.exe` 契约（4 条） |
 | `tests/review3-r02-quota-partial.test.ts` | T05 双卷一成功一失败 → unknown（含抛错、0、负数、NaN、Infinity）；T06 不完整结果不转化为数字缓存；未知结论仍只读一次 |
 | `tests/review3-r03-history-scan.test.ts` | T07 测试文件里曾提交后删除的 token 仍报；T08 `--staged` 被拒绝（退出码 2）；T09 基线精确覆盖 / 新增仍红 / 凭据不可基线 / 坏基线退出 2 |
+| `tests/review3-selfcheck-runtime-guard.test.ts` | 读取函数返回 `undefined` / `null` / 数字 / 无 `kind` 的对象时收敛成三态而**不抛错**；调用点仍排在 `createTools()` 与钩子注册之前 |
+| `tests/privacy-audit-sdp.test.ts` | 新增一条：本仓库当前审计通过；基线文件没有被整份塞进 `SCANNERS`；两个扫描器的规则标签都不含自己的触发词 |
+
+---
+
+## 7e. 提交后自检（2026-11-05，`ba15a12` 已推送后）
+
+按用户的四项要求（插件 BUG / 隐私泄露 / 无用文件与缓存 / 异常注释）复查刚推的提交，**找到 2 个真实问题，都是我这一轮自己引入的**。
+
+| # | 问题 | 性质 | 处理 |
+|---|---|---|---|
+| 1 | 运行时兜底缺失：`RegistryReader` 的类型收窄成判别式后，漏网的 `undefined` / `null` 会让 `detectPermanentDeleteRisk()` 抛 `TypeError` | **我引入**（P1） | 加 `coerceRegistryRead()`：不认识的返回值一律判 `unknown`。类型层防"写错"，运行时层防"加载崩" |
+| 2 | 规则标签含自己的触发词：这条规则原来的标签在括号里写了它的一个检测词，而那个词正是该规则的分支，导致**任何写出规则名的文件**（基线、报告、文档）都被判泄露 | **我引入**（P1） | 标签改成 `对话痕迹`，并把上一轮为此加的 `ignoreFiles` 豁免**删掉** —— 那是给症状打补丁 |
+
+第 1 条为什么算 P1 而不是无关紧要：`applyInner()` 在**第 281 行**同步调用它，而 `createTools()`（339）与 `on('tools/pre-execute')`（924）都在后面。`apply()` 是 fail-soft 的，所以宿主不会崩 —— 但插件会变成完全无效（`safe_delete` 不注册、拦截线不接），失败只在日志里留一行。**一个保护性检查的崩溃让保护完全消失**，比它想修的 fail-open 更糟。
+
+> 我第一次把这条写成"`apply()` 没有 try/catch"—— 那是**没读代码就下的判断**。`apply()` 有 try/catch（第 170–181 行）。影响面因此从 P0 降到 P1：不是"宿主崩溃"，而是"插件静默失效"。这个区别决定了要不要半夜发版，所以值得较真。
+
+第 2 条的教训值得单列：**标签是标识，不该与它检测的内容同形**。我第一次的修法是给那个文件加 `ignoreFiles` 豁免 —— 那会让「每多一个要写规则名的文件就多一条豁免」，把症状按文件数重复一遍。正确的修法是把触发词从标识里拿掉，一次解决。
+
+**自检里确认没问题的**：
+
+- 无用文件：`git status --ignored` 只有 `.superpowers/`、`gate-report.json`、`node_modules/`（都在 `.gitignore` 里，且都是刻意忽略的）；探针脚本 `zz-probe-undefined.ts` 用完已删；仓库根没有 `*.log` / `*.tmp` / `*.orig` 残留
+- 隐私：工作区扫描 6 条规则全绿；历史扫描 7 处在基线内、**0 处新增**
+- 死代码：0 个零引用导出、0 个无人导入的文件
+- 异常注释：清掉了 `src/recycle.ts` 里一段描述**旧配额行为**的孤立文档注释（`quotaLimitBytes` 改签名后它已经失真，留着就是错误信息）
 
 ---
 
