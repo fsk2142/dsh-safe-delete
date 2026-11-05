@@ -29,10 +29,13 @@ const cases: Case[] = [
    * package.json 里的任意命令，而 clean 恰恰是最常见的删除类脚本名 ——
    * 放行它等于让「删目录」通过一个只读清单。
    *
-   * 换成不带 run 的 `npm build`：它命中白名单里已知的 build 子命令，
-   * 仍然代表「脚本名里带动词不算删除」这个意图。
+   * 2026-11-05 复审 A03：`npm build` 也是同一条通道（裸脚本名同样执行
+   * `scripts.build`），所以它也从这里移走，换成真正的查询命令。
+   * 「脚本名里带动词不算删除」这个意图由 `npm list` 代表不了 ——
+   * 它现在是独立的「应当拦截」用例。
    */
-  { label: 'npm 脚本名含 build（不带 run）', text: 'npm build', expect: 'not-destructive' },
+  { label: 'npm 裸脚本名（build）要审批', text: 'npm build', expect: 'destructive' },
+  { label: '依赖查询 npm list', text: 'npm list', expect: 'not-destructive' },
   { label: 'grep 搜 rm', text: 'grep -rn "rm -rf" docs/', expect: 'not-destructive' },
   { label: 'echo 打印删除命令', text: 'echo upgrade-guide.md', expect: 'not-destructive' },
 

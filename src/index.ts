@@ -18,6 +18,7 @@
  */
 
 import fs from 'node:fs'
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -502,26 +503,44 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          */
         if (approvalPolicy(session) === 'never') {
           /*
-           * ## 只在`确实会永久删除`时拒绝（2026-11-04 审计）
+           * ## 回收站 + 模式形态：**必须拒绝**（2026-11-05 复审 A01）
            *
-           * 上一版是「never + 回收站 → 无条件 deny」，理由是 pattern 的目标
-           * 大小在执行前未知。但那个理由只覆盖**配额**这一种风险，而
-           * 「不确定」不等于「一定会永久删除」：
+           * 上一版在这里只判 `hookPermanentDeleteRisk.risky`（NoRecycleFiles 策略），
+           * 其余直接 `next()`。那条推理有个洞：
            *
-           *  - 系统没有 NoRecycleFiles 策略，且目标没超配额 → 条目进回收站，
-           *    仍可恢复。此时拒绝等于把功能废掉 —— 而切到 never 的人正是
-           *    想不被打断地干活。
+           * 1. 钩子对模式形态**不枚举目标**（枚举 6000 个文件要 529 ms），
+           *    所以配额风险在执行前是**未知**的；
+           * 2. 工具执行体确实会调 `detectQuotaRisk` 并 `requestApproval`，
+           *    但生产接线里那个函数是**恒返回 `allowed-once` 的桩**
+           *    （见第 282 行的说明 —— 它的前提是"管线已经问过了"）；
+           * 3. `never` 下管线不但不问，还会把 `ask` 直接驳回成拒绝。
            *
-           * 所以对齐非 pattern 分支的规则：**有确定风险才拒绝**。
-           * 配额风险在 pattern 下无法预判（目标未枚举），那部分交给执行期
-           * 的单条判定，不在这里替用户做决定。
+           * 三道叠起来的实际效果：匹配到一个超过回收站上限的文件时，
+           * Windows 会**永久删除并返回成功**，而用户从未真实确认过。
+           * 这正是插件承诺「不可恢复的删除必须有真实授权」的那条不变量。
+           *
+           * 所以：只要目标是"回收站 + 模式形态 + 用户选了不问"，
+           * 就无法在**不枚举**的前提下证明这次删除可恢复 → 拒绝。
+           *
+           * 为什么不用「枚举一遍再说」：枚举正是钩子刻意避免的 O(文件数) 成本，
+           * 而且它发生在**每次** `safe_delete` 调用前。
+           *
+           * 出路写在理由里，用户可以立刻照做，而不是反复重试被拒的调用。
            */
-          if (hookDestination === 'recycle-bin' && hookPermanentDeleteRisk.risky) {
+          if (hookDestination === 'recycle-bin') {
+            const policyLine =
+              hookPermanentDeleteRisk.risky
+                ? ` System policy: ${hookPermanentDeleteRisk.reason ?? 'the recycle bin is not in effect'}.`
+                : ' Matched file sizes are unknown before execution, so items above the recycle bin limit could be deleted permanently.'
             return {
               kind: 'deny',
               reason:
-                `refusing a permanently-destructive pattern delete because the approval policy is 'never': ` +
-                `${hookPermanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}`,
+                `refusing this pattern delete because the approval policy is 'never' and the destination is the ` +
+                `system recycle bin: the outcome cannot be verified without enumerating the matches, and the ` +
+                `in-tool approval hook is a no-op that assumes the pipeline already asked.${policyLine} ` +
+                `To proceed, do one of: switch the approval policy to 'ask' temporarily, pass explicit \`paths\` ` +
+                `(their sizes are stat-ed and checked before deleting), or set deleteDestination back to ` +
+                `\`safe-zone\` so the items stay restorable with safe_zone_restore.`,
             }
           }
           return next()
@@ -721,8 +740,54 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     let verdict
     try {
       verdict = parseCommand(text)
-    } catch {
-      return next()
+    } catch (error) {
+      /*
+       * ## 解析失败不能等于不保护（2026-11-05 复审 A04）
+       *
+       * 旧写法是 `catch { return next() }` —— 一个 fail-open 分支。解析器
+       * 面对超长输入或深层嵌套会抛错（实测 5,000 层数组抛
+       * `RangeError: Maximum call stack size exceeded`），而那正是最该
+       * 保守的时刻：看不清的命令里有可能是 `rm -rf`。
+       *
+       * 现在的规则与「目标不可解析」一致：
+       *   - `ask` 策略 → 返回 ask，让人看原文；
+       *   - `never` 策略 → 明确 deny（ask 会被宿主在派发前驳回，卡片不出现，
+       *     用户只会看到一次没有理由的"工具被拒绝"）。
+       *
+       * 审计只记命令的**指纹**，不记原文（见 `commandFingerprint`）。
+       */
+      const detail = error instanceof Error ? error.message : String(error)
+      const fingerprint = commandFingerprint(text)
+      if (approvalPolicy(session) === 'never') {
+        appendAudit(stateDir, {
+          event: 'deny',
+          tool: toolName,
+          detail: `command interpreter failed (${detail.slice(0, 120)}); command ${fingerprint}`,
+        })
+        return {
+          kind: 'deny',
+          reason:
+            `refusing to run this command because it could not be interpreted safely ` +
+            `(${detail.slice(0, 120)}) and the approval policy is 'never'. ` +
+            `Command ${fingerprint}. Split it into shorter, simpler commands, or switch the approval policy to 'ask' ` +
+            `so you can review the text yourself.`,
+        }
+      }
+      appendAudit(stateDir, {
+        event: 'ask',
+        tool: toolName,
+        detail: `command interpreter failed (${detail.slice(0, 120)}); command ${fingerprint}`,
+      })
+      return {
+        kind: 'ask',
+        reason:
+          `A command could not be interpreted safely (${detail.slice(0, 120)}). Review it before allowing. ` +
+          `Command ${fingerprint}.`,
+        displayReason: {
+          en: 'A command could not be interpreted safely — review it before allowing.',
+          zh: '有一条命令无法被安全解析（可能是超长或嵌套过深）。请先看清内容再决定。',
+        },
+      }
     }
     if (!verdict.destructive) return next()
 
@@ -735,19 +800,26 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     // 由别的防线（沙箱、审批策略本身）兜住。
     if (verdict.target === null || isUnresolvableTarget(verdict.target)) {
       const policy = approvalPolicy(session)
+      /*
+       * ## 审计只记**形状**，不记命令原文（2026-11-05 复审 A07）
+       *
+       * 旧写法把 `text.trim().slice(0, 200)` 写进 `detail`。那串东西会被
+       * `safe_zone_journal` 原样返回给模型上下文，也会进终端与 CI 日志 ——
+       * 而一条命令里可能有私有目录、`--password=…`、URL token 或内嵌认证头。
+       * 200 字符的上限不是脱敏：20 字符的令牌会完整进去。
+       *
+       * 追查只需要「哪一条、多长、哪一类目标」，所以记指纹与目标形态。
+       */
+      const detail = `unresolvable target; command ${commandFingerprint(text)}`
       if (policy === 'never') {
         appendAudit(stateDir, {
           event: 'ask',
           tool: toolName,
-          detail: `unresolvable target, allowed under the never policy: ${text.trim().slice(0, 200)}`,
+          detail: `allowed under the never policy: ${detail}`,
         })
         return next()
       }
-      appendAudit(stateDir, {
-        event: 'ask',
-        tool: toolName,
-        detail: `unresolvable target: ${text.trim().slice(0, 200)}`,
-      })
+      appendAudit(stateDir, { event: 'ask', tool: toolName, detail })
       return {
         kind: 'ask',
         reason:
@@ -769,17 +841,41 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     })
     const escalate = appliesStop(verdict.target)
 
+    /*
+     * ## 拒绝文案必须按**当前配置**改写（2026-11-05 复审 A10）
+     *
+     * 旧文案无条件承诺「改用 safe_delete 就进安全区，能取回」。那在
+     * `deleteDestination = recycle-bin` 时是假的：文件直接进系统回收站，
+     * `safe_zone_restore` 找不回它。
+     *
+     * 承诺与实际不符比不说更糟 —— 用户会照着一个错误的心智去决策。
+     */
+    const destination = normalizeDestination(unwrap(raw['deleteDestination']))
+    const toolOutcome =
+      destination === 'recycle-bin'
+        ? 'Use the `safe_delete` tool instead: with the current configuration it hands the target to the ' +
+          'system recycle bin, where it can be restored from Explorer (the safe zone will not track it).'
+        : 'Use the `safe_delete` tool instead: it moves the target into the safe zone, where it can be ' +
+          'restored with safe_zone_restore for a while.'
+
     return {
       kind: 'deny',
       reason:
         `Blocked a raw shell delete of "${verdict.target}" (${verdict.recursive ? 'recursive' : 'non-recursive'}). ` +
-        'Deleting through the shell erases data permanently. Use the `safe_delete` tool instead: it moves the target into the ' +
-        'safe zone, where it can be restored for a while. Run `safe_delete` with preview:true to see exactly what would be moved, ' +
+        'Deleting through the shell erases data permanently. ' +
+        toolOutcome +
+        ' Run `safe_delete` with preview:true to see exactly what would be moved, ' +
         'then call it again to do it. Do not retry this shell command or look for another way around the block.' +
         (escalate ? stopClause(attempts) : ''),
       displayReason: {
-        en: `Blocked a raw shell delete of "${verdict.target}". Use safe_delete so it can be restored.`,
-        zh: `已拦下对 "${verdict.target}" 的原始 shell 删除。请改用 safe_delete，这样还能取回。`,
+        en:
+          destination === 'recycle-bin'
+            ? `Blocked a raw shell delete of "${verdict.target}". Use safe_delete (items go to the system recycle bin).`
+            : `Blocked a raw shell delete of "${verdict.target}". Use safe_delete so it can be restored.`,
+        zh:
+          destination === 'recycle-bin'
+            ? `已拦下对 "${verdict.target}" 的原始 shell 删除。请改用 safe_delete —— 当前配置是直接进系统回收站，取回要去回收站。`
+            : `已拦下对 "${verdict.target}" 的原始 shell 删除。请改用 safe_delete，这样还能取回。`,
       },
     }
   }
@@ -1367,6 +1463,30 @@ export function decideHookRisk(input: {
   }
 
   return { kind: 'next' }
+}
+
+/**
+ * 命令的**指纹**：长度 + 哈希。用于审计与拒绝理由里指代一条命令。
+ *
+ * ## 为什么不记原文（2026-11-05 复审 A07）
+ *
+ * 审计日志会被 `safe_zone_journal` 原样返回给**模型上下文**，也会进终端、
+ * CI 日志和录屏。而一条命令里可能有：私有目录、`--password`、URL token、
+ * 内嵌认证头。把原文持久化等于把敏感数据复制到另一个更容易被读到的地方。
+ *
+ * 追查需要的只是"是不是同一条命令"——长度 + 哈希足够。
+ *
+ * @param text 命令原文。
+ * @returns 形如 `len=42 sha256=ab12cd34` 的指纹。
+ */
+function commandFingerprint(text: string): string {
+  try {
+    const hash = createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16)
+    return `len=${text.length} sha256=${hash}`
+  } catch {
+    // 极早期（crypto 不可用）也不该让拦截失败。
+    return `len=${text.length}`
+  }
 }
 
 /**

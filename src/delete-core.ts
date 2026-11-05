@@ -479,7 +479,30 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
 
     const recycler = ctx.recycler ?? recycleManyToSystemBin
     const recycled = await recycler([target])
-    if (recycled.ok) {
+    /*
+     * ## `ok` 是批级汇总，不能当成「这一条进去了」（2026-11-05 复审 A05/A06）
+     *
+     * 回收站实现允许部分完成：`{ ok: true, recycled: 0, failedPaths: [target] }`
+     * 是合法返回（Shell 报了错，但没有任何条目真的移走）。旧代码只看 `ok`，
+     * 于是这条删除被记成「已进回收站」并返回 `kind: 'recycled'` ——
+     * 文件其实还在原地，用户却被告知去回收站取回。
+     *
+     * 判据按可信度从高到低：
+     *   1. 有逐条成功清单 → 必须**包含** target；
+     *   2. 没有清单但有失败清单 → target 不在失败清单里才算成功；
+     *   3. 两者都没有（老实现 / 测试替身）→ 退化为 `ok && recycled > 0`。
+     */
+    const succeeded = recycled.succeededPaths
+    const failed = recycled.failedPaths
+    const reallyRecycled =
+      recycled.ok &&
+      (succeeded !== undefined
+        ? succeeded.includes(target)
+        : failed !== undefined
+          ? !failed.includes(target)
+          : recycled.recycled > 0)
+
+    if (reallyRecycled) {
       appendAudit(ctx.stateDir, {
         event: 'delete',
         target,
@@ -498,7 +521,9 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
       event: 'delete',
       target,
       tool: 'safe_delete',
-      detail: `destination=recycle-bin fell back to safe zone: ${recycled.reason}`,
+      detail: `destination=recycle-bin fell back to safe zone: ${
+        recycled.ok ? 'the shell did not confirm this path was recycled' : recycled.reason
+      }`,
     })
   }
 

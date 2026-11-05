@@ -31,16 +31,16 @@ pre-execute 钩子判定 → 危险路径或超阈值 → 弹审批卡
 
 | 项 | 值 |
 |---|---|
-| 版本 | 2.2.0 |
-| HEAD | `077d27f` |
-| 远端 | 已同步（`eb2e53c..077d27f` 已推送） |
+| 版本 | 2.2.0（工作区含 2026-11-05 复审整改，未发版） |
+| HEAD | `077d27f` + 本轮未提交改动 |
+| 远端 | 已同步到 `077d27f` |
 | tag | `v2.2.0`（annotated `6af8433`，指向提交 `eb2e53c`；**之后 6 个提交没有新 tag**） |
 | Release | [v2.2.0](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.2.0) |
 | 提交总数 | 202 |
-| 源码规模 | 13,493 行 / 21 个 `.ts` |
-| 测试 | **1,112 个 / 149 个文件，全绿** |
+| 源码规模 | 12,223 行 / 21 个 `.ts` |
+| 测试 | **1,163 个 / 153 个文件，全绿** |
 | 运行时依赖 | **零** |
-| 本地安装 | `C:\Users\FSK\.dsh\profiles\desktop\node_modules\dsh-safe-delete`（30 个文件） |
+| 本地安装 | `C:\Users\<user>\.dsh\profiles\desktop\node_modules\dsh-safe-delete`（30 个文件） |
 
 ### 一键验证
 
@@ -180,13 +180,45 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 | 边界 | 说明 |
 |---|---|
 | `pattern` 形态不枚举 | 钩子只拿 `root` 做分类判定，不扫盘（`node_modules` 量级要 529 ms） |
-| `never` 审批策略 | 危险路径降级放行（只剩「可恢复」一层）；但**不可恢复删除明确拒绝** |
+| `never` 审批策略 | 危险路径降级放行（只剩「可恢复」一层）；但**不可恢复删除明确拒绝** —— 包括 `never + recycle-bin + pattern`（目标大小无法预判，工具侧的审批是恒允许的桩）与**解析器抛错**（解析失败 ≠ 放行） |
 | 索引损坏 | 拒绝一切写入，保留原文件。`safe_zone_list` 明确报错而不是显示空列表 |
 | 批次聚合回收 | 回收站里记录的是**批次目录**路径，不是每个文件的原路径 |
 
 ---
 
-## 7. 最近一轮修复（2026-11-04/05）
+## 7. 2026-11-05 复审（固定 SHA `077d27f`）与整改
+
+外部复审报告给出 12 条（A01–A12）。**A01–A04 已在源码中确认并修复**，A05–A10 一并处理；A11（历史隐私扫描范围）与 A12（设计约束）作为已知边界记入本文档，不改代码。
+
+| ID | 问题 | 修复 |
+|---|---|---|
+| **A01** | `never + recycle-bin + pattern` 绕过真实审批：钩子不枚举目标，工具侧 `requestApproval` 是恒返回 `allowed-once` 的桩 | 该组合**直接拒绝**，理由里给出三条出路；`never + safe-zone` 与显式 `paths` 不受影响 |
+| **A02** | `isPureLiteralValue` 只看首尾引号：`["a" + require("fs").rmSync(x) + "b"]` 被判纯字面量 | 改为「整串必须**恰好是**一个字符串」（扫描引号闭合位置 + 转义）；深度 ≤32、单字面量 ≤4 KB |
+| **A03** | `pnpm build` / `npm test` / `git pull` 被写成「已证明只读」，但都执行项目自定义内容 | 从白名单移除；保留真正的查询（`list` / `ls` / `why` / `outdated` / `--version`）；`git pull` 单独说明 |
+| **A04** | `parseCommand` 抛错时钩子 `next()` —— fail-open | 改为 `ask`（`never` 下 `deny`）；进钩子前先按输入长度上限处理（64 KB） |
+| **A05** | `SHFileOperationW` 部分成功时脚本把整批记失败，调用方整批回落安全区 | 脚本改为**逐条复核**是否仍在原处，输出 `moved`；调用方按 `succeededPaths` / `failedPaths` / unknown 三类对账 |
+| **A06** | 调用方仍用 `split(' : ')[0]` 从人类可读文案反推路径 | 只读结构化字段；实现没给 `failedPaths` 时记 unknown，**不**回退到字符串解析 |
+| **A07** | 审计持久化命令原文（`text.trim().slice(0,200)`）与自由文本 reason | 钩子改记**指纹**（长度 + sha256 前 16 位）；`readAudit` 侧不新增原文 |
+| **A08** | `safe_zone_journal` 每次全量读取并解析整个 JSONL | 改为从文件尾部按 16 KB 块回读，凑够 N 条即停（80,000 行下读取量从 11.4 MB 降到数十 KB） |
+| **A09** | 重复语句与过期注释（`$present` 连续初始化两次、旧协议注释、错位 JSDoc、`BATCH_SIZE` 写死 500） | 逐条订正；测试里加静态契约（`$present` 只能初始化一次） |
+| **A10** | 工具描述与拦截文案写死「进安全区 / 可用 safe_zone_restore 取回」 | 按 `deleteDestination` 生成；README 的删除去向章节同步 |
+
+**A11 / A12（不改代码，记边界）**：`privacy-audit.mjs` 只覆盖工作区 + 暂存区，不覆盖 Git 历史、不可达对象与二进制产物；目录配额只有**下界**（只量顶层），配置风险缓存按 Reader 身份缓存。这些是设计取舍，已在 README 与本节写明。
+
+**新增回归测试**（都能在修复前的代码上变红）：
+
+| 文件 | 覆盖 |
+|---|---|
+| `tests/audit-20261105-command.test.ts` | A02 / A03（含合法字面量与只读查询的反向用例、深度与长度上限） |
+| `tests/audit-20261105-hook.test.ts` | A01 / A04（`never` / `ask` × 单条 / 批量 / 模式） |
+| `tests/audit-20261105-recycle.test.ts` | A05 / A06（逐条对账、计数不一致） |
+| `tests/audit-20261105-audit.test.ts` | A07 / A08（尾部读取字节数、半行、超长单行、多字节） |
+
+> 反转了一条旧断言：`tests/pattern-never-consistency.test.ts` 过去锁的是「无策略风险时 `never + recycle-bin` 不该拒绝」。那条推理漏掉了**配额**这一类风险（钩子不枚举 → 大小未知 → 工具侧桩放行），现在改为断言拒绝。
+
+---
+
+## 7. 2026-11-04/05 自检修复（上一轮）
 
 8 个发现，**5 个是修改过程中自己引入的**。
 
@@ -291,11 +323,19 @@ git push origin main && git push origin vX.Y.Z
 
 **判定必须写在 `index.ts` 的 pre-execute 钩子里。** 写在工具里等于没写（`requestApproval` 是桩）。
 
+三条已有的不变量，改动时别破坏：
+
+1. **未知 = 问**（`never` 下 = 拒绝）。解析器抛错、目标不可解析、`never + 回收站 + pattern` 都走这条。
+2. **「已证明只读」只装真正能证明的项**。执行项目自定义脚本的入口（`run` / `build` / `test` / `lint` / `typecheck` / `start`）不在里面。
+3. **去向按条报告**。任何「整批一个布尔」的汇总都会在部分成功时骗人；`succeededPaths` / `failedPaths` / unknown 三类必须分开。
+
 ### 当前遗留
 
-- `v2.2.0` tag 指向 `eb2e53c`，之后 6 个提交（含 5 个 bug 修复）**没有 tag**。建议补 `v2.2.1`
+- `v2.2.0` tag 指向 `eb2e53c`，之后 6 个提交（含 5 个 bug 修复）**没有 tag**；本轮 2026-11-05 整改也未提交。建议补 `v2.3.0`
 - `match: "build"` 匹配目录名返回 0 结果——语义有歧义（删目录本身还是删里面？），未改
 - 目录配额只量顶层，嵌套深处的超大文件不预警（已写进 README）
+- `privacy-audit.mjs` 只扫工作区 + 暂存区，**不覆盖 Git 历史与二进制产物**（复审 A11）。发版前应另跑一次历史扫描（`gitleaks` / `trufflehog`），并如实写明扫描范围
+- 目录全树统计仍在宿主进程同步执行（复审 A12 第 4 点），大目录有可见延迟；要动之前先测，不要凭感觉搬进 Worker
 
 ---
 

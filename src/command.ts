@@ -578,7 +578,19 @@ function isPureAssignment(text: string): boolean {
  * @param text 值文本（已去首尾空白）。
  * @returns 能证明是纯字面量返回 true。
  */
-function isPureLiteralValue(text: string): boolean {
+function isPureLiteralValue(text: string, depth = 0): boolean {
+  /*
+   * ## 深度与长度的硬上限（2026-11-05 复审 A02）
+   *
+   * 这是一个递归下降判定，而输入来自模型。5,000 层嵌套数组会抛
+   * `RangeError: Maximum call stack size exceeded`（实测 448ms 后抛出），
+   * 而上层钩子的 catch 是 fail-open —— 抛错就等于「不保护」。
+   *
+   * 判不了就不要硬判：返回 false（= 不能证明），调用方据此要求审批。
+   */
+  if (depth > MAX_LITERAL_DEPTH) return false
+  if (text.length > MAX_LITERAL_CHARS) return false
+
   const t = text.trim()
   if (t === '') return true
 
@@ -590,15 +602,32 @@ function isPureLiteralValue(text: string): boolean {
     (t.startsWith('"') && t.endsWith('"')) ||
     (t.startsWith('`') && t.endsWith('`'))
   ) {
-    // 引号内不能有插值或转义外的引号闭合问题，交给更粗的检查。
-    return !t.slice(1, -1).includes('${') && t.length >= 2
+    /*
+     * ## 整串必须**就是**一个字符串字面量（2026-11-05 复审 A02）
+     *
+     * 旧判据只看「首尾是不是同种引号 + 中间没有 `${`」。于是：
+     *
+     * ```
+     * "a" + require("fs").rmSync("/tmp/x") + "b"
+     * ```
+     *
+     * 以 `"` 开头、以 `"` 结尾、中间没有 `${` —— 被判成纯字面量，整个赋值
+     * 因此走 `isPureAssignment` 提前放行。而它在 JS 里会被求值，删除在赋值
+     * 完成前就执行了。Bash 的 `["$(rm -rf /tmp/x)"]` 是同一个洞：`$(…)` 在
+     * 双引号里照样执行。
+     *
+     * 现在要求这是一个**语法上完整**的单一字符串：按引号规则走到结尾时
+     * 恰好闭合。中途出现未转义的同类引号、或闭合后还有剩余字符，都说明它
+     * 是拼接/调用的一部分，不能证明。
+     */
+    return isSingleStringToken(t)
   }
 
   // 数组：逐个元素证明。
   if (t.startsWith('[') && t.endsWith(']')) {
     const inner = t.slice(1, -1).trim()
     if (inner === '') return true
-    return splitTopLevel(inner, ',').every((part) => isPureLiteralValue(part))
+    return splitTopLevel(inner, ',').every((part) => isPureLiteralValue(part, depth + 1))
   }
 
   // 对象：逐个值证明。键可以是标识符、字符串或计算后的简写。
@@ -623,12 +652,84 @@ function isPureLiteralValue(text: string): boolean {
       // 键必须是字面量或标识符（计算键 `[f()]: 1` 会求值）。
       if (key.startsWith('[') && key.endsWith(']')) return false
       if (!/^(?:[A-Za-z_$][\w$]*|'[^']*'|"[^"]*"|\d+)$/.test(key)) return false
-      return isPureLiteralValue(value)
+      return isPureLiteralValue(value, depth + 1)
     })
   }
 
   // 其他形态（调用、运算、模板插值…）一律不能证明。
   return false
+}
+
+/** 字面量递归深度上限。超过就判「不能证明」。 */
+const MAX_LITERAL_DEPTH = 32
+
+/** 单个字面量的字符上限。超过就判「不能证明」—— 没有人手写 4KB 的字面量。 */
+const MAX_LITERAL_CHARS = 4096
+
+/**
+ * 一条命令的字符上限。
+ *
+ * 超过就按「无法可靠解释」处理（要求审批），而不是继续逐字符扫描。
+ * 真实的 shell 命令 / 内联脚本不会到这个量级；到这个量级的多半是
+ * 生成出来的、或刻意构造来拖垮解析器的输入。
+ */
+const MAX_COMMAND_CHARS = 64 * 1024
+
+/**
+ * 整段文本是否**恰好是一个**字符串字面量（不多不少）。
+ *
+ * ## 为什么不能只看首尾字符（2026-11-05 复审 A02）
+ *
+ * `"a" + require("fs").rmSync("/tmp/x") + "b"` 首尾都是 `"`、中间没有 `${`，
+ * 旧判据因此返回 true，整条赋值被当作「纯数据」放行 —— 而它是拼接，
+ * 右操作数会真的执行。
+ *
+ * 判据换成「扫描一遍引号状态」：从第 0 个字符开始，遇到未转义的同类引号就
+ * 闭合；闭合位置必须正好是字符串末尾。中途闭合说明后面还有别的东西。
+ *
+ * 单引号按 POSIX/JS 语义处理（内容不展开），双引号与反引号里出现 `${` 或
+ * `$(` 仍然会求值，不能证明。
+ *
+ * @param t 已 trim 的文本，首字符是引号。
+ * @returns 确实是一个完整字符串字面量时为 true。
+ */
+function isSingleStringToken(t: string): boolean {
+  const quote = t[0]
+  if (quote !== "'" && quote !== '"' && quote !== '`') return false
+  if (t.length < 2 || t[t.length - 1] !== quote) return false
+
+  let i = 1
+  let closedAt = -1
+  while (i < t.length) {
+    const ch = t[i] as string
+    if (ch === '\\') {
+      i += 2
+      continue
+    }
+    if (ch === quote) {
+      closedAt = i
+      break
+    }
+    i += 1
+  }
+
+  // 没闭合，或闭合之后还有内容（`"a" + f()`）—— 都不是单一字面量。
+  if (closedAt !== t.length - 1) return false
+
+  const inner = t.slice(1, -1)
+  /*
+   * 单引号：内容在任何被支持的语言里都不展开（POSIX 与 JS 都是）。
+   */
+  if (quote === "'") return true
+  /*
+   * 双引号 / 反引号：`${…}` 与 `$(…)` 会被求值。
+   *
+   * `\$(…)` 是转义的字面量，所以先抹掉转义序列再查。
+   */
+  const unescaped = inner.replace(/\\[\s\S]/g, '')
+  if (unescaped.includes('${')) return false
+  if (unescaped.includes('$(')) return false
+  return true
 }
 
 /**
@@ -1183,39 +1284,54 @@ const PROVEN_READ_ONLY_GIT = new Set([
    * - `clean`：`git clean -fdx` 会真的删文件；
    * - `checkout` / `restore` / `switch`：会**覆盖**工作区内容（未提交的修改丢失）；
    * - `stash`：把修改移走；
-   * - `merge` / `rebase` / `cherry-pick`：可能改写工作区。
+   * - `merge` / `rebase` / `cherry-pick`：可能改写工作区；
+   * - `pull`：见下方说明。
    *
    * 它们不"删文件"，但都能让用户丢数据 —— 归入要求审批。
    */
   'add',
   'commit',
   'fetch',
-  'pull',
   'push',
 ])
 
-/**
- * 包管理器的**只读**子命令。
+/*
+ * ## `git pull` 不再是「只读」（2026-11-05 复审 A03）
  *
- * `pnpm typecheck` / `pnpm test` 是开发时最高频的写法，不该弹卡；
- * 而 `pnpm remove` / `pnpm uninstall` 会改文件系统（并删目录）。
+ * 旧版本把它收进只读表，理由是「只改索引与仓库状态，不删工作区文件」。
+ * 前半句对 `add` / `commit` 成立，对 `pull` **不成立**：
+ *
+ * - 上游删除一个已跟踪文件时，`git pull`（fast-forward 或 merge）会把工作区
+ *   里那份**一并删掉** —— 一次真实的文件消失，而插件放行了它；
+ * - 它还会移动 HEAD、改动当前分支，语义上属于写操作。
+ *
+ * `fetch` / `push` 保留在只读表里：它们只更新远端与 remote-tracking 引用，
+ * 从不改动工作区文件。把 `push` 也拦下只会让模型被要求改用 `safe_delete`，
+ * 那对一次推送毫无意义 —— 误拦同样是失效的一种（用户会开始无脑点同意）。
+ */
+
+/**
+ * `pnpm` / `npm` / `yarn` 的**查询类**子命令。
+ *
+ * ## 刻意不收 `build` / `start` / `test` / `typecheck` / `lint`（2026-11-05 复审 A03）
+ *
+ * 这些名字**执行的是 package.json 里的脚本**，而脚本内容由项目任意定义：
+ *
+ * ```json
+ * { "scripts": { "build": "node scripts/cleanup-build.js" } }
+ * ```
+ *
+ * 旧版本把它们收进来，注释里的理由是「赌构建脚本不删东西」—— 那与函数名
+ * `isProvenReadOnlyCommand` 的「证明」语义直接矛盾。一个按惯例猜的豁免被写成
+ * 「已证明只读」，等于把「插件声称无害」与「用户自己承担风险」混为一谈；
+ * 仓库新增一个清理脚本就会静默变成绕过通道。
+ *
+ * 所以：**执行项目自定义脚本的入口一律要求审批**（与 `run` / `exec` / `dlx` 同类）。
+ * 代价是每次构建多一次确认 —— 这是明示的取舍，见 README 的「已证明只读」一节。
+ *
+ * 保留的都是真正的查询：它们只读注册表 / 已安装清单，不执行项目脚本。
  */
 const PROVEN_READ_ONLY_PKG = new Set([
-  /*
-   * 已知只读 / 高频的开发子命令。
-   *
-   * `build` 与 `start` 收在这里是有意的：它们是每天都会跑的构建入口，
-   * 拦下来只会造成审批疲劳 —— 而审批疲劳会让人无脑点同意，反而更危险。
-   *
-   * 代价要说清：`pnpm build` 最终执行的是 package.json 里那个脚本，
-   * 理论上它可以是 `rimraf`。这里赌的是「构建脚本不删东西」这个惯例。
-   * 真要删东西，脚本名通常是 clean / reset 这类，不在此列。
-   */
-  'typecheck',
-  'test',
-  'lint',
-  'build',
-  'start',
   'ls',
   'list',
   'outdated',
@@ -1223,14 +1339,14 @@ const PROVEN_READ_ONLY_PKG = new Set([
   'view',
   'info',
   /*
-   * 刻意不收 `run`（2026-11-04 自检）。
+   * 刻意不收 `run` / `exec` / `dlx` / `build` / `start` / `test` / `typecheck` / `lint`：
    *
-   * `pnpm run <script>` 执行 package.json 里写的**任意命令** —— 一个
-   * `"clean": "rimraf dist"` 的脚本会真的删目录。它与 `exec`/`dlx` 同类。
+   * `run <script>` 与 `build` 这类**裸脚本名**最终都执行 package.json 里写的
+   * 任意命令（`"clean": "rimraf dist"`）。它们与 `exec`/`dlx` 同类，
+   * 不属于「已证明只读」。
    *
-   * 注意 `pnpm build`（不带 run）与 `pnpm run build` 是两条不同路径：
-   * 前者命中上面 `build` 那一项，后者因为含 `run` 而不在白名单里 ——
-   * 于是「显式 run 一个没被认定为安全的脚本」仍然要问。
+   * 注意 `pnpm build` 与 `pnpm run build` 都会执行 `scripts.build` ——
+   * 两者都要问，不存在「不带 run 就安全」这回事。
    */
 ])
 
@@ -1251,7 +1367,16 @@ function isProvenReadOnlyCommand(token: string, next?: string): boolean {
   }
   if (base === 'pnpm' || base === 'npm' || base === 'yarn') {
     const sub = (next ?? '').toLowerCase()
-    return sub !== '' && PROVEN_READ_ONLY_PKG.has(sub)
+    if (sub === '') return false
+    /*
+     * 版本查询是只读的，但它写成**旗标**而不是子命令：
+     * `pnpm --version` / `npm -v`。
+     *
+     * 注意 `pnpm version`（不带横线）是**写**操作 —— 它会改 package.json
+     * 并打 tag，所以只接受带横线的形态。
+     */
+    if (sub === '--version' || sub === '-v' || sub === '-version') return true
+    return PROVEN_READ_ONLY_PKG.has(sub)
   }
   return false
 }
@@ -1919,6 +2044,20 @@ function hasCallStyleDelete(body: string): boolean {
  */
 export function parseCommand(command: string): CommandVerdict {
   const raw = command ?? ''
+
+  /*
+   * ## 超长输入：判不了就要求审批（2026-11-05 复审 A04）
+   *
+   * 解析器是逐字符扫描 + 多处递归，输入长度没有上限。一条 400 KB 的
+   * 「命令」让钩子跑 338ms，且结果不可靠 —— 真实 shell 命令不会有这个量级。
+   *
+   * 直接返回 destructive + target:null（= 目标不可解析 → 走审批而不是放行）。
+   * 这比在别处加一堆长度检查更可靠：所有调用方都经过这个入口。
+   */
+  if (raw.length > MAX_COMMAND_CHARS) {
+    return { destructive: true, kind: 'delete', recursive: false, target: null }
+  }
+
   // 去掉注释（注释里的删除字样不会执行），再做转义归一化。
   // 两者都只影响判定，展示与拒绝理由仍用原始文本。
   const text = normalizeObfuscation(stripComments(raw))

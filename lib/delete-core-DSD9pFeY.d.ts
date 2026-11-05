@@ -1,4 +1,4 @@
-import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle-tWAnI2es.js";
+import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle-DEb4muso.js";
 import { n as TargetDescription, r as TrashEntry, t as Classification } from "./types-BuaWcYtz.js";
 //#region src/classify.d.ts
 /** 分类所需的路径事实。 */

@@ -84,10 +84,13 @@ const cases: Case[] = [
    * 但 `35e92a3` 已把 `run` 从包管理器白名单移除（它执行 package.json 里的
    * 任意命令），所以显式 `run` 现在要审批 —— 用例没跟上，脚本因此 24/25。
    *
-   * 改用不带 `run` 的 `npm build`：它命中白名单里的 `build` 子命令，
-   * 仍代表「跑构建不该被误伤」这个意图。
+   * 2026-11-05 复审 A03 又收了紧：`npm build` 与 `npm run build` 执行的是
+   * **同一段** package.json 脚本（可以是 `node scripts/cleanup-build.js`），
+   * 「不带 run 就安全」是个假的区分。所以本条改用真正只读的查询命令，
+   * 并单独断言跑构建会要审批。
    */
-  { name: '跑构建', tool: 'bash', args: { command: 'npm build' }, expect: 'allow' },
+  { name: '跑构建（要审批，不是放行）', tool: 'bash', args: { command: 'npm build' }, expect: 'ask' },
+  { name: '依赖查询', tool: 'bash', args: { command: 'npm list' }, expect: 'allow' },
   { name: 'git status', tool: 'bash', args: { command: 'git status' }, expect: 'allow' },
   { name: '写普通工作区文件', tool: 'write', args: { file_path: 'C:\\Work\\proj\\src\\index.ts', content: 'x' }, expect: 'allow' },
   { name: 'str_replace_editor view', tool: 'str_replace_editor', args: { command: 'view', path: path.join(dshHome, 'cordis.patch.yml') }, expect: 'allow' },

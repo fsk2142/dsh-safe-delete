@@ -52,11 +52,29 @@ type RecycleManyOutcome = {
    * 字符串拼结构化数据，路径里一旦含分隔符就会截断。
    */
   failedPaths?: string[];
+  /**
+   * 确实已移入回收站的原始路径。
+   *
+   * ## 为什么必须单独给（2026-11-05 复审 A05）
+   *
+   * 只知道「哪些失败了」不够：`SHFileOperationW` 允许**部分完成**
+   * （返回非零或 `fAnyOperationsAborted` 时，前面几条可能已经移走）。
+   * 调用方拿到 `ok:false` 就整批回落到安全区，于是已经进回收站的路径
+   * 会报 "not found"，用户看到「回落安全区」而实际一部分在回收站。
+   *
+   * 有了这份清单，调用方可以对**每条**路径说清去向。
+   */
+  succeededPaths?: string[];
 } | {
   ok: false;
   reason: string;
   recycled: number;
   unsupported?: boolean;
+  /** 即使总体上失败，也可能有个别条目真的移走了 —— 逐条给出来。 */
+  succeededPaths?: string[];
+  failedPaths?: string[];
+  /** 逐条失败原因（人类可读，只用于展示）。 */
+  failed?: string[];
 };
 /**
  * 可替换的回收站实现。

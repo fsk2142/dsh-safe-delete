@@ -1,4 +1,4 @@
-import { r as DeleteDestination } from "./delete-core-BKdrXFZQ.js";
+import { r as DeleteDestination } from "./delete-core-DSD9pFeY.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**

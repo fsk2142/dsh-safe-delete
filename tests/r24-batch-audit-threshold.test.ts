@@ -63,6 +63,12 @@ describe('R24-2 部分成功时审计与输出要区分', () => {
           ok: true,
           recycled: paths.length - 1,
           failed: [`${files[1]} : denied`],
+          /*
+           * 2026-11-05 复审 A06：身份必须来自结构化字段。
+           * 生产实现（`recycleManyToSystemBin`）一定会给 `failedPaths`；
+           * 只给人类可读文案时调用方无法精确对账，只能把未确认的记为 unknown。
+           */
+          failedPaths: [files[1] as string],
         }),
       }) as never,
     ).find((t) => t.name === 'safe_delete')!
@@ -72,6 +78,27 @@ describe('R24-2 部分成功时审计与输出要区分', () => {
     // 失败的条目必须在输出里被点名
     expect(result.text).toMatch(/bad\.txt/)
     expect(result.text, '不能把失败的说成 success').toMatch(/Not recycled|not recycled/i)
+  })
+
+  it('只给人类可读文案、不给 failedPaths 时，未确认的条目记为 unknown 而不是成功', async () => {
+    const files = ['u1.txt', 'u2.txt'].map((n) => {
+      const p = join(root, n)
+      writeFileSync(p, 'x')
+      return p
+    })
+
+    const tool = createTools(
+      deps({
+        // 故意不给 failedPaths —— 调用方不能从字符串反推身份。
+        recyclerMany: () => ({ ok: true, recycled: 1, failed: ['something : denied'] }),
+      }) as never,
+    ).find((t) => t.name === 'safe_delete')!
+
+    const result = (await tool.execute({ paths: files } as never)) as { ok: boolean; text: string }
+
+    expect(result.text).toMatch(/UNKNOWN/i)
+    // 没有一条能被确认为「已进回收站」。
+    expect(result.text).not.toMatch(/→\s+system recycle bin/)
   })
 })
 

@@ -21,11 +21,24 @@ describe('package-manager run executes arbitrary scripts', () => {
   })
 
   it.each([
-    ['pnpm typecheck', 'typecheck 是已知只读'],
-    ['pnpm test', 'test 是已知只读'],
-    ['pnpm lint', 'lint 是已知只读'],
+    /*
+     * 2026-11-05 复审 A03：`typecheck` / `test` / `lint` 也执行
+     * `package.json` 里的脚本，与 `run` 同类 —— 脚本可以是
+     * `"lint": "rimraf .eslintcache"`。所以它们从「已知只读」里移除了。
+     */
+    ['pnpm typecheck', 'typecheck 执行 scripts.typecheck'],
+    ['pnpm test', 'test 执行 scripts.test'],
+    ['pnpm lint', 'lint 执行 scripts.lint'],
+  ])('requires review for %s too (%s)', (command) => {
+    expect(parseCommand(command).destructive).toBe(true)
+  })
+
+  it.each([
     ['npm list', 'list 是查询'],
+    ['pnpm ls', 'ls 是查询'],
     ['pnpm why left-pad', 'why 是查询'],
+    ['pnpm outdated', 'outdated 是查询'],
+    ['pnpm --version', '版本查询'],
   ])('keeps the known read-only subcommands allowed: %s', (command) => {
     expect(parseCommand(command).destructive).toBe(false)
   })

@@ -32,17 +32,36 @@ describe('回收脚本的输出契约', () => {
   })
 
   it('每个退出分支都输出 JSON', () => {
-    const convertCalls = script.match(/ConvertTo-Json/g) ?? []
     /*
-     * 四个出口：
-     *   1. 空清单
-     *   2. 全部不存在
-     *   3. SHFileOperation 失败 / 被中止（共用一段）
-     *   4. 正常结束（复核后）
+     * ## 出口收敛成两处（2026-11-05 复审 A05）
      *
-     * 至少要覆盖 1、2、3、4 四处；少于 4 说明有分支还在输出纯文本。
+     * 旧脚本有三个「失败」出口（rc≠0、aborted、正常复核）各自输出一遍 JSON，
+     * 而且前两个出口把 `$present` **整批**记成失败 —— 部分完成时会谎报。
+     *
+     * 现在 rc / aborted / 正常结束走**同一段逐条复核**，所以 JSON 输出只剩：
+     *   1. 空清单
+     *   2. 全部不存在（`$present.Count -eq 0`，这里也带 `moved = @()`）
+     *   3. 统一的逐条复核结果
+     *
+     * 少于 3 处说明有分支还在输出纯文本。
      */
-    expect(convertCalls.length, `只有 ${convertCalls.length} 处输出 JSON，应有至少 4 处`).toBeGreaterThanOrEqual(4)
+    const convertCalls = script.match(/ConvertTo-Json/g) ?? []
+    expect(convertCalls.length, `只有 ${convertCalls.length} 处输出 JSON，应有至少 3 处`).toBeGreaterThanOrEqual(3)
+  })
+
+  it('reports per-path moves so a partial success is not reported as total failure', () => {
+    /*
+     * A05 的核心：rc≠0 / aborted 之后不能把 `$present` 整批记成失败，
+     * 而要对每条路径复核是否真的移走了。
+     */
+    expect(script, '必须逐条复核并按 moved 报告').toMatch(/moved/)
+    expect(script, '不再有「把整批记为失败」的分支').not.toMatch(/foreach \(\$p in \$present\) \{ \$errors\.Add/)
+    /*
+     * 静态契约：`$present` 只初始化一次（旧脚本连续写了两遍，
+     * 无意义分配且让读者以为第二个是笔误）。
+     */
+    const presentInits = script.match(/\$present = \[System\.Collections\.Generic\.List\[string\]\]::new\(\)/g) ?? []
+    expect(presentInits.length, '$present 只该初始化一次').toBe(1)
   })
 
   it('JSON 里带 ok / fail / errors 三个字段', () => {

@@ -142,14 +142,20 @@ describe('interception must not block ordinary work', () => {
  * 任意脚本，而 `clean` 恰恰是最常见的删除类脚本名 —— 放行它等于让
  * 「删目录」通过一个只读清单。
  *
- * `npm build`（不带 run）仍在放行清单里，日常构建不受影响。
+ * `npm build`（不带 run）曾经仍在放行清单里；2026-11-05 复审 A03 把这一条
+ * 也收紧了：裸脚本名同样执行 `scripts.build`，一个
+ * `"build": "node scripts/cleanup-build.js"` 就会删目录。
  */
-describe('package-manager run is not a read-only shortcut', () => {
+describe('package-manager scripts are not a read-only shortcut', () => {
   it('requires review for npm run clean', () => {
     expect(parseCommand('npm run clean').destructive, 'run 执行任意脚本').toBe(true)
   })
 
-  it('keeps npm build allowed', () => {
-    expect(parseCommand('npm build').destructive, 'build 是已知子命令').toBe(false)
+  it('requires review for a bare script name too', () => {
+    expect(parseCommand('npm build').destructive, '不带 run 也执行 scripts.build').toBe(true)
+  })
+
+  it('still allows a real query', () => {
+    expect(parseCommand('npm list').destructive).toBe(false)
   })
 })

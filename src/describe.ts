@@ -46,22 +46,6 @@ function walk(dir: string, acc: { bytes: number; fileCount: number; incomplete: 
 }
 
 /**
- * 描述一个路径。
- *
- * ## `stats` 选项（2026-11-04）
- *
- * 递归统计是「删之前让你看清」的代价：每个条目一次 `lstatSync`，全在审批
- * 卡片出现**之前**同步跑完。回收站模式不需要这两个数字（它也不做按大小的
- * 确认），所以允许跳过 —— 目录只读顶层一层，`bytes`/`fileCount` 记 0 并带
- * `statsOmitted: true`。
- *
- * 顶层使用 `lstatSync`，链接只描述自身；单文件保留实际大小，跳过反而
- * 让「删一个 3 GB 镜像」显示成「0 条目 0 B」。
- *
- * @param absPath 目标绝对路径。
- * @param options.stats 是否统计目录内容；缺省 `true`（保持原有行为）。
- */
-/**
  * 只量**顶层直接子项**的总大小，不递归。
  *
  * ## 为什么需要它（2026-11-04 第 24 次审查 R24-9）
@@ -97,6 +81,23 @@ export function shallowBytes(dir: string): number {
   return total
 }
 
+/**
+ * 描述一个路径。
+ *
+ * ## `stats` 选项（2026-11-04）
+ *
+ * 递归统计是「删之前让你看清」的代价：每个条目一次 `lstatSync`，全在审批
+ * 卡片出现**之前**同步跑完。回收站模式不需要这两个数字（它也不做按大小的
+ * 确认），所以允许跳过 —— 目录只读顶层一层，`bytes`/`fileCount` 记 0 并带
+ * `statsOmitted: true`（`bytes` 仍取 `shallowBytes` 的下界，好让配额判定
+ * 至少能覆盖「顶层有个巨大文件」）。
+ *
+ * 顶层使用 `lstatSync`，链接只描述自身；单文件保留实际大小，跳过反而
+ * 让「删一个 3 GB 镜像」显示成「0 条目 0 B」。
+ *
+ * @param absPath 目标绝对路径。
+ * @param options.stats 是否统计目录内容；缺省 `true`（保持原有行为）。
+ */
 export function describeTarget(
   absPath: string,
   options: { stats?: boolean } = {},

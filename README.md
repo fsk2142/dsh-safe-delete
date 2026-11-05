@@ -24,7 +24,7 @@ dsh plugin --profile <profile> add dsh-safe-delete
 
 | 工具 | 参数 | 作用 |
 |---|---|---|
-| `safe_delete` | `path` / `paths` / `root`+`match`+`olderThan`+`exclude`，`preview`，`reason`，`force`（忽略） | 删除文件或目录，移入安全区。详见下节 |
+| `safe_delete` | `path` / `paths` / `root`+`match`+`olderThan`+`exclude`，`preview`，`reason`，`force`（忽略） | 删除文件或目录，去向由 `deleteDestination` 决定（安全区或系统回收站）。详见下节 |
 | `safe_zone_list` | `limit`（默认 20，**最大 200**） | 列出安全区条目 |
 | `safe_zone_restore` | `id` | 取回条目。原路径被占用时落到 `<原路径>.restored-<时间戳>` |
 | `safe_zone_status` | — | 条目数、占用大小、保留期、确认阈值、清理去向 |
@@ -110,9 +110,12 @@ dsh-safe-delete journal
 
 | 层 | 时机 | 取回方式 |
 |---|---|---|
-| 1 安全区 | 删除时 | `safe_zone_restore id=<id>`，默认 1 天内 |
-| 2 系统回收站 | 保留期结束 | 资源管理器「还原」 |
+| 1 安全区 | 删除时（默认 `deleteDestination=safe-zone`） | `safe_zone_restore id=<id>`，默认 1 天内 |
+| 1' 系统回收站 | 删除时（`deleteDestination=recycle-bin`） | 资源管理器「还原」；插件**不记录**这些条目 |
+| 2 系统回收站 | 安全区条目保留期结束 | 资源管理器「还原」 |
 | 3 永久消失 | 清空回收站 | 无法取回 |
+
+`deleteDestination=recycle-bin` 时**没有第 1 层**：文件直接进回收站，`safe_zone_list` 里看不到它，`safe_zone_restore` 也取不回它 —— 那条路只有系统回收站。拦截裸 shell 删除时给出的提示会按当前配置改写，不会在回收站模式下错误承诺 `safe_zone_restore`。
 
 ### 第 2 层的边界（R-01）
 
@@ -261,7 +264,29 @@ C: write(wx) 成功 → C 也进入工作体
 
 `never` 下另一处例外：删除命令目标含变量、管道、通配符时放行执行。
 
-模式删除（`root` + `match` / `olderThan`）在回收站模式下无法提前确认每个匹配项的大小及可恢复性，因此 `never` 策略下拒绝执行；允许审批时，卡片说明实际回收站去向和可能永久删除的风险。安全区模式维持原有规则。
+模式删除（`root` + `match` / `olderThan`）在回收站模式下**无法**提前确认每个匹配项的大小及可恢复性（钩子不枚举目标），因此：
+
+- `never` 策略下**一律拒绝** —— 工具执行体里那次 `detectQuotaRisk` 的「审批」在生产接线里是恒允许的桩（前提是管线已经问过），而 `never` 下管线根本不出卡。拒绝对话里会给出三条出路：临时改 `ask`、改用显式 `paths`（大小可以 stat 出来，风险可预判）、或切回 `safe-zone`。
+- `ask` 策略下弹卡片，卡片说明实际回收站去向与可能永久删除的风险。
+
+安全区模式维持原有规则。
+
+> 同一条「不可恢复的删除必须有真实授权」的原则也适用于解析失败：命令**无法被安全解析**时（超长、嵌套过深导致解析器抛错），`ask` 下返回审批、`never` 下明确拒绝 —— 解析失败不等于放行。
+
+### 「证明只读」的边界（2026-11-05 收紧）
+
+拦截器只放行**能正向证明只读**的命令。以下曾经在放行清单里，现在**要审批**，因为它们的实际操作由项目自定义：
+
+| 命令 | 为什么不再算只读 |
+|---|---|
+| `pnpm build` / `npm build` / `yarn build` | 执行 `package.json` 的 `scripts.build`；脚本可以是 `node scripts/cleanup-build.js` |
+| `pnpm start` / `test` / `typecheck` / `lint` | 同上，都是项目自定义脚本的入口 |
+| `pnpm version`（不带横线） | 改 `package.json` 并打 tag |
+| `git pull` | 上游删除已跟踪文件时，工作区里那份会**一并消失** |
+
+仍然放行的只读查询：`git status` / `log` / `diff` / `show` / `ls-files`、`npm list`、`pnpm ls` / `why` / `outdated`、`pnpm --version` 等。
+
+代价是每次跑构建多一次确认 —— 这是明示的取舍：**「照惯例猜它不删东西」不能写进「已证明只读」的清单**，而审批疲劳的解法是让放行清单只装真正可证明的项，不是让它装更多。
 
 ## 兼容性
 

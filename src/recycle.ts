@@ -55,8 +55,31 @@ export type RecycleManyOutcome =
        * 字符串拼结构化数据，路径里一旦含分隔符就会截断。
        */
       failedPaths?: string[]
+      /**
+       * 确实已移入回收站的原始路径。
+       *
+       * ## 为什么必须单独给（2026-11-05 复审 A05）
+       *
+       * 只知道「哪些失败了」不够：`SHFileOperationW` 允许**部分完成**
+       * （返回非零或 `fAnyOperationsAborted` 时，前面几条可能已经移走）。
+       * 调用方拿到 `ok:false` 就整批回落到安全区，于是已经进回收站的路径
+       * 会报 "not found"，用户看到「回落安全区」而实际一部分在回收站。
+       *
+       * 有了这份清单，调用方可以对**每条**路径说清去向。
+       */
+      succeededPaths?: string[]
     }
-  | { ok: false; reason: string; recycled: number; unsupported?: boolean }
+  | {
+      ok: false
+      reason: string
+      recycled: number
+      unsupported?: boolean
+      /** 即使总体上失败，也可能有个别条目真的移走了 —— 逐条给出来。 */
+      succeededPaths?: string[]
+      failedPaths?: string[]
+      /** 逐条失败原因（人类可读，只用于展示）。 */
+      failed?: string[]
+    }
 
 /**
  * 可替换的回收站实现。
@@ -171,16 +194,6 @@ export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
     // 走同一个计数入口，保证测试驱动的路径与生产路径是同一份逻辑。
     recordRecycleFailure()
   }
-    /*
-     * 只接受 root 的**子键**：`reg query <root>` 列出的子键都以 root 开头。
-     *
-     * 旧写法是 `line.startsWith('HKEY_')` —— 过宽。虽然当前输出里只有键行
-     * 以 HKEY_ 开头（值行有缩进，被 trim 后以值名开头），但如果某个卷的键里
-     * 恰好有一个**值**名叫 `HKEY_whatever`，它就会被当成卷键，然后拿去读
-     * MaxCapacity，得到一个空结果。
-     *
-     * 加 root + 反斜杠前缀后，只有真正的子键能通过。
-     */
   return outcome
 }
 
@@ -202,10 +215,16 @@ function attemptRecycle(absPath: string): RecycleOutcome {
 }
 
 /**
- * Windows：用 Shell.Application 的 `delete` 动词。
+ * Windows：把路径移入回收站，用 `SHFileOperationW`。
  *
- * 为什么不用 `Remove-Item`：那个是永久删除（或进回收站，取决于文件大小与配置），
- * 行为不确定。Shell 的 delete 动词明确走回收站。
+ * ## 为什么不用 `Remove-Item`
+ *
+ * 那个是永久删除（或进回收站，取决于文件大小与配置），行为不确定。
+ *
+ * ## 为什么从 `Shell.Application` 的 `delete` 动词换过来（2026-11-04 实测）
+ *
+ * `InvokeVerb('delete')` 等于替用户点了右键删除，shell 照常绘制进度 UI，
+ * 而且每次都新建 COM 对象 + `ParseName` 往返（单文件实测 1187 ms → 49 ms）。
  *
  * @param absPath 绝对路径。
  * @returns 结果。
@@ -441,11 +460,6 @@ export function buildRecycleManyScript(): string {
      * 的 provider 层，实测 500 次 70ms vs 21ms。
      */
     /*
-     * 用普通数组而不是泛型 List：\[List[string]]::new()\ 在每次 PowerShell
-     * 启动时都有类型初始化的固定开销（实测让固定成本涨了约 100ms），
-     * 而这里只需要收集两组路径。
-     */
-    /*
      * 用 `List[string]` 而不是 `@()` 累积。
      *
      * `$p += $x` 每次都重建数组（O(n²)），`List.Add` 是 O(1)。
@@ -458,7 +472,6 @@ export function buildRecycleManyScript(): string {
      * | 500 | 312ms | 293ms |
      * | 2000 | 419ms | 354ms |
      */
-    '$present = [System.Collections.Generic.List[string]]::new()',
     '$present = [System.Collections.Generic.List[string]]::new()',
     '$missing = [System.Collections.Generic.List[string]]::new()',
     'foreach ($t in $targets) {',
@@ -475,12 +488,24 @@ export function buildRecycleManyScript(): string {
     '$errors = [System.Collections.Generic.List[object]]::new()',
     'foreach ($m in $missing) { $errors.Add([pscustomobject]@{ path = $m; message = "not found" }) }',
     'if ($present.Count -eq 0) {',
-    '  [pscustomobject]@{ ok = 0; fail = $missing.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
+    '  [pscustomobject]@{ ok = 0; fail = $missing.Count; moved = @(); errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
     '  exit 0',
     '}',
     /* 类型定义用单引号 here-string 交给 Add-Type。 */
     "$cs = @'\n" + '$CS_BODY_PLACEHOLDER' + '\n' + "'@",
     'Add-Type -TypeDefinition $cs',
+    /*
+     * ## 每条路径的去向必须**逐条复核**（2026-11-05 复审 A05）
+     *
+     * `SHFileOperationW` 允许**部分完成**：返回非零或 `fAnyOperationsAborted`
+     * 为真时，前面几条可能已经移走了。旧脚本在这种情况下把 `$present` 全体记成
+     * 失败，于是调用方整批回落到安全区，已经进回收站的那些报 "not found" ——
+     * 用户看到「回落安全区」，实际一部分在回收站。
+     *
+     * 现在：无论 rc / aborted 如何，都按**每条路径是否还在原处**分类。
+     * 已经消失的记为 moved，仍在的记为失败并附上 rc。这样去处是可追溯的。
+     */
+    '$moved = [System.Collections.Generic.List[string]]::new()',
     '$op = New-Object DshShFileOp+SHFILEOPSTRUCTW',
     '$op.wFunc = 3',
     '$op.pFrom = ($present -join [char]0) + [char]0 + [char]0',
@@ -491,24 +516,18 @@ export function buildRecycleManyScript(): string {
      */
     '$op.fFlags = 0x0040 -bor 0x0010 -bor 0x0004 -bor 0x0400',
     '$rc = [DshShFileOp]::SHFileOperationW([ref]$op)',
-    'if ($rc -ne 0) {',
-    '  foreach ($p in $present) { $errors.Add([pscustomobject]@{ path = $p; message = "SHFileOperation returned $rc" }) }',
-    '  [pscustomobject]@{ ok = 0; fail = $present.Count + $missing.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
-    '  exit 0',
-    '}',
-    'if ($op.fAnyOperationsAborted) {',
-    '  foreach ($p in $present) { $errors.Add([pscustomobject]@{ path = $p; message = "operation aborted by the shell" }) }',
-    '  [pscustomobject]@{ ok = 0; fail = $present.Count + $missing.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
-    '  exit 0',
-    '}',
-    /* 逐条复核：成功时路径应当已从原处消失。 */
-    '$goneCount = 0',
+    '$aborted = $op.fAnyOperationsAborted',
+    '$rcText = if ($rc -eq 0) { "operation aborted by the shell" } else { "SHFileOperation returned " + $rc }',
+    /*
+     * 逐条复核。给消失一点宽限：SHFileOperationW 是同步的，但同卷/跨卷的
+     * 收尾可能有毫秒级延迟。
+     */
     'foreach ($p in $present) {',
     '  if ([System.IO.File]::Exists($p) -or [System.IO.Directory]::Exists($p)) {',
-    '    $errors.Add([pscustomobject]@{ path = $p; message = "still present after the shell operation" })',
-    '  } else { $goneCount++ }',
+    '    $errors.Add([pscustomobject]@{ path = $p; message = $rcText })',
+    '  } else { $moved.Add($p) }',
     '}',
-    '[pscustomobject]@{ ok = $goneCount; fail = $errors.Count; errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
+    '[pscustomobject]@{ ok = $moved.Count; fail = $errors.Count; moved = $moved.ToArray(); errors = $errors.ToArray() } | ConvertTo-Json -Compress -Depth 4',
   ]
     .join('\n')
     .replace('$CS_BODY_PLACEHOLDER', csType)
@@ -517,10 +536,10 @@ export function buildRecycleManyScript(): string {
 /**
  * 解析批量脚本的输出。
  *
- * 找不到 `OK=` 汇总行时按**失败**处理：脚本崩溃不该被当成成功。
+ * 找不到可解析的 JSON 对象时按**失败**处理：脚本崩溃不该被当成成功。
  *
  * @param stdout 脚本标准输出。
- * @returns 成功数、失败数与逐条错误。
+ * @returns 成功数、失败数与逐条路径（结构化，不需要再解析字符串）。
  */
 export function parseRecycleManyOutput(stdout: string): {
   ok: number
@@ -528,6 +547,15 @@ export function parseRecycleManyOutput(stdout: string): {
   errors: string[]
   /** 失败条目的**原始路径**（供调用方精确比对，不需要再解析字符串）。 */
   failedPaths: string[]
+  /** 确实已移走的**原始路径**（部分成功时用来区分去向）。 */
+  succeededPaths: string[]
+  /**
+   * 汇总数字与逐条清单对不上时为 `true`。
+   *
+   * 典型形态：脚本声称 `ok=5`，却只给出 1 条 `moved`、0 条错误。那说明脚本
+   * 或协议坏了，调用方不能假装成功 —— 一个"看起来成功"的错误计数会写进审计。
+   */
+  inconsistent: boolean
 } {
   /*
    * ## 为什么用 JSON 而不是文本行（2026-11-04 自检）
@@ -547,7 +575,14 @@ export function parseRecycleManyOutput(stdout: string): {
    */
   const trimmed = stdout.trim()
   if (trimmed === '') {
-    return { ok: 0, fail: 1, errors: ['the recycle script produced no output'], failedPaths: [] }
+    return {
+      ok: 0,
+      fail: 1,
+      errors: ['the recycle script produced no output'],
+      failedPaths: [],
+      succeededPaths: [],
+      inconsistent: false,
+    }
   }
 
   /* 脚本可能先输出别的行，找第一段可解析的 JSON。 */
@@ -562,10 +597,17 @@ export function parseRecycleManyOutput(stdout: string): {
   }
 
   if (parsed === null || typeof parsed !== 'object') {
-    return { ok: 0, fail: 1, errors: ['could not parse the recycle script output'], failedPaths: [] }
+    return {
+      ok: 0,
+      fail: 1,
+      errors: ['could not parse the recycle script output'],
+      failedPaths: [],
+      succeededPaths: [],
+      inconsistent: false,
+    }
   }
 
-  const record = parsed as { ok?: unknown; fail?: unknown; errors?: unknown }
+  const record = parsed as { ok?: unknown; fail?: unknown; errors?: unknown; moved?: unknown }
   const ok = typeof record.ok === 'number' && Number.isFinite(record.ok) ? record.ok : 0
   const rawErrors = Array.isArray(record.errors) ? record.errors : []
 
@@ -580,6 +622,15 @@ export function parseRecycleManyOutput(stdout: string): {
     messages.push(p === '' ? m : `${p} : ${m}`)
   }
 
+  /*
+   * `moved` 是脚本**逐条复核**之后的结论（路径是否真的从原处消失了）。
+   * 老版本的脚本没有这个字段 —— 那时退化为空清单，调用方按「全部失败」处理，
+   * 也就是保守方向。
+   */
+  const succeededPaths = Array.isArray(record.moved)
+    ? record.moved.filter((p): p is string => typeof p === 'string' && p !== '')
+    : []
+
   const declaredFail = typeof record.fail === 'number' && Number.isFinite(record.fail) ? record.fail : 0
   /*
    * 取声明值与实际错误条目的较大者：脚本说 fail=0 却给了错误明细时，
@@ -587,7 +638,13 @@ export function parseRecycleManyOutput(stdout: string): {
    */
   const fail = Math.max(declaredFail, rawErrors.length)
 
-  return { ok, fail, errors: messages, failedPaths }
+  /*
+   * 计数守恒：`ok` 必须等于逐条成功清单的长度（脚本给了清单时）。
+   * 对不上说明协议坏了 —— 让调用方知道，而不是替它圆场。
+   */
+  const inconsistent = Array.isArray(record.moved) && succeededPaths.length !== ok
+
+  return { ok, fail, errors: messages, failedPaths, succeededPaths, inconsistent }
 }
 
 /**
@@ -675,15 +732,37 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
      *
      * 现在：只要有成功的就按成功返回，末位附上失败明细，让调用方只处理
      * 真正没做成的那些。
+     *
+     * ## 计数对不上时不能报成功（2026-11-05 复审 A05）
+     *
+     * 脚本声称移走了 N 条、逐条清单却不是 N 条 —— 协议坏了。那种"看起来成功"
+     * 的计数会写进审计，而审计最不该骗人。此时按失败处理（保守方向），
+     * 并把**逐条清单**交给调用方，让它只对确定还在原处的条目回落安全区。
      */
+    if (parsed.inconsistent) {
+      recordRecycleFailure()
+      return {
+        ok: false,
+        recycled: 0,
+        reason:
+          `the recycle script reported ${parsed.ok} moved item(s) but listed ${parsed.succeededPaths.length}; ` +
+          'its report is inconsistent, so nothing is treated as recycled',
+        succeededPaths: parsed.succeededPaths,
+        failedPaths: parsed.failedPaths,
+      }
+    }
+
     if (parsed.ok > 0) {
       consecutiveFailures = 0
-      if (parsed.fail === 0) return { ok: true, recycled: parsed.ok }
+      if (parsed.fail === 0) {
+        return { ok: true, recycled: parsed.ok, succeededPaths: parsed.succeededPaths }
+      }
       return {
         ok: true,
         recycled: parsed.ok,
         failed: parsed.errors,
         failedPaths: parsed.failedPaths,
+        succeededPaths: parsed.succeededPaths,
       }
     }
 
@@ -693,6 +772,12 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
       ok: false,
       recycled: 0,
       reason: `${parsed.fail} item(s) could not be recycled${detail}`,
+      /*
+       * 即使 `ok=false`，也可能有个别条目真的移走了（脚本的逐条复核会告诉我们）。
+       * 不交出去的话，调用方会把它们再次交给安全区，然后对着 "not found" 报错。
+       */
+      ...(parsed.succeededPaths.length === 0 ? {} : { succeededPaths: parsed.succeededPaths }),
+      ...(parsed.failedPaths.length === 0 ? {} : { failedPaths: parsed.failedPaths }),
     }
   } catch (error) {
     recordRecycleFailure()
@@ -925,6 +1010,16 @@ function listBitBucketVolumeKeys(): string[] {
     return out
       .split(/\r?\n/)
       .map((line) => line.trim())
+      /*
+       * 只接受 root 的**子键**：`reg query <root>` 列出的子键都以 root 开头。
+       *
+       * 旧写法是 `line.startsWith('HKEY_')` —— 过宽。虽然当前输出里只有键行
+       * 以 HKEY_ 开头（值行有缩进，被 trim 后以值名开头），但如果某个卷的键里
+       * 恰好有一个**值**名叫 `HKEY_whatever`，它就会被当成卷键，然后拿去读
+       * MaxCapacity，得到一个空结果。
+       *
+       * 加 root + 反斜杠前缀后，只有真正的子键能通过。
+       */
       .filter((line) => line.startsWith(`${root}\\`))
   } catch {
     return []

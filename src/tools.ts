@@ -669,36 +669,98 @@ async function deleteMany(
 
     const recycle = ctx.recycler ?? recycleManyToSystemBin
     const outcome = await recycle(plans.map((p) => p.target))
-    if (outcome.ok) {
-      /*
-       * 只对**真的进了回收站**的条目写审计（R24-2）。
-       *
-       * `outcome.failed` 里有逐条失败原因，但上一版没有任何调用方读它 ——
-       * 部分失败时全部条目都被记成「已删除」，审计与事实不符。
-       */
-      const failedTargets = new Set(
-        (outcome.failed ?? []).map((line) => line.split(' : ')[0]?.trim() ?? ''),
-      )
-      const succeededPlans = plans.filter((p) => !failedTargets.has(p.target))
-      const auditRecords: Array<Omit<AuditRecord, 'at'>> = succeededPlans.map((p) => ({
+
+    /*
+     * ## 逐条对账，而不是整批一个布尔（2026-11-05 复审 A05/A06）
+     *
+     * 两件事必须一起修：
+     *
+     * 1. **身份来自结构化字段**。旧代码用 `line.split(' : ')[0]` 从人类可读的
+     *    错误文案里反推路径 —— 路径含 ` : ` 时截断，于是一个真实的失败被判成
+     *    成功并写进审计。现在只读 `failedPaths` / `succeededPaths`。
+     * 2. **部分成功不能整批回落**。Shell 允许部分完成，已经进回收站的路径
+     *    再交给安全区只会报 "not found"，用户看到「回落安全区」而实际一部分
+     *    在回收站。现在只对**确定仍在原处**的条目回落。
+     *
+     * 三类去向分开报告：
+     *   - recycled：确定进了回收站（含 `ok:false` 但仍有个别成功的）；
+     *   - unknown：既不在成功清单也不在失败清单 —— 说不清，绝不能写成成功；
+     *   - still-present：确定没进去，回落安全区。
+     */
+    const failedPaths = new Set(outcome.failedPaths ?? [])
+    const succeededPaths = new Set(outcome.succeededPaths ?? [])
+    /*
+     * ## 只有「有人可读的失败文案」而没有逐条路径 → 说不清是哪几条
+     *
+     * 新契约要求实现方给出 `failedPaths`（生产路径的 `recycleManyToSystemBin`
+     * 一定会给）。若某个实现只给了 `failed` 文案，**不能**回退到
+     * `split(' : ')[0]` 那种字符串反推 —— 那正是 A06 要消灭的东西。
+     *
+     * 这种情况下把所有未确认成功的条目记为 unknown：宁可说「不确定」，
+     * 也不能把一条真实失败记成已删除。
+     */
+    const ambiguousFailure = outcome.failedPaths === undefined && (outcome.failed?.length ?? 0) > 0
+
+    const recycledPlans = plans.filter((p) => succeededPaths.has(p.target))
+    /*
+     * `ok:true` 但没给逐条成功清单（老实现 / 测试替身）：以失败清单为准，
+     * 其余视为成功 —— 这是唯一能保持既有行为的退化路径。
+     */
+    const recycledFromSummary =
+      outcome.ok === true && succeededPaths.size === 0 && !ambiguousFailure
+        ? plans.filter((p) => !failedPaths.has(p.target))
+        : recycledPlans
+    const unknownPlans = ambiguousFailure
+      ? plans.filter((p) => !succeededPaths.has(p.target))
+      : plans.filter((p) => !failedPaths.has(p.target) && !succeededPaths.has(p.target))
+    const remainingPlans = plans.filter((p) => failedPaths.has(p.target))
+
+    if (recycledFromSummary.length > 0 || unknownPlans.length > 0) {
+      const auditRecords: Array<Omit<AuditRecord, 'at'>> = recycledFromSummary.map((p) => ({
         event: 'delete',
         target: p.target,
         tool: 'safe_delete',
         detail: `destination=recycle-bin cls=${p.gate.classification}`,
       }))
-      if (failedTargets.size > 0) {
+      /*
+       * 去向不明**不能**记成删除。审计里必须留下一条能事后追查的记录，
+       * 否则「这条文件去哪了」就没有答案。
+       */
+      for (const p of unknownPlans) {
         auditRecords.push({
           event: 'delete',
-          target: `${failedTargets.size} item(s)`,
+          target: p.target,
           tool: 'safe_delete',
-          detail: `destination=recycle-bin failed: ${(outcome.failed ?? []).slice(0, 3).join('; ')}`,
+          detail: 'destination=recycle-bin outcome=UNKNOWN (the shell did not report this path)',
+        })
+      }
+      if (failedPaths.size > 0) {
+        auditRecords.push({
+          event: 'delete',
+          target: `${failedPaths.size} item(s)`,
+          tool: 'safe_delete',
+          detail: `destination=recycle-bin failed: ${(outcome.ok === true ? (outcome.failed ?? []) : []).slice(0, 3).join('; ') || 'see per-path records'}`,
         })
       }
       appendAuditBatch(ctx.stateDir, auditRecords)
-      const lines = succeededPlans.map((p) => `${p.target}  →  system recycle bin`)
-      if (failedTargets.size > 0) {
-        lines.push('', `Not recycled (${failedTargets.size}):`)
-        for (const line of (outcome.failed ?? []).slice(0, 5)) lines.push(`  ${line}`)
+
+      const lines = recycledFromSummary.map((p) => `${p.target}  →  system recycle bin`)
+      if (unknownPlans.length > 0) {
+        lines.push('', `Outcome UNKNOWN (${unknownPlans.length}) — check the recycle bin before retrying:`)
+        for (const p of unknownPlans.slice(0, 10)) lines.push(`  ${p.target}`)
+        if (unknownPlans.length > 10) lines.push(`  …and ${unknownPlans.length - 10} more`)
+      }
+      if (failedPaths.size > 0) {
+        lines.push('', `Not recycled (${failedPaths.size}):`)
+        for (const p of failedPaths) lines.push(`  ${p}`)
+        const reasons = outcome.failed ?? []
+        if (reasons.length > 0) {
+          lines.push('  Reasons:')
+          for (const line of reasons.slice(0, 5)) lines.push(`    ${line}`)
+        }
+      }
+      if (remainingPlans.length > 0) {
+        lines.push('', `Falling back to the safe zone for ${remainingPlans.length} item(s).`)
       }
       if (failed.length > 0) {
         lines.push('', `Skipped (${failed.length}):`)
@@ -706,9 +768,50 @@ async function deleteMany(
       }
       lines.push(
         '',
-        `Moved ${outcome.recycled} item(s) to the system recycle bin. ` +
+        `Moved ${recycledFromSummary.length} item(s) to the system recycle bin. ` +
           'Restore them from the recycle bin itself — this deletion is not tracked in the safe zone.',
       )
+      if (remainingPlans.length === 0 && unknownPlans.length === 0) {
+        return { ok: true, text: lines.join('\n') }
+      }
+      /*
+       * 还有条目要回落：**只对确定仍在原处的那几条**走安全区，
+       * 然后把两段结果拼在一起返回。
+       */
+      const fallback = await moveManyToSafeZone(
+        ctx.stateDir,
+        remainingPlans.map((p) => p.target),
+        {
+          retentionDays: ctx.retentionDays,
+          now: ctx.now(),
+          ...(ctx.crossVolumeCopy === true ? { crossVolumeCopy: true } : {}),
+          ...(boundedReason === undefined ? {} : { reason: boundedReason }),
+        },
+      )
+      const fallbackAudit: Array<Omit<AuditRecord, 'at'>> = []
+      let fallbackMoved = 0
+      for (const item of fallback) {
+        if (item.entry !== undefined) {
+          fallbackMoved += 1
+          fallbackAudit.push({
+            event: 'delete',
+            target: item.path,
+            tool: 'safe_delete',
+            detail: `id=${item.entry.id} batch (fell back from recycle-bin)`,
+          })
+        } else {
+          failed.push({ target: item.path, error: item.error ?? 'unknown error' })
+        }
+      }
+      appendAuditBatch(ctx.stateDir, fallbackAudit)
+      if (fallbackMoved > 0) {
+        lines.push('', `Fell back to the safe zone: ${fallbackMoved} item(s) moved there and can be restored with safe_zone_restore.`)
+      }
+      if (failed.length > 0) {
+        lines.push('', `Still not handled (${failed.length}):`)
+        for (const item of failed.slice(0, 10)) lines.push(`  ${item.target} — ${item.error}`)
+      }
+      if (ctx.afterMove !== undefined) await ctx.afterMove()
       return { ok: true, text: lines.join('\n') }
     }
     // 回落：把原因记进审计，让用户能看到「本想进回收站，结果进了安全区」。
@@ -717,7 +820,7 @@ async function deleteMany(
         event: 'delete',
         target: `${plans.length} item(s)`,
         tool: 'safe_delete',
-        detail: `destination=recycle-bin fell back to safe zone: ${outcome.reason}`,
+        detail: `destination=recycle-bin fell back to safe zone: ${outcome.ok ? 'partial report' : outcome.reason}`,
       },
     ])
   }
@@ -837,7 +940,18 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       // 工具描述在每次请求里都会发给模型，是最该精简的地方。
       // 原来这里把「batch 更省」「危险路径要审批」「先 preview」各说了两遍
       // （描述里一遍、参数描述里一遍），压掉重复不损失任何信息。
-      'Move files/directories into the safe zone (restorable via safe_zone_restore). This is the ONLY sanctioned way to delete in DSH; raw shell deletes are blocked. ' +
+      /*
+       * ## 文案必须与「删除去向」配置一致（2026-11-05 复审 A10）
+       *
+       * 旧描述写死「移入安全区，可用 safe_zone_restore 取回」。配置支持
+       * `deleteDestination = recycle-bin` 之后，那句话在半个产品里是假的：
+       * 条目直接进系统回收站，`safe_zone_restore` 找不回它。
+       *
+       * 现在按 deps 里的实际目的地生成描述。模型读到的是**这个部署**的行为。
+       */
+      (normalizeDestination(deps.destination) === 'recycle-bin'
+        ? 'Delete files/directories through DSH\'s sanctioned delete path. This deployment is configured to hand them to the system recycle bin, which keeps their original location — restore from the recycle bin itself; the safe zone does not track them. '
+        : 'Move files/directories into the safe zone (restorable via safe_zone_restore). This is the ONLY sanctioned way to delete in DSH; raw shell deletes are blocked. ') +
       'Pass `paths` to delete several in one call — one approval covers the batch. ' +
       'To clear generated output, prefer `root` + `match` (e.g. root a `.tmp` dir, match `**/*.log`) over enumerating files yourself: one call, one approval, and it stays O(n). ' +
       'Dangerous paths (home dir, plugin sources, profile manifests, node_modules) need user approval; ordinary workspace files move silently. ' +
