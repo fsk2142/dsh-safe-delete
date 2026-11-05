@@ -21,7 +21,7 @@ import { classifyPath, normalize as normalizeForCompare, requiresApproval, type 
 import { describeTarget } from './describe'
 import { moveToSafeZone } from './store'
 import {
-  detectQuotaRisk,
+  assessQuota,
   recycleManyToSystemBin,
   type PermanentDeleteRisk,
   type RecycleManyOutcome,
@@ -449,10 +449,19 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
    *   2. 回收失败**回落安全区**，绝不静默永久删除。
    */
   if (normalizeDestination(ctx.destination) === 'recycle-bin') {
-    if (ctx.permanentDeleteRisk?.risky === true) {
+    /*
+     * ## 策略三态（2026-11-05 第二轮复审 R02）
+     *
+     * 旧代码只认 `risky === true`。而 `risky: false` 既可能是"确认没关回收站"，
+     * 也可能是"注册表读不到"——后者被并进 false 之后，"问不到"就变成了"不用问"。
+     * 现在 `unknown` 也走审批。
+     */
+    const permStatus =
+      ctx.permanentDeleteRisk?.status ?? (ctx.permanentDeleteRisk?.risky === true ? 'risky' : 'safe')
+    if (permStatus !== 'safe') {
       const outcome = await ctx.requestApproval(
         `This delete will PERMANENTLY remove ${target} — the recycle bin is not in effect.\n\n` +
-          `Reason: ${ctx.permanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}\n\n` +
+          `Reason: ${ctx.permanentDeleteRisk?.reason ?? 'the system is configured to delete permanently'}\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
@@ -462,18 +471,28 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
 
     /*
      * 单文件超过回收站上限时 Windows 会**永久删除并返回成功**（Important-9）。
-     * 只能事前问：目录刻意不量（回收站模式跳过统计），只判单文件。
+     *
+     * ## 目录按 unknown 处理（2026-11-05 第二轮复审 R01）
+     *
+     * 回收站模式跳过目录的全树统计，`description.bytes` 只是**顶层**的
+     * `shallowBytes` 下界。旧代码只对 `isDirectory === false` 判配额，
+     * 于是「顶层什么都没有、嵌套深处 20 GB」的目录得到 `bytes = 0` →
+     * 判定为无风险 → 静默送进回收站，可能被永久删除。
+     *
+     * 现在目录也判，并把「这只是下界」告诉判定函数：下界已超 → 确定超限；
+     * 下界没超 → **unknown**，同样要问。目录的完整大小在此模式下刻意不测，
+     * 所以"不知道"才是诚实的答案。
      */
-    if (description.isDirectory === false) {
-      const quotaRisk = detectQuotaRisk(description.bytes)
-      if (quotaRisk !== undefined) {
-        const outcome = await ctx.requestApproval(
-          `This delete will PERMANENTLY remove ${target} — ${quotaRisk}.\n\n` +
-            `Approve only if you accept that the data cannot be recovered.`,
-        )
-        if (outcome !== 'allowed-once') {
-          return { ok: false, target, error: approvalFailureText(outcome, target) }
-        }
+    const quota = assessQuota(description.bytes, {
+      ...(description.isDirectory === true ? { sizeIsLowerBound: true } : {}),
+    })
+    if (quota.status !== 'within') {
+      const outcome = await ctx.requestApproval(
+        `This delete may PERMANENTLY remove ${target} — ${quota.reason}.\n\n` +
+          `Approve only if you accept that the data cannot be recovered.`,
+      )
+      if (outcome !== 'allowed-once') {
+        return { ok: false, target, error: approvalFailureText(outcome, target) }
       }
     }
 

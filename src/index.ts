@@ -30,7 +30,7 @@ import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
-import { detectPermanentDeleteRisk, detectQuotaRisk } from './recycle'
+import { detectPermanentDeleteRisk, assessQuota } from './recycle'
 import { describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
@@ -528,10 +528,19 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
            * 出路写在理由里，用户可以立刻照做，而不是反复重试被拒的调用。
            */
           if (hookDestination === 'recycle-bin') {
+            /*
+             * 文案要按三态写：策略确定命中 / 策略读不到 / 策略正常。
+             * 中间那一种正是 R02 修的洞 —— 读不到的旧值等于"无风险"。
+             */
+            const policyStatus =
+              hookPermanentDeleteRisk.status ??
+              (hookPermanentDeleteRisk.risky ? 'risky' : 'safe')
             const policyLine =
-              hookPermanentDeleteRisk.risky
+              policyStatus === 'risky'
                 ? ` System policy: ${hookPermanentDeleteRisk.reason ?? 'the recycle bin is not in effect'}.`
-                : ' Matched file sizes are unknown before execution, so items above the recycle bin limit could be deleted permanently.'
+                : policyStatus === 'unknown'
+                  ? ` ${hookPermanentDeleteRisk.reason ?? 'The recycle bin policy could not be read'}.`
+                  : ' Matched items are not enumerated, so their sizes stay unknown and items above the recycle bin limit could be deleted permanently.'
             return {
               kind: 'deny',
               reason:
@@ -558,17 +567,27 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
            */
           bits.push('the matched items are not known until execution, and may include protected paths')
         }
+        /*
+         * 「这次会怎样」那句按三态写（R02）：策略命中 / 策略读不到 / 策略正常。
+         * 中间那一种必须说出来 —— 它此前被并进"正常"，于是卡片什么风险都不提。
+         */
+        const permStatus =
+          hookPermanentDeleteRisk.status ?? (hookPermanentDeleteRisk.risky ? 'risky' : 'safe')
+        const destinationLine =
+          hookDestination === 'recycle-bin'
+            ? 'Matched items go to the system recycle bin, not the safe zone. ' +
+              (permStatus === 'risky'
+                ? `System policy will permanently delete them: ${hookPermanentDeleteRisk.reason ?? 'recycling is disabled'}. `
+                : permStatus === 'unknown'
+                  ? `The recycle bin policy could not be read: ${hookPermanentDeleteRisk.reason ?? 'unknown'}. `
+                  : 'Matched sizes are unknown before execution; items exceeding recycle-bin capacity may be permanently deleted. ') +
+              'safe_zone_restore cannot restore these items. '
+            : 'Only matched items inside it move into the safe zone. '
         const text =
           `Delete files matched under this path? ` +
           bits.join('; ') +
           '. The root directory itself is kept. ' +
-          (hookDestination === 'recycle-bin'
-            ? 'Matched items go to the system recycle bin, not the safe zone. ' +
-              (hookPermanentDeleteRisk.risky
-                ? `System policy will permanently delete them: ${hookPermanentDeleteRisk.reason ?? 'recycling is disabled'}. `
-                : 'Matched sizes are unknown before execution; items exceeding recycle-bin capacity may be permanently deleted. ') +
-              'safe_zone_restore cannot restore these items. '
-            : 'Only matched items inside it move into the safe zone. ') +
+          destinationLine +
           'The exact count is computed during execution and covered by this one approval.'
         /*
          * 返回 `ask`，由工具管线发起审批。
@@ -596,6 +615,15 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           const resolved: string[] = []
           const recycleMode = hookDestination === 'recycle-bin'
 
+          /*
+           * 每个目标是否「大小只是下界」。
+           *
+           * 回收站模式下 `describeTarget(…, { stats: false })` 只量顶层，
+           * 目录的 `bytes` 是一个下界。判定配额时必须把这件事告诉它 ——
+           * 否则「顶层 0 字节、嵌套深处 20 GB」会被判成无风险。
+           */
+          const lowerBoundFlags: boolean[] = []
+
           for (const raw of targets.paths) {
             const target = path.resolve(raw)
             resolved.push(target)
@@ -614,6 +642,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             fileCount += description.fileCount
             bytes += description.bytes
             targetSizes.push(description.bytes)
+            lowerBoundFlags.push(description.statsOmitted === true && description.isDirectory === true)
             /*
              * 回收站模式下阈值归零（2026-11-04 第 24 次审查 R24-3）。
              *
@@ -644,7 +673,16 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             reasons.push(`${bytes} bytes in this batch exceeds the limit of ${bytesLimit}`)
           }
 
-          return { resolved, fileCount, bytes, reasons, statsOmitted, targetSizes, needsApproval: reasons.length > 0 }
+          return {
+            resolved,
+            fileCount,
+            bytes,
+            reasons,
+            statsOmitted,
+            targetSizes,
+            lowerBoundFlags,
+            needsApproval: reasons.length > 0,
+          }
         } catch {
           return undefined
         }
@@ -663,6 +701,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         ...(hookPermanentDeleteRisk === undefined ? {} : { permanentDeleteRisk: hookPermanentDeleteRisk }),
         targets: plan.resolved,
         sizes: plan.targetSizes,
+        lowerBoundFlags: plan.lowerBoundFlags,
       })
       if (riskVerdict.kind === 'ask') {
         /*
@@ -1422,10 +1461,16 @@ async function maybeRunRequestedClean(
  */
 export function decideHookRisk(input: {
   destination: DeleteDestination
-  permanentDeleteRisk?: { risky: boolean; reason?: string }
+  permanentDeleteRisk?: { status?: 'risky' | 'safe' | 'unknown'; risky: boolean; reason?: string }
   targets: readonly string[]
   /** 与 `targets` 等长的大小（字节）。 */
   sizes: readonly number[]
+  /**
+   * 与 `targets` 等长：该大小是否只是**下界**（目录内容未完整统计）。
+   *
+   * 默认全 `false`（单文件、或安全区模式已做全树统计）。
+   */
+  lowerBoundFlags?: readonly boolean[]
 }): { kind: 'ask'; reason: string } | { kind: 'next' } {
   /*
    * 只有回收站模式才可能「不可恢复」：安全区模式的条目还能取回，
@@ -1433,32 +1478,73 @@ export function decideHookRisk(input: {
    */
   if (input.destination !== 'recycle-bin') return { kind: 'next' }
 
-  if (input.permanentDeleteRisk?.risky === true) {
+  /*
+   * ## 三态：risky 与 unknown 都要问（2026-11-05 第二轮复审 R02）
+   *
+   * 旧判定只认 `risky === true`。而 `risky` 为 false 有两种含义：确认安全、
+   * 或者**读不到策略**。后者被并进 false 之后，"问不到"就变成了"不用问"。
+   */
+  const policy = input.permanentDeleteRisk
+  const policyStatus = policy?.status ?? (policy?.risky === true ? 'risky' : 'safe')
+  if (policyStatus === 'risky') {
     return {
       kind: 'ask',
       reason:
         `This delete will PERMANENTLY remove ${input.targets.length} item(s) — the recycle bin is not in effect.\n\n` +
-        `Reason: ${input.permanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}\n\n` +
+        `Reason: ${policy?.reason ?? 'the system is configured to delete permanently'}\n\n` +
+        `Approve only if you accept that the data cannot be recovered.`,
+    }
+  }
+  if (policyStatus === 'unknown') {
+    return {
+      kind: 'ask',
+      reason:
+        `This delete may PERMANENTLY remove ${input.targets.length} item(s) — whether Windows will use the recycle bin could not be verified.\n\n` +
+        `Reason: ${policy?.reason ?? 'the recycle bin policy could not be read'}\n\n` +
         `Approve only if you accept that the data cannot be recovered.`,
     }
   }
 
   /*
-   * 超配额的单文件会被 Windows 永久删除。这里按**钩子已知的大小**判断 ——
-   * 钩子本来就算过 description，所以不需要额外遍历。
+   * 配额风险：逐个目标按三态判。
+   *
+   * ## 目录的下界（R01）
+   *
+   * 回收站模式下目录只量顶层，`sizes[i]` 是下界。下界已超 → over；下界没超
+   * 但真实大小未知 → unknown。旧实现只判 `size > 0`，于是「顶层 0 字节、
+   * 嵌套深处 20 GB」直接落进"没风险"。
    */
-  const oversized = input.targets.filter((_, i) => {
-    const size = input.sizes[i]
-    return typeof size === 'number' && size > 0 && detectQuotaRisk(size) !== undefined
-  })
-  if (oversized.length > 0) {
-    const sample = oversized.slice(0, 3).map((p) => `"${p}"`).join(', ')
-    const rest = oversized.length > 3 ? ` (+${oversized.length - 3} more)` : ''
+  const flagged = input.targets
+    .map((target, i) => {
+      const size = input.sizes[i]
+      return {
+        target,
+        quota: assessQuota(typeof size === 'number' ? size : 0, {
+          ...(input.lowerBoundFlags?.[i] === true ? { sizeIsLowerBound: true } : {}),
+        }),
+      }
+    })
+    .filter((entry) => entry.quota.status !== 'within')
+
+  if (flagged.length > 0) {
+    const over = flagged.filter((e) => e.quota.status === 'over')
+    const unknown = flagged.filter((e) => e.quota.status === 'unknown')
+    const sample = flagged.slice(0, 3).map((e) => `"${e.target}"`).join(', ')
+    const rest = flagged.length > 3 ? ` (+${flagged.length - 3} more)` : ''
+    const detail = [...new Set(flagged.map((e) => (e.quota.status === 'within' ? '' : e.quota.reason)))]
+      .filter((r) => r !== '')
+      .join('; ')
+    const headline =
+      unknown.length === 0
+        ? `${over.length} file(s) larger than the recycle bin's per-volume limit`
+        : over.length === 0
+          ? `${unknown.length} item(s) whose size could not be bounded below the recycle bin's limit`
+          : `${flagged.length} item(s) that may exceed the recycle bin's limit`
     return {
       kind: 'ask',
       reason:
-        `This delete will PERMANENTLY remove ${oversized.length} file(s) larger than the recycle bin's per-volume limit: ` +
-        `${sample}${rest}.\n\nApprove only if you accept that they cannot be recovered.`,
+        `This delete may PERMANENTLY remove ${headline}: ${sample}${rest}.\n\n` +
+        `${detail}\n\nApprove only if you accept that they cannot be recovered.`,
     }
   }
 

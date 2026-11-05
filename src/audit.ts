@@ -146,6 +146,19 @@ export function appendAuditBatch(
  * 审计日志只增不减，这个成本会一直涨。现在按块从末尾往前读，凑够 N 条完整行
  * 就停，只解析这些行。
  *
+ * ## 必须**先拼字节、后解码**（2026-11-05 第二轮复审 R03）
+ *
+ * 第一版每读一块就 `toString('utf8')` 再拼字符串。块边界落在中文/emoji 的
+ * 多字节序列中间时，两半各自解码都会得到 U+FFFD：块 A 的末尾缺续字节，
+ * 块 B 的开头多出续字节，拼接处于是变成 `\uFFFD\uFFFD`。
+ *
+ * 而这不是"读不到"，是**静默改写了路径**：`JSON.parse` 照常成功（U+FFFD 是
+ * 合法字符），审计里的 `C:/工作区/报告.txt` 变成 `C:/工��区/报告.txt`。
+ * 实测 900 行中文记录、`wanted` 大到读两个块时，有 2 条记录被这样破坏。
+ *
+ * 现在累积 `Buffer`，用 `Buffer.concat` 拼好之后**只解码一次** —— 边界落在
+ * 字符中间也无所谓，因为解码器看到的是连续字节。
+ *
  * ## 边界
  *
  * - 半行（进程在写一半时被杀）：末尾的半行解析失败被跳过，不影响更早的完整行；
@@ -179,31 +192,36 @@ export function readAudit(stateDir: string, limit = 20): AuditRecord[] {
 
   try {
     /*
-     * 从末尾往前累积分块，直到攒够 `wanted` 个换行（+1 表示最后一行没有
-     * 结尾换行时也能成行）。块大小指数增长，避免长行时做 O(n²) 次读取。
+     * 从末尾往前累积分块，直到攒够 `wanted` 个换行。块大小指数增长，避免
+     * 长行时做 O(n²) 次读取。
+     *
+     * 累积的是 **Buffer**，不是字符串 —— 见上面「先拼字节、后解码」。
      */
     let chunk = Math.min(TAIL_CHUNK_BYTES, size)
     let start = size
-    let buffer = ''
+    /** 已读到的字节（末尾在前）。 */
+    let parts: Buffer[] = []
 
     for (;;) {
       const from = Math.max(0, start - chunk)
       const length = start - from
       const bytes = Buffer.allocUnsafe(length)
       const read = readSync(fd, bytes, 0, length, from)
-      const text = bytes.subarray(0, read).toString('utf8')
-      buffer = text + buffer
+      parts.unshift(read === length ? bytes : bytes.subarray(0, read))
       start = from
 
       /*
-       * 换行数够不够：`buffer` 里最后一个字符可能是下一行的开头（我们从中间
-       * 切进来了），所以要看的是**完整行**的条数。
+       * 换行数直接在**字节**上数：UTF-8 里 `\n` 是单字节 0x0A，而续字节的
+       * 高位是 `10`，永远不会等于 0x0A。所以按字节计数与按字符计数等价，
+       * 且不需要先解码。
        */
-      if (start === 0 || countNewlines(buffer) > wanted) break
+      if (start === 0 || countNewlineBytes(parts) > wanted) break
       chunk = Math.min(start, chunk * 2)
     }
 
-    return parseTail(buffer, wanted)
+    /* 只在拼好之后解码一次。 */
+    const text = Buffer.concat(parts).toString('utf8')
+    return parseTail(text, wanted)
   } catch {
     return []
   } finally {
@@ -218,11 +236,18 @@ export function readAudit(stateDir: string, limit = 20): AuditRecord[] {
 /** 尾部读取的起始块大小（字节）。够装几十条正常审计记录。 */
 const TAIL_CHUNK_BYTES = 16 * 1024
 
-/** 数一段文本里的换行数（不分配数组，长文本下比 `split` 便宜）。 */
-function countNewlines(text: string): number {
+/**
+ * 数已读字节里的换行数（不拼字符串、不分配数组）。
+ *
+ * @param parts 已读到的分块（末尾在前）。
+ * @returns 换行字节总数。
+ */
+function countNewlineBytes(parts: readonly Buffer[]): number {
   let count = 0
-  for (let i = 0; i < text.length; i += 1) {
-    if (text.charCodeAt(i) === 0x0a) count += 1
+  for (const part of parts) {
+    for (let i = 0; i < part.length; i += 1) {
+      if (part[i] === 0x0a) count += 1
+    }
   }
   return count
 }

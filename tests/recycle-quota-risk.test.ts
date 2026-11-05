@@ -44,17 +44,23 @@ describe('detectQuotaRisk', () => {
     expect(reason).toBeDefined()
   })
 
-  it('stays quiet when no limit can be read', () => {
+  it('reports unknown when no limit can be read', () => {
+    /*
+     * 2026-11-05 第二轮复审 R02：这里原来断言 `undefined`（"不报风险"）。
+     * 但"读不到上限"与"文件没超"的安全含义完全相反 —— 前者是**不知道**会不会
+     * 被永久删除。现在改成返回说明，由上层按风险处理。
+     */
     const reason = detectQuotaRisk(999 * MB, {
       platform: 'win32',
       listVolumeKeys: () => [],
       readCapacityMb: () => undefined,
     })
 
-    expect(reason).toBeUndefined()
+    expect(reason).toBeDefined()
+    expect(reason).toMatch(/could not|cannot be verified/i)
   })
 
-  it('does not throw when the registry read throws', () => {
+  it('does not throw when the registry read throws, and reports unknown', () => {
     const reason = detectQuotaRisk(999 * MB, {
       platform: 'win32',
       listVolumeKeys: () => ['vol'],
@@ -63,7 +69,8 @@ describe('detectQuotaRisk', () => {
       },
     })
 
-    expect(reason).toBeUndefined()
+    expect(reason, '读失败是未知，不是安全').toBeDefined()
+    expect(reason).toMatch(/could not|cannot be verified/i)
   })
 
   it('is not applicable off Windows', () => {

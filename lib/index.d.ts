@@ -1,4 +1,4 @@
-import { r as DeleteDestination } from "./delete-core-DSD9pFeY.js";
+import { r as DeleteDestination } from "./delete-core-BpCB5vMX.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**
@@ -243,12 +243,19 @@ export declare function apply(ctx: PluginContext, config?: SafeDeleteConfig): vo
 export declare function decideHookRisk(input: {
   destination: DeleteDestination;
   permanentDeleteRisk?: {
+    status?: 'risky' | 'safe' | 'unknown';
     risky: boolean;
     reason?: string;
   };
   targets: readonly string[];
   /** 与 `targets` 等长的大小（字节）。 */
   sizes: readonly number[];
+  /**
+   * 与 `targets` 等长：该大小是否只是**下界**（目录内容未完整统计）。
+   *
+   * 默认全 `false`（单文件、或安全区模式已做全树统计）。
+   */
+  lowerBoundFlags?: readonly boolean[];
 }): {
   kind: 'ask';
   reason: string;

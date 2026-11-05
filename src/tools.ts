@@ -33,7 +33,7 @@ import { describeTarget } from './describe'
 import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
 import type { PermanentDeleteRisk, Recycler, RecycleManyOutcome } from './recycle'
-import { detectQuotaRisk } from './recycle'
+import { assessQuota } from './recycle'
 import { recycleManyToSystemBin } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
@@ -633,11 +633,17 @@ async function deleteMany(
      *
      * 只接线 `deletePath` 不够：`deleteMany` 是「一次删几千个」那条路，不经过
      * `deletePath`，于是策略命中的机器上批量删除依然静默永久删。
+     *
+     * ## 三态（2026-11-05 第二轮复审 R02）
+     *
+     * `risky === true` 只覆盖"确定永久删除"；"读不到策略"同样不可忽略。
      */
-    if (ctx.permanentDeleteRisk?.risky === true) {
+    const permStatus =
+      ctx.permanentDeleteRisk?.status ?? (ctx.permanentDeleteRisk?.risky === true ? 'risky' : 'safe')
+    if (permStatus !== 'safe') {
       const outcome = await ctx.requestApproval(
         `This delete will PERMANENTLY remove ${plans.length} item(s) — the recycle bin is not in effect.\n\n` +
-          `Reason: ${ctx.permanentDeleteRisk.reason ?? 'the system is configured to delete permanently'}\n\n` +
+          `Reason: ${ctx.permanentDeleteRisk?.reason ?? 'the system is configured to delete permanently'}\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
@@ -649,21 +655,34 @@ async function deleteMany(
      * 配额风险在批量路径上同样要问（2026-11-04 自检）。
      *
      * 上一版只接在 `deletePath` 里，批量删一个超大文件会静默永久删除。
-     * 只判单个文件：目录的递归大小在这个模式下刻意不统计。
+     *
+     * ## 目录也算（2026-11-05 第二轮复审 R01）
+     *
+     * 这里原来过滤 `isDirectory === false` —— 于是目录的「顶层 0 字节、嵌套
+     * 深处 20 GB」既不算 oversized，也不会被问，直接送进回收站。现在目录按
+     * **下界**参与判定：下界已超 → over；下界没超但真实大小未知 → unknown。
+     * 两者都落进 `atRisk`，都要求审批。
      */
-    const oversized = plans.filter(
-      (p) => p.description.isDirectory === false && detectQuotaRisk(p.description.bytes) !== undefined,
-    )
-    if (oversized.length > 0) {
-      const sample = oversized.slice(0, 3).map((p) => p.target)
-      const rest = oversized.length > sample.length ? ` (+${oversized.length - sample.length} more)` : ''
+    const atRisk = plans
+      .map((p) => ({
+        plan: p,
+        quota: assessQuota(p.description.bytes, {
+          ...(p.description.isDirectory === true ? { sizeIsLowerBound: true } : {}),
+        }),
+      }))
+      .filter((entry) => entry.quota.status !== 'within')
+    if (atRisk.length > 0) {
+      const sample = atRisk.slice(0, 3).map((entry) => entry.plan.target)
+      const rest = atRisk.length > sample.length ? ` (+${atRisk.length - sample.length} more)` : ''
+      const reasons = [...new Set(atRisk.map((e) => (e.quota.status === 'within' ? '' : e.quota.reason)))]
       const outcome = await ctx.requestApproval(
-        `This delete will PERMANENTLY remove ${oversized.length} file(s) larger than the recycle bin's limit.\n\n` +
-          `Files: ${sample.join(', ')}${rest}\n\n` +
+        `This delete may PERMANENTLY remove ${atRisk.length} item(s) — the recycle bin's capacity could not rule it out.\n\n` +
+          `Items: ${sample.join(', ')}${rest}\n\n` +
+          `Why: ${reasons.join('; ')}\n\n` +
           `Approve only if you accept that they cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
-        return { ok: false, text: '', error: approvalFailureText(outcome, `${oversized.length} oversized file(s)`) }
+        return { ok: false, text: '', error: approvalFailureText(outcome, `${atRisk.length} item(s) at quota risk`) }
       }
     }
 

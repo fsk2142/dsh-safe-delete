@@ -70,11 +70,17 @@ describe('batch quota check wiring', () => {
     /*
      * 静态断言：造一个真超过 50 GB 的文件代价太大，而这里的缺陷形态就是
      * 「某一侧忘了调用」，静态断言正好覆盖。
+     *
+     * 2026-11-05 第二轮复审 R01/R02：判定入口从 `detectQuotaRisk`（二态）换成
+     * `assessQuota`（risky/within/unknown 三态），因为它要能表达「目录只量了
+     * 顶层、真实大小未知」。这里跟着断言新入口。
      */
     const src = readFileSync('src/tools.ts', 'utf8')
     const manyStart = src.indexOf('async function deleteMany')
     expect(manyStart).toBeGreaterThan(-1)
-    expect(src.slice(manyStart)).toMatch(/detectQuotaRisk/)
+    expect(src.slice(manyStart)).toMatch(/assessQuota/)
+    // 目录的下界必须传下去，否则「顶层 0 字节」又会被判成 within。
+    expect(src.slice(manyStart)).toMatch(/sizeIsLowerBound/)
   })
 })
 

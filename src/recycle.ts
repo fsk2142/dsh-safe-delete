@@ -521,6 +521,14 @@ export function buildRecycleManyScript(): string {
     /*
      * 逐条复核。给消失一点宽限：SHFileOperationW 是同步的，但同卷/跨卷的
      * 收尾可能有毫秒级延迟。
+     *
+     * ## `moved` 只说明「原路径不在了」，不是「回收站里有它」
+     *
+     * 这个区分必须写下来（2026-11-05 第二轮复审第 5.4 条）：插件从未读取
+     * 回收站的 `$I`/`$R` 条目去确认可恢复性。原路径消失只证明**它离开了
+     * 原位置**；是否真的进了回收站、能不能还原，取决于系统策略、配额与
+     * 文件系统（见 README「第 2 层的边界」）。所以输出里说的是
+     * "moved to the recycle bin"，而不是"已确认可恢复"。
      */
     'foreach ($p in $present) {',
     '  if ([System.IO.File]::Exists($p) -or [System.IO.Directory]::Exists($p)) {',
@@ -793,17 +801,36 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
 }
 
 /**
- * 系统是否被配置成「删除即永久删除」。
+ * 「删除会被系统永久执行」的三种状态。
  *
- * ## 为什么必须检测（2026-11-04）
+ * ## 为什么不是一个布尔（2026-11-05 第二轮复审 R02）
  *
- * Windows 的回收站可以被策略关掉：`NoRecycleFiles` 为 1 时，Shell 的删除
- * 动词**直接永久删除并返回成功**。对一个承诺「删除可反悔」的插件，这是最坏的
- * 情形 —— 用户以为进了回收站，其实没有了。
+ * 旧实现只有一个 `risky: boolean`，于是把三种不同的情况压成了两种：
  *
- * 命中时调用方必须**先问人**，用户不同意就放弃这次删除。
+ * | 事实 | 旧值 | 正确语义 |
+ * |---|---|---|
+ * | 读到策略，值为 1 | risky | **risky** |
+ * | 读到策略，值为 0 / 未设置 | safe | **safe** |
+ * | 读注册表抛错 / 值解析不了 | safe | **unknown** ← 错的 |
+ *
+ * `risky: false` 的下游动作是「不问，直接进回收站」。把「无法确认」也报成
+ * false，等于保护性检查**只是停止保护** —— 不抛错、不打日志，正是本插件
+ * 反复被咬的那种静默失效。
  */
-export type PermanentDeleteRisk = { risky: boolean; reason?: string }
+export type RiskStatus = 'risky' | 'safe' | 'unknown'
+
+export type PermanentDeleteRisk = {
+  /** 三态判定。`unknown` 必须按风险处理（ask / never 下拒绝）。 */
+  status: RiskStatus
+  /**
+   * 兼容字段：`status === 'risky'`。
+   *
+   * 保留它是因为调用点很多，且**只有确定 risky 才该当成确定永久删除**；
+   * `unknown` 在 `risky` 上仍是 false，别把它读成「安全」—— 判 `status`。
+   */
+  risky: boolean
+  reason?: string
+}
 
 /** 读取注册表值的替身（测试注入）。 */
 export type RegistryReader = (key: string, name: string) => string | undefined
@@ -829,9 +856,19 @@ function readRegistryViaReg(key: string, name: string): string | undefined {
 /**
  * 检测「删除会被系统永久执行」的策略。
  *
+ * ## 读失败 ≠ 确认安全（2026-11-05 第二轮复审 R02）
+ *
+ * 旧实现 catch 之后返回 `{ risky: false }` 并在注释里写「不能因为一次读注册表
+ * 失败就拦住所有删除」。那条件本身没错，错在**结论**：读失败说明的是「不知道」，
+ * 不是「没有这条策略」。把未知当安全，等于在受限账户 / 策略被拦 / 非标准卷上
+ * 静默关掉这层保护。
+ *
+ * 现在分三态。`unknown` 的处置交给调用方：
+ * 回收站模式下 ask，`never` 下拒绝（见 `decideHookRisk` 与 `deletePath`）。
+ *
  * @param options.platform 平台（测试注入，默认 `process.platform`）。
  * @param options.readRegistry 注册表读取替身。
- * @returns `risky` 为真时调用方必须先问人。
+ * @returns 三态判定。`status === 'risky'` 时调用方必须先问人。
  */
 export function detectPermanentDeleteRisk(
   options: {
@@ -840,28 +877,48 @@ export function detectPermanentDeleteRisk(
   } = {},
 ): PermanentDeleteRisk {
   const platform = options.platform ?? process.platform
-  if (platform !== 'win32') return { risky: false }
+  // 非 Windows 没有回收站策略；那是**确认不适用**，不是未知。
+  if (platform !== 'win32') return { status: 'safe', risky: false }
 
   const read = options.readRegistry ?? readRegistryViaReg
   const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer'
   let raw: string | undefined
   try {
     raw = read(key, 'NoRecycleFiles')
-  } catch {
-    // 读不到就当作没有该策略：不能因为一次读注册表失败就拦住所有删除。
-    return { risky: false }
+  } catch (error) {
+    return {
+      status: 'unknown',
+      risky: false,
+      reason:
+        `could not read the NoRecycleFiles policy (${error instanceof Error ? error.message : String(error)}); ` +
+        'whether Windows will delete permanently is unknown',
+    }
   }
-  if (raw === undefined) return { risky: false }
+  // 读到了、但那一条不存在 —— 这是「确认没有设置」，属于 safe。
+  if (raw === undefined) return { status: 'safe', risky: false }
 
   const value = raw.trim().toLowerCase()
   // 注册表里既可能是 DWORD（0x1 / 1），也可能被手工写成字符串。
   const enabled = value === '1' || value === '0x1' || value === 'true'
-  if (!enabled) return { risky: false }
+  const disabled = value === '0' || value === '0x0' || value === 'false'
+  if (enabled) {
+    return {
+      status: 'risky',
+      risky: true,
+      reason:
+        'the NoRecycleFiles policy is enabled: Windows will permanently delete instead of using the recycle bin',
+    }
+  }
+  if (disabled) return { status: 'safe', risky: false }
 
+  /*
+   * 读到了值，但解析不出含义（`maybe`、被截断的输出、非预期类型）。
+   * 那同样是「不知道」—— 不能因为读到了字符串就当安全。
+   */
   return {
-    risky: true,
-    reason:
-      'the NoRecycleFiles policy is enabled: Windows will permanently delete instead of using the recycle bin',
+    status: 'unknown',
+    risky: false,
+    reason: `the NoRecycleFiles policy has an unrecognised value ("${value.slice(0, 40)}"); whether Windows will delete permanently is unknown`,
   }
 }
 
@@ -950,21 +1007,103 @@ function quotaLimitBytes(
 }
 
 /**
- * 单个文件是否超过该卷回收站容量上限。
+ * 单个文件的配额判定结果（三态）。
  *
- * ## 为什么要查这个（2026-11-04 审查 Important-9）
+ * ## 为什么要三态（2026-11-05 第二轮复审 R01/R02）
  *
- * Windows 在条目**超过回收站上限**时会**永久删除并返回成功**。插件无法阻止，
- * 也无法事后感知 —— 只能事前问。
+ * 旧实现返回 `string | undefined`，`undefined` 同时表示「文件没超」和
+ * 「上限读不到」——两者的安全含义完全相反：
  *
- * 只对**单个文件**判断：目录的递归大小在回收站模式下刻意不统计。
+ *   - 没超 → 可以静默进回收站；
+ *   - 上限读不到 → **不知道**会不会被永久删除。
  *
- * 上限读取有进程内缓存（见 `quotaLimitCache`），所以对 N 个文件判断只读一次
- * 注册表。
+ * 同一份语义压缩让上层无法正确措辞，也无法正确决策。现在分开。
+ */
+export type QuotaAssessment =
+  | { status: 'over'; reason: string }
+  | { status: 'within' }
+  | { status: 'unknown'; reason: string }
+
+/**
+ * 评估一个目标相对回收站上限的风险。
  *
- * @param sizeBytes 目标大小（调用方已 statSync）。
+ * ## `sizeIsLowerBound`（R01）
+ *
+ * 回收站模式跳过目录的递归统计，只量顶层（`shallowBytes`）。那是一个**下界**：
+ * 嵌套深处的 20 GB 文件不会体现在里面。所以：
+ *
+ * - 下界已经超过上限 → 确定 over（实际只会更大）；
+ * - 下界没超、但真实大小未知 → **unknown**，按风险处理；
+ * - 只有能确认完整大小（单文件、或安全区模式的递归统计）才给 within。
+ *
+ * 这条把「目录只量顶层」从**静默漏检**变成**显式不确定**：前者不会有人发现，
+ * 后者会走审批。
+ *
+ * @param sizeBytes 已知大小（字节）。
+ * @param options.sizeIsLowerBound 该大小只是下界（目录内容未完整统计）。
+ * @param options.platform 平台（测试注入）。
+ * @param options.readCapacityMb 卷容量读取替身。
+ * @param options.listVolumeKeys 列卷替身。
+ * @returns 三态判定。
+ */
+export function assessQuota(
+  sizeBytes: number,
+  options: {
+    platform?: NodeJS.Platform
+    readCapacityMb?: (volumeKey: string) => number | undefined
+    listVolumeKeys?: () => string[]
+    sizeIsLowerBound?: boolean
+  } = {},
+): QuotaAssessment {
+  const platform = options.platform ?? process.platform
+  // 非 Windows 没有回收站配额；那是确认不适用。
+  if (platform !== 'win32') return { status: 'within' }
+  if (sizeBytes < 0) return { status: 'within' }
+
+  const readCapacity = options.readCapacityMb ?? readCapacityViaReg
+  const listKeys = options.listVolumeKeys ?? listBitBucketVolumeKeys
+  // Function identity matters: equal source text can capture different capacities.
+  const limitBytes = quotaLimitBytes(readCapacity, listKeys)
+
+  if (limitBytes === null) {
+    return {
+      status: 'unknown',
+      reason:
+        'the recycle bin capacity limit could not be read from the registry, so whether this item ' +
+        'exceeds it cannot be verified',
+    }
+  }
+
+  if (sizeBytes > limitBytes) {
+    return {
+      status: 'over',
+      reason:
+        `the file is larger than the recycle bin's per-volume limit ` +
+        `(${Math.round(limitBytes / (1024 * 1024))} MB): Windows will delete it permanently instead of recycling it`,
+    }
+  }
+
+  if (options.sizeIsLowerBound === true) {
+    return {
+      status: 'unknown',
+      reason:
+        `only ${Math.round(sizeBytes / (1024 * 1024))} MB could be measured at the top level (recursive stats are ` +
+        `skipped in recycle-bin mode), while the limit is ${Math.round(limitBytes / (1024 * 1024))} MB: ` +
+        'a file nested deeper may exceed it and be deleted permanently',
+    }
+  }
+
+  return { status: 'within' }
+}
+
+/**
+ * 兼容包装：超过上限**或无法判定**时返回一句说明，确定没超时返回 `undefined`。
+ *
+ * 调用方若需要区分「超了」与「不知道」（措辞、审计），用 `assessQuota`。
+ *
+ * @param sizeBytes 目标大小。
  * @param options 注入点（测试用）。
- * @returns 超限时的说明；未超限或无法判定时返回 `undefined`。
+ * @returns 风险说明；确定没风险时 `undefined`。
  */
 export function detectQuotaRisk(
   sizeBytes: number,
@@ -972,23 +1111,11 @@ export function detectQuotaRisk(
     platform?: NodeJS.Platform
     readCapacityMb?: (volumeKey: string) => number | undefined
     listVolumeKeys?: () => string[]
+    sizeIsLowerBound?: boolean
   } = {},
 ): string | undefined {
-  const platform = options.platform ?? process.platform
-  if (platform !== 'win32') return undefined
-  if (sizeBytes <= 0) return undefined
-
-  const readCapacity = options.readCapacityMb ?? readCapacityViaReg
-  const listKeys = options.listVolumeKeys ?? listBitBucketVolumeKeys
-  // Function identity matters: equal source text can capture different capacities.
-  const limitBytes = quotaLimitBytes(readCapacity, listKeys)
-  if (limitBytes === null) return undefined
-  if (sizeBytes <= limitBytes) return undefined
-
-  return (
-    `the file is larger than the recycle bin's per-volume limit ` +
-    `(${Math.round(limitBytes / (1024 * 1024))} MB): Windows will delete it permanently instead of recycling it`
-  )
+  const assessment = assessQuota(sizeBytes, options)
+  return assessment.status === 'within' ? undefined : assessment.reason
 }
 
 /** 列出 BitBucket 下的卷键（形如 `{GUID}` 或卷名）。 */

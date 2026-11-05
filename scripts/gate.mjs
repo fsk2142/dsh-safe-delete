@@ -12,7 +12,8 @@
  *
  * 这个脚本把全部检查串起来，任何一项红就非零退出。
  */
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 
 const checks = [
   { name: 'typecheck', cmd: 'pnpm', args: ['typecheck'] },
@@ -28,6 +29,37 @@ const checks = [
   { name: '误伤探针', cmd: 'npx', args: ['tsx', 'scripts/false-positive-probe.ts'] },
   { name: '客户端渲染', cmd: 'node', args: ['scripts/verify-client-render.mjs'] },
 ]
+
+/*
+ * ## 结果必须与提交 SHA 一起留下（2026-11-05 第二轮复审 R06）
+ *
+ * 提交说明里写「gate 12/12 通过」是一句**无法核实**的断言：读的人不知道
+ * 它对应哪个 SHA、哪台机器、什么时候。复审报告因此只能把它当作"待验证"。
+ *
+ * 这里把 SHA、时间、平台与逐项结果写进 `gate-report.json`：
+ *
+ * - 它由**脚本自己**生成，不是人写的总结；
+ * - 它可以被 CI 归档、被下一个审阅者直接读；
+ * - 它明确记录 `dirty`（工作区是否有未提交改动）—— 一次跑在脏工作区上的
+ *   gate 不能代表那个 SHA。
+ *
+ * 文件不提交（见 .gitignore），因为它是**每次运行的产物**，不是源码。
+ */
+const reportPath = 'gate-report.json'
+
+/**
+ * 取一个 git 值，失败时返回空串（gate 不能因为 git 不可用而崩）。
+ *
+ * @param {string[]} args git 参数。
+ * @returns {string} 输出（已 trim）。
+ */
+function gitValue(args) {
+  try {
+    return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  } catch {
+    return ''
+  }
+}
 
 const results = []
 for (const check of checks) {
@@ -49,6 +81,29 @@ for (const check of checks) {
 const failed = results.filter((r) => !r.ok)
 process.stdout.write('\n==================== gate 汇总 ====================\n')
 for (const r of results) process.stdout.write(`  ${r.ok ? '✓' : '✗'} ${r.name}\n`)
+
+/*
+ * 把结果写进 gate-report.json，与 SHA / 时间 / 平台 / 脏标记绑定。
+ * 写失败不影响退出码 —— gate 的职责是判定，不是归档。
+ */
+const report = {
+  sha: gitValue(['rev-parse', 'HEAD']),
+  branch: gitValue(['rev-parse', '--abbrev-ref', 'HEAD']),
+  dirty: gitValue(['status', '--porcelain']) !== '',
+  at: new Date().toISOString(),
+  platform: process.platform,
+  node: process.version,
+  checks: results.map((r) => ({ name: r.name, ok: r.ok })),
+  ok: failed.length === 0,
+}
+try {
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+  process.stdout.write(
+    `\n结果已写入 ${reportPath}（sha=${report.sha.slice(0, 12) || 'unknown'}${report.dirty ? ', 工作区有未提交改动' : ''}）\n`,
+  )
+} catch {
+  process.stdout.write(`\n（${reportPath} 写入失败，不影响判定）\n`)
+}
 
 if (failed.length > 0) {
   process.stdout.write(`\n${failed.length} 项失败：${failed.map((f) => f.name).join('、')}\n`)

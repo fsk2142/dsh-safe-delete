@@ -54,7 +54,7 @@ describe('detectQuotaRisk 的调用成本', () => {
     expect(detectQuotaRisk(101 * MB, options), '略超应命中').toBeDefined()
   })
 
-  it('读不到上限时不报风险，且不反复重试', () => {
+  it('读不到上限时报 unknown，且不反复重试', () => {
     let listCalls = 0
     const options = {
       platform: 'win32' as const,
@@ -66,7 +66,11 @@ describe('detectQuotaRisk 的调用成本', () => {
     }
 
     for (let i = 0; i < 10; i += 1) {
-      expect(detectQuotaRisk(999 * MB, options)).toBeUndefined()
+      /*
+       * 2026-11-05 第二轮复审 R02：读不到上限不再是"无风险"（undefined），
+       * 而是 unknown —— 返回一句说明，让上层按风险处理。
+       */
+      expect(detectQuotaRisk(999 * MB, options)).toBeDefined()
     }
     expect(listCalls, '读不到也只该试一次').toBe(1)
   })

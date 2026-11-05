@@ -92,17 +92,32 @@ type Recycler = (absPath: string) => RecycleOutcome;
  */
 declare function moveToSystemRecycleBin(absPath: string): RecycleOutcome;
 /**
- * 系统是否被配置成「删除即永久删除」。
+ * 「删除会被系统永久执行」的三种状态。
  *
- * ## 为什么必须检测（2026-11-04）
+ * ## 为什么不是一个布尔（2026-11-05 第二轮复审 R02）
  *
- * Windows 的回收站可以被策略关掉：`NoRecycleFiles` 为 1 时，Shell 的删除
- * 动词**直接永久删除并返回成功**。对一个承诺「删除可反悔」的插件，这是最坏的
- * 情形 —— 用户以为进了回收站，其实没有了。
+ * 旧实现只有一个 `risky: boolean`，于是把三种不同的情况压成了两种：
  *
- * 命中时调用方必须**先问人**，用户不同意就放弃这次删除。
+ * | 事实 | 旧值 | 正确语义 |
+ * |---|---|---|
+ * | 读到策略，值为 1 | risky | **risky** |
+ * | 读到策略，值为 0 / 未设置 | safe | **safe** |
+ * | 读注册表抛错 / 值解析不了 | safe | **unknown** ← 错的 |
+ *
+ * `risky: false` 的下游动作是「不问，直接进回收站」。把「无法确认」也报成
+ * false，等于保护性检查**只是停止保护** —— 不抛错、不打日志，正是本插件
+ * 反复被咬的那种静默失效。
  */
+type RiskStatus = 'risky' | 'safe' | 'unknown';
 type PermanentDeleteRisk = {
+  /** 三态判定。`unknown` 必须按风险处理（ask / never 下拒绝）。 */
+  status: RiskStatus;
+  /**
+   * 兼容字段：`status === 'risky'`。
+   *
+   * 保留它是因为调用点很多，且**只有确定 risky 才该当成确定永久删除**；
+   * `unknown` 在 `risky` 上仍是 false，别把它读成「安全」—— 判 `status`。
+   */
   risky: boolean;
   reason?: string;
 };

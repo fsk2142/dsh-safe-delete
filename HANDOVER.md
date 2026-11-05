@@ -29,26 +29,35 @@ pre-execute 钩子判定 → 危险路径或超阈值 → 弹审批卡
 
 ## 2. 当前状态速查
 
+> **本节是快照**，日期见文件头。HEAD / 远端 / 测试数字都会随提交变化 ——
+> 以 `git log -1` 与 `gate-report.json` 为准，不要引用旧快照里的数字。
+
 | 项 | 值 |
 |---|---|
-| 版本 | 2.2.0（工作区含 2026-11-05 复审整改，未发版） |
-| HEAD | `077d27f` + 本轮未提交改动 |
-| 远端 | 已同步到 `077d27f` |
-| tag | `v2.2.0`（annotated `6af8433`，指向提交 `eb2e53c`；**之后 6 个提交没有新 tag**） |
+| 版本 | 2.2.0（工作区含 2026-11-05 两轮复审整改，**未发版**） |
+| tag | `v2.2.0`（annotated `6af8433`，指向提交 `eb2e53c`；之后一直没有新 tag） |
 | Release | [v2.2.0](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.2.0) |
-| 提交总数 | 202 |
-| 源码规模 | 12,223 行 / 21 个 `.ts` |
-| 测试 | **1,163 个 / 153 个文件，全绿** |
+| 源码规模 | 21 个 `.ts`（约 1.2 万行） |
+| 测试 | 160 个文件，全绿（数字会变，跑 `pnpm gate` 看当次结果） |
 | 运行时依赖 | **零** |
-| 本地安装 | `C:\Users\<user>\.dsh\profiles\desktop\node_modules\dsh-safe-delete`（30 个文件） |
+| 本地安装 | `C:\Users\<user>\.dsh\profiles\desktop\node_modules\dsh-safe-delete` |
+
+> **为什么不再写 HEAD 与"远端已同步"**：那两栏每次提交都会过期，而交接文档的
+> 读者会拿它当事实（第二轮复审 R05 正是这么指出来的）。想知道现在在哪，
+> 跑 `git log -1 --oneline`；想知道测试结果，看 `gate-report.json` 里的 `sha`。
 
 ### 一键验证
 
 ```bash
-pnpm gate     # 12 项，任一红即非零退出
+pnpm gate          # 12 项，任一红即非零退出
+node scripts/privacy-history-audit.mjs   # 历史隐私（不在 gate 里，见下）
 ```
 
-`gate` 包含：typecheck · 测试 · 构建 · 隐私审计 · 文档一致 · 死代码 · 拦截链(25 例) · 设置契约 · **变异检查** · 对抗探针 · 误伤探针 · 客户端渲染
+`gate` 包含：typecheck · 测试 · 构建 · 隐私审计 · 文档一致 · 死代码 · 拦截链 · 设置契约 · **变异检查** · 对抗探针 · 误伤探针 · 客户端渲染
+
+跑完会生成 `gate-report.json`（**不入库**）：`sha` / `branch` / `dirty` / `at` / `platform` / 逐项 `ok`。提交说明里写「gate 全绿」时，这份文件是唯一可核实的证据。
+
+**历史隐私扫描为什么不在 gate 里**：它扫 204 个提交的全部 diff（约 4 MB / 0.4 秒），每次改代码都跑没意义；而且它的命中不会因为"改一下就没了"——那是发布前的检查。当前 4 处已知命中见 §7。
 
 > **为什么强调 gate**：2026-11-04 之前有三个验证脚本不在任何 gate 里，重构后静默失效，而提交信息仍写着「full gate clean」。变异检查尤其危险——锚点漂移会让它**静默 SKIP**，报告出「5 抓 0 漏」这种看起来完美的结果。现在全部串进 `pnpm gate`。
 
@@ -168,9 +177,11 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 
 | 边界 | 后果 |
 |---|---|
-| **配额预检是尽力而为** | 读注册表上限，判单文件与目录顶层。但目录**只量顶层不递归**，嵌套深处的超大文件不触发预警 |
-| 读不到注册表 → 判「无风险」 | 不能因为一次读失败就拦住所有删除，但受限环境下这层保护不生效 |
+| **配额判定分三态** | 超限 → 弹窗；**完整**大小确认未超 → 静默；**无法确认** → 按风险处理（弹窗，`never` 下拒绝） |
+| 目录只量顶层 | 目录大小只是一个**下界**。下界已超 → 确定超限；下界没超 → **unknown**，仍然弹窗（2026-11-05 第二轮 R01 修的就是这一条：此前会静默放行） |
+| 读不到注册表 → **unknown** | 不再判「无风险」。受限账户 / 策略拦截 / 非标准卷上，这层保护会**问人**而不是静默失效（第二轮 R02） |
 | 超配额条目 | Windows 会**永久删除并返回成功**，插件无法阻止也无法事后感知 |
+| 「移进回收站」的语义 | 只是**原路径消失**的观测。插件不读回收站的 `$I`/`$R`，不做「可还原」验证 |
 | 目录名匹配 | `match: "build"` 对名为 `build` 的目录返回 **0 结果**——目录会被递归进入，但目录本身从不加入匹配集。要删整个目录用 `paths: [...]` |
 
 **要保证可恢复，请用安全区模式。**
@@ -186,7 +197,7 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 
 ---
 
-## 7. 2026-11-05 复审（固定 SHA `077d27f`）与整改
+## 7. 2026-11-05 首轮复审（固定 SHA `077d27f`）与整改
 
 外部复审报告给出 12 条（A01–A12）。**A01–A04 已在源码中确认并修复**，A05–A10 一并处理；A11（历史隐私扫描范围）与 A12（设计约束）作为已知边界记入本文档，不改代码。
 
@@ -218,7 +229,41 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 
 ---
 
-## 7. 2026-11-04/05 自检修复（上一轮）
+## 7b. 2026-11-05 第二轮复审（固定 SHA `d08d951`）与整改
+
+上一轮整改后又有一次复审，确认 A01–A10 已进入生产代码，另提 6 条（R01–R06）。本轮修了 R01–R03、R05；R04 部分处理（工具已补，历史内容不重写）；R06 用工具解决（gate 自报 SHA）。
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| **R01** | 目录配额只量顶层，嵌套深处的 20 GB 文件不触发预警，且判成「无风险」静默进回收站 | `assessQuota` 加 `sizeIsLowerBound`：下界已超 → over；下界没超 → **unknown**，走审批。钩子、`deletePath`、`deleteMany` 三条路径全部接线 |
+| **R02** | 注册表读失败 / 值解析不了时返回 `risky: false`（= 确认安全） | `PermanentDeleteRisk` 改为三态 `risky/safe/unknown`；`unknown` 按风险处理。**三个决策点全部接线**：`decideHookRisk`、`deletePath`、`deleteMany` —— 只改函数不改调用点是这一条最容易漏的半边。配额上限同理（`assessQuota` 三态） |
+| **R03** | 审计尾部读取**每块单独解码**，多字节字符跨块时被替换成 U+FFFD，路径静默损坏 | 改为累积 `Buffer` 后**只解码一次**；换行在字节层数。测试精确构造「块边界落在续字节上」，修复前实测 2 条记录被破坏 |
+| **R04** | `privacy-audit.mjs` 不覆盖 Git 历史与二进制 | 新增 `scripts/privacy-history-audit.mjs`（`git log --all` 的 diff + 提交信息），**明确打印不覆盖的范围**；跳过规则载体/测试夹具并**报出跳过行数**。历史内容本身不重写 —— 见下方「历史命中」 |
+| **R05** | HANDOVER 的 HEAD / 远端状态过期 | §2 改成快照 + 明确「以 `git log -1` 与 `gate-report.json` 为准」，不再写会过期的两栏 |
+| **R06** | gate 结果只存在于提交说明里，没有与 SHA 绑定 | `gate.mjs` 生成 `gate-report.json`：`sha` / `branch` / `dirty` / `at` / `platform` / 逐项结果 |
+
+**新增回归测试**（都能在修复前的代码上变红）：
+
+| 文件 | 覆盖 |
+|---|---|
+| `tests/r01-lower-bound-quota.test.ts` | 下界未超 → unknown；下界已超 → over；目录接线 |
+| `tests/r02-unknown-risk.test.ts` | 注册表抛错 / 值解析不了 → unknown；配额读不到 → unknown |
+| `tests/r03-utf8-boundary.test.ts` | 多字节字符跨 16 KB 块边界（精确构造续字节落在边界上） |
+
+**历史隐私命中（4 处，已在远端历史里，不重写）**：
+
+| 提交 | 位置 | 内容性质 |
+|---|---|---|
+| `2bc5f62` | `HANDOVER.md:44` | 本机用户名路径（当前版本已脱敏为 `<user>`） |
+| `2af67b79` | `docs/INCIDENT-2026-10-30.md:57` | 同上的 PowerShell 举例（当前版本已改写） |
+| `f7b445b5` | `src/client/index.tsx:879` | 注释里引用了用户一句界面反馈（当前版本已去掉） |
+| `98fe8443` | `scripts/release.mjs:10` | 注释里提到过一次用户现场的反馈语（当前版本已去掉） |
+
+这四处都是**路径 / 措辞**，不是凭据。按 `privacy-history-audit.mjs` 的建议：先判断是否仍是有效凭据（都不是），再决定是否值得改写历史。**改写历史会改变所有下游 SHA**，对一个已公开、已打 tag 的仓库，代价高于收益 —— 所以这里是知情接受，不是遗忘。
+
+---
+
+## 7c. 2026-11-04/05 自检修复
 
 8 个发现，**5 个是修改过程中自己引入的**。
 
@@ -252,13 +297,16 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 ### 8.1 自动化
 
 ```bash
-pnpm gate          # 12 项
-pnpm test          # 1,112 个测试
+pnpm gate                                 # 12 项
+pnpm test                                 # 全部单元测试
+node scripts/privacy-history-audit.mjs    # 历史隐私（发布前跑，不在 gate 里）
 ```
 
 **变异检查**（`scripts/mutation-check-core.mjs`）会故意破坏保护代码，确认测试变红。当前 **7 抓 0 漏，零 SKIP**。
 
 > 如果它报 SKIP，说明锚点漂移了 —— 那比失败更糟，因为看起来像通过。
+
+**`gate-report.json`** 由 `gate.mjs` 写出（不入库）：`sha` / `branch` / `dirty` / `at` / `platform` / 逐项结果。提交说明里写「gate 全绿」时，这是唯一可核实的证据；`dirty: true` 的报告不代表那个 SHA。
 
 ### 8.2 真实回收站往返（需要手动跑）
 
@@ -277,6 +325,11 @@ pnpm test          # 1,112 个测试
 1. 重启 DSH → 设置页两个按钮能点、能保存、刷新后状态保持
 2. 选「直接进回收站」→ 删一个测试文件 → 去 Windows 回收站确认存在、原位置正确
 3. 点回「放入安全区」→ 删文件 → `safe_zone_list` 能看到 → `safe_zone_restore` 能取回
+
+另外两件只有真机能确认的事：
+
+- **`SHFileOperationW` 的部分成功行为**：`moved` 是靠「原路径是否还在」推断的，插入真实的权限拒绝 / 锁定文件才会走到那条分支（需要在可丢弃的测试卷上做）。
+- **注册表受限时的三态**：`unknown` 分支在正常账户上永远不会触发；用受限账户或组策略拦 `reg` 才能验证它确实变成了「问人」而不是「放行」。
 
 ---
 
@@ -325,16 +378,19 @@ git push origin main && git push origin vX.Y.Z
 
 三条已有的不变量，改动时别破坏：
 
-1. **未知 = 问**（`never` 下 = 拒绝）。解析器抛错、目标不可解析、`never + 回收站 + pattern` 都走这条。
+1. **未知 = 问**（`never` 下 = 拒绝）。解析器抛错、目标不可解析、`never + 回收站 + pattern`、**风险判定为 unknown**（注册表读不到、目录只量了顶层）都走这条。
 2. **「已证明只读」只装真正能证明的项**。执行项目自定义脚本的入口（`run` / `build` / `test` / `lint` / `typecheck` / `start`）不在里面。
 3. **去向按条报告**。任何「整批一个布尔」的汇总都会在部分成功时骗人；`succeededPaths` / `failedPaths` / unknown 三类必须分开。
 
+第 1 条的推论：**任何 `X ? 'risky' : 'safe'` 形式的二态压缩都值得怀疑**。R02 的根因就是把「读到了且没设置」「读不到」都写成了 `risky: false`；R01 的根因是把「没超」「不知道」都写成了 `undefined`。加判定时先问：这个函数的返回类型能不能表达"我不知道"？
+
 ### 当前遗留
 
-- `v2.2.0` tag 指向 `eb2e53c`，之后 6 个提交（含 5 个 bug 修复）**没有 tag**；本轮 2026-11-05 整改也未提交。建议补 `v2.3.0`
+- `v2.2.0` tag 指向 `eb2e53c`，之后一直没有新 tag（两轮复审整改都在里面）。按你的要求本轮**不打 tag、不发 release**，版本号仍是 2.2.0 —— 发版时建议 `2.3.0`（行为有 breaking change：`pnpm build` / `npm test` 现在要审批，`never + 回收站 + pattern` 现在直接拒绝）
 - `match: "build"` 匹配目录名返回 0 结果——语义有歧义（删目录本身还是删里面？），未改
-- 目录配额只量顶层，嵌套深处的超大文件不预警（已写进 README）
-- `privacy-audit.mjs` 只扫工作区 + 暂存区，**不覆盖 Git 历史与二进制产物**（复审 A11）。发版前应另跑一次历史扫描（`gitleaks` / `trufflehog`），并如实写明扫描范围
+- 目录配额只量顶层（已改成 unknown + 问人，但**没有**真正测出嵌套大小；要精确就得 O(文件数) 扫描，与本模式的取舍冲突）
+- `privacy-audit.mjs` 只扫工作区 + 暂存区；历史扫描现在是独立脚本 `privacy-history-audit.mjs`，**范围有限**（不覆盖 reflog / 不可达对象 / 二进制 / Release 附件）。发布前仍应跑 `gitleaks` / `trufflehog`
+- 历史里 4 处命中是**知情接受**，不是遗忘（见 §7b 表格）
 - 目录全树统计仍在宿主进程同步执行（复审 A12 第 4 点），大目录有可见延迟；要动之前先测，不要凭感觉搬进 Worker
 
 ---
