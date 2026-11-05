@@ -1,7 +1,11 @@
 # dsh-safe-delete 交接文档
 
 > 最后更新：2026-11-05
-> 版本：**2.2.0** · HEAD：`077d27f` · 工作区干净
+> 版本：**2.2.0**（未发版；工作区含 2026-11-05 三轮复审整改）
+>
+> **本文件刻意不写 HEAD 与"工作区干净"**：那两栏每次提交都会过期，而读者会拿它当事实
+> （第二轮复审 R05、第三轮复审 R06 都指出过这一点）。想知道现在在哪，跑
+> `git log -1 --oneline`；想知道测试结果，看 `gate-report.json` 里的 `sha`。
 
 ---
 
@@ -38,7 +42,7 @@ pre-execute 钩子判定 → 危险路径或超阈值 → 弹审批卡
 | tag | `v2.2.0`（annotated `6af8433`，指向提交 `eb2e53c`；之后一直没有新 tag） |
 | Release | [v2.2.0](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.2.0) |
 | 源码规模 | 21 个 `.ts`（约 1.2 万行） |
-| 测试 | 160 个文件，全绿（数字会变，跑 `pnpm gate` 看当次结果） |
+| 测试 | `tests/` 下的 `*.test.ts`，全绿（**数量会变**：跑 `pnpm gate` 或 `pnpm test` 看当次结果，不要引用本表的数字） |
 | 运行时依赖 | **零** |
 | 本地安装 | `C:\Users\<user>\.dsh\profiles\desktop\node_modules\dsh-safe-delete` |
 
@@ -57,7 +61,7 @@ node scripts/privacy-history-audit.mjs   # 历史隐私（不在 gate 里，见�
 
 跑完会生成 `gate-report.json`（**不入库**）：`sha` / `branch` / `dirty` / `at` / `platform` / 逐项 `ok`。提交说明里写「gate 全绿」时，这份文件是唯一可核实的证据。
 
-**历史隐私扫描为什么不在 gate 里**：它扫 204 个提交的全部 diff（约 4 MB / 0.4 秒），每次改代码都跑没意义；而且它的命中不会因为"改一下就没了"——那是发布前的检查。当前 4 处已知命中见 §7。
+**历史隐私扫描为什么不在 gate 里**：它扫**全部可达提交**的 diff（数字随提交数增长，实测约 0.5 秒），每次改代码都跑没意义；而且它的命中不会因为"改一下就没了"——那是发布前的检查。4 处已知命中已进 `scripts/privacy-history-baseline.json`（精确到 `SHA + 文件 + 规则`），脚本因此**只在出现新增命中时**返回 1 —— 一个永远红的门禁等于没有门禁。见 §7b。
 
 > **为什么强调 gate**：2026-11-04 之前有三个验证脚本不在任何 gate 里，重构后静默失效，而提交信息仍写着「full gate clean」。变异检查尤其危险——锚点漂移会让它**静默 SKIP**，报告出「5 抓 0 漏」这种看起来完美的结果。现在全部串进 `pnpm gate`。
 
@@ -261,6 +265,32 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 
 这四处都是**路径 / 措辞**，不是凭据。按 `privacy-history-audit.mjs` 的建议：先判断是否仍是有效凭据（都不是），再决定是否值得改写历史。**改写历史会改变所有下游 SHA**，对一个已公开、已打 tag 的仓库，代价高于收益 —— 所以这里是知情接受，不是遗忘。
 
+这四处现在写进 `scripts/privacy-history-baseline.json`（精确到 `SHA + 文件 + 规则`），历史扫描因此稳在退出码 0；任何**新增**命中仍然失败。凭据类命中永远不能进基线 —— 基线里出现凭据条目时脚本直接退出 2。
+
+---
+
+## 7d. 2026-11-05 第三轮复审（固定 SHA `ddbbb21`）与整改
+
+第三轮复审确认上一轮的 A/R 整改已进生产代码，另提 7 条（R01–R07）。**R01 与 R02 是安全问题**（P1），都落在"不可恢复删除"这条链上；其余是扫描器可靠性与文档准确性。
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| **R01** | 三态风险函数本身正确，但**生产默认适配器** `readRegistryViaReg` 自己 `catch { return undefined }`，异常到不了外层的三态判定 —— 访问被拒绝 / `reg.exe` 起不来 / 输出解析不了，全都变成 `safe`（= 不问、直接进回收站） | 读取结果改为**判别式类型** `{kind:'value'\|'missing'\|'error'}`，`undefined` 不再被接受。默认适配器 `createRegReader()` 用**同语言控制探针**区分"找不到"与"读不了"：正值探针 `reg query HKCU\Software` 必须成功，负值探针取本机"找不到"消息，目标查询与之**逐字相同**才判 `missing`。不比对任何绝对文本，因此换系统语言不会静默退化。值行按"值名整列相等"匹配（旧 `includes` 会把 `NoRecycleFilesBackup` 当主值） |
+| **R02** | 多卷配额：某个卷读失败时**跳过**该卷，取成功卷的最小值当成全局上界，并缓存这个不完整结果。D 盘 500 MB 读失败、C 盘 10 GB 成功 → 缓存 10 GB → D 盘的 1 GB 文件被判"没超"→ 永久删除 | `quotaLimitBytes` 改为返回 `QuotaLimit = known \| unknown`；**任意卷**读失败 / 值缺失 / 0 / 负数 / NaN / Infinity → 整体 `unknown`。缓存的是三态结论而不是数字：`unknown` 可以记住（不可能变成错误的安全结论），不完整的最小值不能 |
+| **R03** | 历史扫描按**文件路径**跳过 `tests/` 与 `*.test.ts` 的**全部规则**，包括凭据 —— "真 token 误写进测试文件、后来删掉"这种**只有历史扫描能发现**的泄露永远报不出来 | 豁免改成**按规则**：`fixtureSkippable` 只给上下文规则（本机路径、对话痕迹、会话标识）。凭据 / Token 与邮箱在规则载体与测试文件里**照扫** |
+| **R04** | 文件头文档写着 `--staged`，但脚本根本不读 `process.argv` | 删除那条说明，并让**未知参数直接退出 2** —— 一个被静默忽略的安全审计参数比没有更危险 |
+| **R05** | 4 处已确认的历史命中没有基线，脚本永远返回 1 | 新增 `scripts/privacy-history-baseline.json`，精确到 `SHA + 文件 + 规则`。基线内命中单独打印为「已接受」，只有**新增**命中让门禁变红。基线读不懂 → 退出 2（不能当成空基线）。**凭据条目出现即退出 2**，永不放行 |
+| **R06** | HANDOVER 头部仍写 `HEAD: 077d27f · 工作区干净`，正文还写死测试文件数 | 头部删除 HEAD 与"工作区干净"字段；测试数与提交数不再硬编码，改为"跑 `pnpm gate` / `git log -1` 看当次结果" |
+| **R07** | `gate-report.json` 被 `.gitignore` 忽略，远端历史上没有这份报告，CI artifact 未确认 | 见 §8.1 —— 报告由脚本自报 SHA / dirty，但**当前没有 CI**，所以它以本地文件形式存在，不以提交形式存在。这是已知限制，不是"已验证" |
+
+**新增回归测试**（都能在修复前的代码上变红）：
+
+| 文件 | 覆盖 |
+|---|---|
+| `tests/review3-r01-registry-adapter.test.ts` | T01 访问拒绝 → unknown；T02 确认不存在 → safe；T03 `reg.exe` 起不来 → unknown；T04 输出解析不了 / 值名相近 → unknown；外加真实 `reg.exe` 契约（4 条） |
+| `tests/review3-r02-quota-partial.test.ts` | T05 双卷一成功一失败 → unknown（含抛错、0、负数、NaN、Infinity）；T06 不完整结果不转化为数字缓存；未知结论仍只读一次 |
+| `tests/review3-r03-history-scan.test.ts` | T07 测试文件里曾提交后删除的 token 仍报；T08 `--staged` 被拒绝（退出码 2）；T09 基线精确覆盖 / 新增仍红 / 凭据不可基线 / 坏基线退出 2 |
+
 ---
 
 ## 7c. 2026-11-04/05 自检修复
@@ -299,14 +329,18 @@ const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 ```bash
 pnpm gate                                 # 12 项
 pnpm test                                 # 全部单元测试
-node scripts/privacy-history-audit.mjs    # 历史隐私（发布前跑，不在 gate 里）
+node scripts/privacy-history-audit.mjs    # 历史隐私（发布前跑，不在 gate 里；无参数）
 ```
+
+历史扫描接受**已审核基线** `scripts/privacy-history-baseline.json`（精确到 `SHA + 文件 + 规则`）：基线内的命中单独打印为「已接受」并返回 0，**新增**命中返回 1，环境/基线不可用或基线里出现凭据条目返回 2。
 
 **变异检查**（`scripts/mutation-check-core.mjs`）会故意破坏保护代码，确认测试变红。当前 **7 抓 0 漏，零 SKIP**。
 
 > 如果它报 SKIP，说明锚点漂移了 —— 那比失败更糟，因为看起来像通过。
 
 **`gate-report.json`** 由 `gate.mjs` 写出（不入库）：`sha` / `branch` / `dirty` / `at` / `platform` / 逐项结果。提交说明里写「gate 全绿」时，这是唯一可核实的证据；`dirty: true` 的报告不代表那个 SHA。
+
+> **已知限制（第三轮复审 R07）**：本仓库**没有 CI**（没有 `.github/`），所以这份报告只以**本地文件**形式存在，远端历史里没有对应 artifact。审阅者拿到的是一个提交 SHA 加一句"gate 全绿"，仍然无法独立核验。真要闭环，需要加一条 CI 作业把 `gate-report.json` 按 SHA 上传为 artifact；在那之前，这条只能算"已实现生成"，不能算"已验证"。
 
 ### 8.2 真实回收站往返（需要手动跑）
 
@@ -384,13 +418,17 @@ git push origin main && git push origin vX.Y.Z
 
 第 1 条的推论：**任何 `X ? 'risky' : 'safe'` 形式的二态压缩都值得怀疑**。R02 的根因就是把「读到了且没设置」「读不到」都写成了 `risky: false`；R01 的根因是把「没超」「不知道」都写成了 `undefined`。加判定时先问：这个函数的返回类型能不能表达"我不知道"？
 
+第 1 条的第二个推论（第三轮复审 R01 的教学案例）：**三态函数本身正确，不等于调用链上是三态的**。`detectPermanentDeleteRisk` 上一轮就改成了三态，但它的默认适配器仍然 `catch { return undefined }` —— 异常在到达判定之前就消失了。函数签名改了要看**每一个返回 undefined 的地方**：那里是不是把两种状态压成了一个值？
+
 ### 当前遗留
 
 - `v2.2.0` tag 指向 `eb2e53c`，之后一直没有新 tag（两轮复审整改都在里面）。按你的要求本轮**不打 tag、不发 release**，版本号仍是 2.2.0 —— 发版时建议 `2.3.0`（行为有 breaking change：`pnpm build` / `npm test` 现在要审批，`never + 回收站 + pattern` 现在直接拒绝）
 - `match: "build"` 匹配目录名返回 0 结果——语义有歧义（删目录本身还是删里面？），未改
 - 目录配额只量顶层（已改成 unknown + 问人，但**没有**真正测出嵌套大小；要精确就得 O(文件数) 扫描，与本模式的取舍冲突）
 - `privacy-audit.mjs` 只扫工作区 + 暂存区；历史扫描现在是独立脚本 `privacy-history-audit.mjs`，**范围有限**（不覆盖 reflog / 不可达对象 / 二进制 / Release 附件）。发布前仍应跑 `gitleaks` / `trufflehog`
-- 历史里 4 处命中是**知情接受**，不是遗忘（见 §7b 表格）
+- 历史里 4 处命中是**知情接受**，不是遗忘（见 §7b 表格），已写进 `scripts/privacy-history-baseline.json`
+- **没有 CI**（没有 `.github/`），所以 `gate-report.json` 只是本地文件，远端没有对应 artifact（第三轮复审 R07）
+- `reg` 的"找不到 vs 读不到"依赖**同语言控制探针**：同一台机器上两种消息必须不同。如果某个系统把这两种失败都输出成同一条消息，适配器会把"读不到"判成"不存在" —— 那时正值探针仍能挡住"整台机器 reg 全挂"的情况，但挡不住"只有目标键被拒绝且消息与找不到相同"。这是设计取舍，写在这里是为了不被当成"已完全闭环"
 - 目录全树统计仍在宿主进程同步执行（复审 A12 第 4 点），大目录有可见延迟；要动之前先测，不要凭感觉搬进 Worker
 
 ---

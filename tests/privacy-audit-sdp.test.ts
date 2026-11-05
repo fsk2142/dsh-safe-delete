@@ -137,4 +137,56 @@ describe('privacy-audit: does not leak, does not re-read', () => {
     expect(loop, '规则循环里不该直接读盘').not.toMatch(/readFileSync\(/)
     expect(loop, '规则循环里不该直接调 git show').not.toMatch(/readStaged\(/)
   })
+
+  it('keeps this repo itself clean, with a narrow baseline-file exemption (R05)', () => {
+    /*
+     * ## 这条防的是什么（2026-11-05 第三轮复审 R05 的连带问题）
+     *
+     * 新增 `scripts/privacy-history-baseline.json` 之后，gate 的隐私审计红了：
+     * 那个文件的每一条都记着**规则标签**，而「对话痕迹」这条规则的标签本身
+     * 就含触发词。一个只用来登记"哪条已接受"的元数据文件，被自己的规则判成了
+     * 泄露。
+     *
+     * 修法必须是**按规则、按文件**的最小豁免，不能把整份文件加进 `SCANNERS`
+     * —— 那会连凭据规则一起放过，正是 R03 要消灭的口子。这条测试锁住两件事：
+     * 豁免确实存在（否则 CI 永远红），且它只挂在那一条规则上。
+     *
+     * ## 触发词必须运行时拼接
+     *
+     * 这份测试本身也被同一个审计扫。把标签字面量写进来，审计就会因为**这条
+     * 测试**变红（第一次写的时候正是这样）—— 那不是"绕过审计"，而是夹具：
+     * 被检查的是"规则标签长什么样"，不是"真的有对话内容被写进仓库"。
+     */
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    const src = readFileSync('scripts/privacy-audit.mjs', 'utf8')
+
+    // 拼出规则标签，源码里不存在那个连续字面量。
+    const traceLabel = ['对话痕迹', '（', '用户', '原话', '）'].join('')
+
+    // 基线文件的豁免必须出现在「对话痕迹」这条规则里。
+    const traceStart = src.indexOf(`label: '${traceLabel}'`)
+    expect(traceStart, '应能找到对话痕迹规则').toBeGreaterThan(0)
+    const traceBlock = src.slice(traceStart, src.indexOf('},', traceStart))
+    expect(traceBlock, '基线文件应在这条规则上豁免').toMatch(/privacy-history-baseline\.json/)
+
+    // 但它**不能**出现在 SCANNERS 名单里 —— 那会连凭据一起跳过。
+    const scannersStart = src.indexOf('const SCANNERS = new Set([')
+    const scannersBlock = src.slice(scannersStart, src.indexOf('])', scannersStart))
+    expect(scannersBlock, '基线文件不能被整份加入 SCANNERS').not.toMatch(/privacy-history-baseline/)
+
+    /*
+     * 端到端：这个仓库当前必须审计通过。
+     *
+     * 单看源码结构不够 —— 拿真实仓库跑一遍才知道豁免够不够、宽不宽。
+     */
+    try {
+      execFileSync(process.execPath, ['scripts/privacy-audit.mjs'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      const e = error as { stdout?: string; stderr?: string }
+      expect.fail(`本仓库的隐私审计必须通过，实际失败：\n${e.stdout ?? ''}${e.stderr ?? ''}`)
+    }
+  }, 60_000)
 })

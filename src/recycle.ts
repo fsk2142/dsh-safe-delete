@@ -25,7 +25,7 @@
  * 宁可占着磁盘，也不能在用户不知情的情况下永久抹掉数据。
  */
 
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -832,24 +832,194 @@ export type PermanentDeleteRisk = {
   reason?: string
 }
 
-/** 读取注册表值的替身（测试注入）。 */
-export type RegistryReader = (key: string, name: string) => string | undefined
+/**
+ * 一次 `reg` 调用的结果。
+ *
+ * 用「退出码 + 输出」而不是异常，是因为**异常里没有可判定的语义**：
+ * `execFileSync` 抛出的东西对不同失败原因长得一样，调用方只能猜。
+ */
+export type RegQueryOutcome = {
+  status: number | null
+  stdout?: string
+  stderr?: string
+  /** 进程根本没起来（ENOENT / EACCES / 被策略拦截）。 */
+  spawnError?: string
+}
 
-/** 用 `reg query` 读一个值；读不到返回 undefined。 */
-function readRegistryViaReg(key: string, name: string): string | undefined {
-  try {
-    const out = execFileSync('reg', ['query', key, '/v', name], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    })
-    // 输出形如 `    NoRecycleFiles    REG_DWORD    0x1`
-    const line = out.split(/\r?\n/).find((l) => l.includes(name))
-    if (line === undefined) return undefined
-    const parts = line.trim().split(/\s+/)
-    return parts[parts.length - 1]
-  } catch {
-    return undefined
+/**
+ * 执行一次 `reg query`。`name` 省略表示查询整个键。
+ *
+ * 抽成参数是为了让测试能在**不碰真实注册表**的前提下构造
+ * 「访问被拒绝」「起不来」「输出异常」—— 这三种在这台机器上构造不出来。
+ */
+export type RegQueryRunner = (key: string, name?: string) => RegQueryOutcome
+
+/**
+ * 读注册表值的结果（三态）。
+ *
+ * ## 为什么不能是 `string | undefined`（2026-11-05 第三轮复审 R01）
+ *
+ * `undefined` 同时承担了两个相反的语义：
+ *
+ * | 事实 | 该字段的旧值 | 下游结论 |
+ * |---|---|---|
+ * | 值确实不存在 | `undefined` | safe（对） |
+ * | 访问被拒绝 | `undefined` | safe（**错**） |
+ * | `reg.exe` 起不来 | `undefined` | safe（**错**） |
+ * | 查询失败 / 输出解析不了 | `undefined` | safe（**错**） |
+ *
+ * 而 `safe` 的下游动作是「不问、直接进回收站」，那一步可能是永久删除。
+ * 所以结果类型必须**能把"不存在"和"读不到"分开**。
+ */
+export type RegistryReadResult =
+  | { kind: 'value'; value: string }
+  | { kind: 'missing' }
+  | { kind: 'error'; reason: string }
+
+/** 读取注册表值的替身（测试注入）。 */
+export type RegistryRead = (key: string, name: string) => RegistryReadResult
+
+/**
+ * `detectPermanentDeleteRisk` 接受的读取函数。
+ *
+ * 允许直接返回字符串是给**测试**用的便利写法：`() => '1'` 明确表达
+ * "读到了 1"。注意它**没有** `undefined` 这一档 —— 想表达"值不存在"必须写
+ * `{ kind: 'missing' }`，这样"读不到"就没法被悄悄写成"不存在"。
+ */
+export type RegistryReader = (key: string, name: string) => RegistryReadResult | string
+
+/**
+ * 默认的 `reg` 执行器。
+ *
+ * 编码用 `utf8`：`reg.exe` 的错误消息来自 MUI 资源，中文系统上是 GBK。
+ * 按 utf8 解会得到乱码 —— 但**同样的字节得到同样的乱码**，而下面判断的是
+ * 「两条消息是否相同」，所以乱码不影响结论。刻意不做编码探测：那会让这个
+ * 零依赖的插件去猜系统代码页。
+ *
+ * @param key 注册表键。
+ * @param name 值名；省略表示查询整个键。
+ * @returns 退出码与输出，不抛异常。
+ */
+function runRegQuery(key: string, name?: string): RegQueryOutcome {
+  const args = name === undefined ? ['query', key] : ['query', key, '/v', name]
+  const result = spawnSync('reg', args, { encoding: 'utf8', windowsHide: true })
+  const status = result.status ?? null
+  if (result.error !== undefined && result.error !== null) {
+    return { status, spawnError: result.error.message }
+  }
+  return { status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
+}
+
+/** 控制探针用的键：任何 Windows 账户下都必然可读。 */
+const PROBE_KEY = 'HKCU\\Software'
+/** 必然不存在的值名 —— 用来取本机"找不到"这一条消息的原文。 */
+const PROBE_VALUE = '__dsh_safe_delete_probe__'
+
+/**
+ * 把一条 `reg` 消息规范成可比较的形态。
+ *
+ * 只做与语言无关的规整（去首尾空白、压缩内部空白、小写）——
+ * **不比对任何具体文本**，否则换一种系统语言就静默失效。
+ *
+ * @param text 原文。
+ * @returns 规范后的文本。
+ */
+function normaliseMessage(text: string | undefined): string {
+  return (text ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/**
+ * 从 `reg query` 的输出里取出某个值的最后一段。
+ *
+ * 输出形如：
+ *
+ * ```text
+ * HKEY_CURRENT_USER\...\Explorer
+ *     NoRecycleFiles    REG_DWORD    0x1
+ * ```
+ *
+ * ## 必须按"值名整列相等"匹配（第三轮复审 R01）
+ *
+ * 旧实现用 `line.includes(name)` —— `NoRecycleFilesBackup` 也会命中，
+ * 于是备份值的 `0x1` 会被当成主策略值。这里比较第一列是否**整串相等**。
+ *
+ * 值的类型列（`REG_DWORD` / `REG_SZ`）之后才是数据；`REG_SZ` 可能含空格，
+ * 所以取类型列之后的**全部**内容，而不是最后一个 token。
+ *
+ * @param stdout 输出。
+ * @param name 值名。
+ * @returns 数据；没找到返回 `undefined`。
+ */
+function parseValueLine(stdout: string, name: string): string | undefined {
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '' || line.startsWith('HKEY_')) continue
+    const parts = line.split(/\s+/)
+    if (parts[0] !== name) continue
+    const typeAt = parts.findIndex((p) => p.startsWith('REG_'))
+    if (typeAt < 0 || typeAt + 1 >= parts.length) continue
+    return parts.slice(typeAt + 1).join(' ')
+  }
+  return undefined
+}
+
+/**
+ * 造一个三态注册表读取器。
+ *
+ * ## 判据：同语言的控制探针（第三轮复审 R01）
+ *
+ * "值不存在"与"访问被拒绝"的**消息不同**，而两台机器只是语言不同。
+ * 所以这里不比对绝对文本，而是比对**相对差异**：
+ *
+ * 1. 正值控制 `reg query HKCU\Software` 必须成功 —— 否则这台机器上
+ *    `reg` 本身就不可信，一切结论都得是 `unknown`；
+ * 2. 负值控制 `reg query HKCU\Software /v <不存在的值>` 取得本机
+ *    "找不到"这条消息；
+ * 3. 目标查询的消息与负值控制**逐字相同** → 确认不存在；否则 → 读失败。
+ *
+ * 控制探针只在失败路径跑，正常路径没有额外成本；负值控制的结果会被记住。
+ *
+ * @param run `reg` 执行器（测试注入）。
+ * @returns 读取器。
+ */
+export function createRegReader(run: RegQueryRunner = runRegQuery): RegistryRead {
+  /** `undefined` = 还没探过；`null` = 探针本身不可信。 */
+  let notFoundMessage: string | null | undefined
+
+  const probeNotFound = (): string | null => {
+    if (notFoundMessage !== undefined) return notFoundMessage
+    notFoundMessage = null
+    const positive = run(PROBE_KEY)
+    if (positive.spawnError !== undefined || positive.status !== 0) return notFoundMessage
+    const negative = run(PROBE_KEY, PROBE_VALUE)
+    if (negative.spawnError !== undefined || negative.status === 0) return notFoundMessage
+    const text = normaliseMessage(negative.stderr)
+    // 没有消息的失败无法与"访问被拒绝"区分 —— 不能据此说"不存在"。
+    if (text === '') return notFoundMessage
+    notFoundMessage = text
+    return notFoundMessage
+  }
+
+  return (key, name) => {
+    const outcome = run(key, name)
+    if (outcome.spawnError !== undefined) {
+      return { kind: 'error', reason: `could not run reg.exe (${outcome.spawnError})` }
+    }
+    if (outcome.status === 0) {
+      const value = parseValueLine(outcome.stdout ?? '', name)
+      return value === undefined
+        ? { kind: 'error', reason: `reg query ${key} succeeded but its output had no "${name}" value` }
+        : { kind: 'value', value }
+    }
+    const notFound = probeNotFound()
+    const message = normaliseMessage(outcome.stderr)
+    if (notFound !== null && message !== '' && message === notFound) return { kind: 'missing' }
+    return {
+      kind: 'error',
+      reason:
+        `could not read ${key} /v ${name}: whether Windows will delete permanently is unknown` +
+        (message === '' ? ' (reg printed no error message)' : ` — ${notFound === null ? 'the reference probe could not run' : message.slice(0, 120)}`),
+    }
   }
 }
 
@@ -880,11 +1050,17 @@ export function detectPermanentDeleteRisk(
   // 非 Windows 没有回收站策略；那是**确认不适用**，不是未知。
   if (platform !== 'win32') return { status: 'safe', risky: false }
 
-  const read = options.readRegistry ?? readRegistryViaReg
+  const read = options.readRegistry ?? createRegReader()
   const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer'
-  let raw: string | undefined
+  let raw: RegistryReadResult
   try {
-    raw = read(key, 'NoRecycleFiles')
+    const result = read(key, 'NoRecycleFiles')
+    /*
+     * 兼容测试里 `() => '1'` 这种便利写法。它表达的是"读到了这个值"，
+     * 与 `{ kind: 'value' }` 等价；`undefined` 不再被接受 —— 想表达
+     * "值不存在"必须显式写 `{ kind: 'missing' }`。
+     */
+    raw = typeof result === 'string' ? { kind: 'value', value: result } : result
   } catch (error) {
     return {
       status: 'unknown',
@@ -894,10 +1070,20 @@ export function detectPermanentDeleteRisk(
         'whether Windows will delete permanently is unknown',
     }
   }
-  // 读到了、但那一条不存在 —— 这是「确认没有设置」，属于 safe。
-  if (raw === undefined) return { status: 'safe', risky: false }
 
-  const value = raw.trim().toLowerCase()
+  /*
+   * ## 只有"确认查询成功且值确实不存在"才是 safe（第三轮复审 R01）
+   *
+   * 旧实现在这里只判 `raw === undefined`，而生产适配器把**所有**异常也折成
+   * `undefined` —— 于是访问被拒绝、`reg.exe` 起不来、输出解析不了，全都走到
+   * `safe`，也就是"不问、直接进回收站"。
+   */
+  if (raw.kind === 'error') {
+    return { status: 'unknown', risky: false, reason: raw.reason }
+  }
+  if (raw.kind === 'missing') return { status: 'safe', risky: false }
+
+  const value = raw.value.trim().toLowerCase()
   // 注册表里既可能是 DWORD（0x1 / 1），也可能被手工写成字符串。
   const enabled = value === '1' || value === '0x1' || value === 'true'
   const disabled = value === '0' || value === '0x0' || value === 'false'
@@ -922,23 +1108,6 @@ export function detectPermanentDeleteRisk(
   }
 }
 
-/**
- * 单个文件是否超过该卷回收站容量上限。
- *
- * ## 为什么要查这个（2026-11-04 审查 Important-9）
- *
- * Windows 在条目**超过回收站上限**时会**永久删除并返回成功**。插件无法阻止，
- * 也无法事后感知 —— 只能事前问。
- *
- * 上限读 `BitBucket\Volume\*\MaxCapacity`（MB）。读不到时不判风险：
- * 不能因为一次读注册表失败就拦住所有删除。
- *
- * 只对**单个文件**判断：目录的递归大小在回收站模式下刻意不统计。
- *
- * @param sizeBytes 目标大小（调用方已 statSync）。
- * @param options 注入点（测试用）。
- * @returns 超限时的说明；未超限或无法判定时返回 `undefined`。
- */
 /*
  * 回收站每卷上限的缓存。
  *
@@ -949,10 +1118,15 @@ export function detectPermanentDeleteRisk(
  * 13.6 分钟。这正是「大量删除卡顿」，而且是我自己加配额检测时引入的。
  *
  * 上限在运行期不会变（改回收站大小要动系统设置），所以读一次就够了。
- * 用 `undefined` 表示「还没读过」，`null` 表示「读过了但读不到」——
- * 两者必须分开，否则每次都会重试一次失败的读取。
+ *
+ * ## 缓存的是**三态结论**，不是一个数值（2026-11-05 第三轮复审 R02）
+ *
+ * 旧实现把"成功读到的那些卷的最小值"当成数字缓存下来；某个卷读失败时它只是
+ * 被跳过，于是**不完整的结果被永久当成上界**。现在缓存的是 `QuotaLimit`：
+ * 记住 `unknown` 是安全的（它不可能变成一个错误的安全结论），记住一个
+ * 缺了某个卷的数字则不是。
  */
-let quotaLimitCache: number | null | undefined
+let quotaLimitCache: QuotaLimit | undefined
 let quotaCacheReader: ((key: string) => number | undefined) | undefined
 let quotaCacheLister: (() => string[]) | undefined
 
@@ -966,26 +1140,62 @@ export function resetQuotaCache(): void {
 }
 
 /**
- * 读一次「本机最小的回收站每卷上限」（字节）。
+ * 「本机最小的回收站每卷上限」的读取结果。
+ *
+ * ## 为什么不是一个 `number | null`（2026-11-05 第三轮复审 R02）
+ *
+ * `null` 表示"读不到"，但它和"只读到了一部分卷"共用了同一个位置 ——
+ * 后者在旧实现里被当成**数字**返回：取成功卷中的最小值，然后当成所有卷的上界。
+ *
+ * | 卷 | 真实上限 | 查询 |
+ * |---|---|---|
+ * | C | 10 GB | 成功 |
+ * | D | 500 MB | 失败 |
+ *
+ * 结论变成"上界 10 GB"，而 D 盘上的 1 GB 文件其实会被 Windows 永久删除。
+ * "成功卷中的最小值"只有在**所有卷都读取成功**时才是全局保守下界。
+ */
+export type QuotaLimit =
+  | { kind: 'known'; bytes: number }
+  | { kind: 'unknown'; reason: string }
+
+/**
+ * 读一次「本机最小的回收站每卷上限」。
+ *
+ * 任意一卷读失败 → 整体 `unknown`。少一个卷的数据，就没有全局上界。
  *
  * @param readCapacity 单个卷的读取函数。
  * @param listKeys 列卷函数。
- * @returns 上限字节数；读不到返回 `null`。
+ * @returns 三态结论（已缓存，函数标识不同即视为不同来源）。
  */
 function quotaLimitBytes(
   readCapacity: (volumeKey: string) => number | undefined,
   listKeys: () => string[],
-): number | null {
-  if (quotaCacheReader === readCapacity && quotaCacheLister === listKeys && quotaLimitCache !== undefined) return quotaLimitCache
+): QuotaLimit {
+  if (quotaCacheReader === readCapacity && quotaCacheLister === listKeys && quotaLimitCache !== undefined) {
+    return quotaLimitCache
+  }
+  const remember = (limit: QuotaLimit): QuotaLimit => {
+    quotaCacheReader = readCapacity
+    quotaCacheLister = listKeys
+    quotaLimitCache = limit
+    return limit
+  }
 
   let keys: string[]
   try {
     keys = listKeys()
   } catch {
-    quotaCacheReader = readCapacity
-    quotaCacheLister = listKeys
-    quotaLimitCache = null
-    return null
+    return remember({
+      kind: 'unknown',
+      reason: 'the list of recycle-bin volumes could not be read from the registry',
+    })
+  }
+  if (keys.length === 0) {
+    return remember({
+      kind: 'unknown',
+      reason: 'the registry lists no recycle-bin volume, so no per-volume limit can be established',
+    })
   }
 
   let smallestMb: number | undefined
@@ -996,14 +1206,21 @@ function quotaLimitBytes(
     } catch {
       mb = undefined
     }
-    if (mb === undefined || mb <= 0) continue
+    /*
+     * 值缺失 / 0 / 负数 / NaN / Infinity 都不是可用上界。
+     * 旧实现 `continue` 掉它们，等于把该卷当成"没有限制"。
+     */
+    if (mb === undefined || !Number.isFinite(mb) || mb <= 0) {
+      return remember({
+        kind: 'unknown',
+        reason: `the recycle-bin limit of volume ${key} could not be read, so no safe bound covers every volume`,
+      })
+    }
     if (smallestMb === undefined || mb < smallestMb) smallestMb = mb
   }
 
-  quotaCacheReader = readCapacity
-  quotaCacheLister = listKeys
-  quotaLimitCache = smallestMb === undefined ? null : smallestMb * 1024 * 1024
-  return quotaLimitCache
+  // 上面已经排除了 keys 为空与任何一卷失败，这里 smallestMb 必然有值。
+  return remember({ kind: 'known', bytes: (smallestMb ?? 0) * 1024 * 1024 })
 }
 
 /**
@@ -1063,17 +1280,16 @@ export function assessQuota(
   const readCapacity = options.readCapacityMb ?? readCapacityViaReg
   const listKeys = options.listVolumeKeys ?? listBitBucketVolumeKeys
   // Function identity matters: equal source text can capture different capacities.
-  const limitBytes = quotaLimitBytes(readCapacity, listKeys)
+  const limit = quotaLimitBytes(readCapacity, listKeys)
 
-  if (limitBytes === null) {
+  if (limit.kind === 'unknown') {
     return {
       status: 'unknown',
-      reason:
-        'the recycle bin capacity limit could not be read from the registry, so whether this item ' +
-        'exceeds it cannot be verified',
+      reason: `${limit.reason}: whether this item exceeds it cannot be verified`,
     }
   }
 
+  const limitBytes = limit.bytes
   if (sizeBytes > limitBytes) {
     return {
       status: 'over',

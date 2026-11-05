@@ -43,9 +43,12 @@ describe('R02: 读不到策略时状态是 unknown，不是 safe', () => {
   it('reports safe when the policy is absent but the read succeeded', () => {
     /*
      * 键不存在（reg 返回 ERROR_FILE_NOT_FOUND）与"读失败"不同：
-     * 前者说明这条策略确实没设置。这里用 `undefined` 表示前者。
+     * 前者说明这条策略确实没设置。
+     *
+     * 2026-11-05 第三轮复审 R01：这个区别现在由**类型**保证 ——
+     * "确认不存在"是 `{ kind: 'missing' }`，`undefined` 已不再被接受。
      */
-    const r = detectPermanentDeleteRisk({ platform: 'win32', readRegistry: () => undefined })
+    const r = detectPermanentDeleteRisk({ platform: 'win32', readRegistry: () => ({ kind: 'missing' }) })
     expect(r.status).toBe('safe')
   })
 

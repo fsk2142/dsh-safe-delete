@@ -329,6 +329,7 @@ node scripts/clean-test-tmp.mjs   # 清测试遗留临时目录
 | `false-positive-probe.ts` | 误拦 |
 | `privacy-audit.mjs` | 隐私与凭据扫描（**工作区 + 暂存区**） |
 | `privacy-history-audit.mjs` | 隐私扫描的**历史**部分：`git log --all` 的 diff 与提交信息 |
+| `privacy-history-baseline.json` | 历史扫描的**已接受命中**基线（精确到 SHA + 文件 + 规则；凭据不可入） |
 | `check-docs.mjs` | 文档与实现一致性 |
 | `mutation-check-core.mjs` | 变异检验 |
 | `where-is-safe-zone.mjs` | 安全区位置与所在卷 |
@@ -344,6 +345,17 @@ node scripts/clean-test-tmp.mjs   # 清测试遗留临时目录
 | `privacy-history-audit.mjs` | **过去**有没有提交过敏感内容 | `git log --all` 的 diff 新增行、提交信息 | reflog / 不可达对象、tag 附注、Release 附件、CI 日志、二进制内容 |
 
 两者都不替代 `gitleaks` / `trufflehog`：正式发布前应另跑专用工具。历史命中无法靠"再提交一次"消除 —— 先判断它是否仍是**有效凭据**（有效则轮换），再决定是否有必要改写历史。
+
+历史扫描有两处**刻意收窄**的豁免，都写在 `privacy-history-audit.mjs` 里：
+
+| 豁免 | 范围 | 为什么收窄 |
+|---|---|---|
+| 规则载体文件 | `scripts/privacy-audit.mjs` / `privacy-history-audit.mjs` / `verify-remote.mjs` 里的**上下文规则**（本机路径、对话痕迹、会话标识） | 那些行就是规则定义本身，不是数据 |
+| 测试夹具路径 | `tests/` 与 `*.test.ts` 里的**上下文规则** | 那些命中是刻意构造的假数据 |
+
+**凭据 / Token 规则在这两类文件里照扫**（第三轮复审 R03）：不存在"这是测试夹具"这种解释 —— 要么是假 token，要么是真泄露，必须有人看一眼。
+
+已确认无害的历史命中写进 `scripts/privacy-history-baseline.json`，精确到 `SHA + 文件 + 规则`，只影响那一条。**凭据类命中永远不能进基线**：基线里出现凭据条目时脚本直接退出 2，而不是放行。
 
 ### 升级 DSH 后
 
