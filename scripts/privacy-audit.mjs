@@ -93,8 +93,20 @@ function readStaged(file) {
 
 /**
  * 本身内嵌检测模式的脚本：它们的"命中"是规则，不是泄露，必须跳过。
+ *
+ * ## 新增规则脚本时必须同步这个名单（2026-11-05 第二轮复审的真实返工）
+ *
+ * 加 `privacy-history-audit.mjs` 时忘了它 —— 那个文件里同样写着 token 正则、
+ * 本机路径正则与"用户原话"字样，于是它在**下一次** gate 里把隐私审计弄红了
+ * （4 处命中，其中一处还是 CRITICAL 级别的 token 正则）。
+ *
+ * 这是"扫描器扫到自己"的老问题：规则文本与被检数据在字面上不可区分。
  */
-const SCANNERS = new Set(['scripts/privacy-audit.mjs', 'scripts/verify-remote.mjs'])
+const SCANNERS = new Set([
+  'scripts/privacy-audit.mjs',
+  'scripts/privacy-history-audit.mjs',
+  'scripts/verify-remote.mjs',
+])
 
 /**
  * 把路径里的本机用户名隐去。
