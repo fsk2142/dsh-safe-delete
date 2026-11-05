@@ -1075,7 +1075,135 @@ export function createRegReader(run: RegQueryRunner = runRegQuery): RegistryRead
 }
 
 /**
+ * 每卷的 `NukeOnDelete` 检查（2026-11-05 第四轮自检）。
+ *
+ * ## 为什么必须有这一条
+ *
+ * 判「删除会被永久执行」原来只看**全局**开关
+ * `Policies\Explorer\NoRecycleFiles`。但 Windows 还有一条**按卷**的开关，
+ * 就在插件为了读配额已经访问的那个键下面：
+ *
+ * ```text
+ * HKCU\...\Explorer\BitBucket\Volume\{GUID}
+ *     MaxCapacity    REG_DWORD    0x...   ← 配额，读了
+ *     NukeOnDelete   REG_DWORD    0x1     ← 永久删除，从来没读
+ * ```
+ *
+ * `NukeOnDelete = 1` 表示该卷**不使用回收站**：删除直接永久执行。它比
+ * `NoRecycleFiles` 更隐蔽 —— 全局策略没动，只把某个卷设成清空就行。
+ *
+ * 前几轮复审漏掉这条，是因为 R01/R02 修的是**读取失败**的处理；这一条是
+ * **压根没读**。失败形态一样（静默放行），根因不同。
+ *
+ * ## 判据与方向
+ *
+ * - 任一卷 `NukeOnDelete = 1` → **risky**；
+ * - 全部卷都读到且为 0（或该值不存在，即默认 0）→ 这一条确认安全；
+ * - 列不出卷 / 某个卷读失败 / 值解析不了 → **unknown**。
+ *
+ * 「任一卷为 1 就 risky」是刻意的保守：钩子层拿不到可靠的目标-卷映射
+ * （盘符到卷 GUID 还要额外查询），所以按最坏情况问人。误报的代价是
+ * 多一次点击；漏报的代价是不可恢复的数据丢失。
+ *
+ * @param read 注册表读取器。
+ * @param listKeys 列卷函数。
+ * @returns 三态判定；`safe` 表示这一项确认无风险。
+ */
+function detectPerVolumeNukeRisk(
+  read: RegistryReader,
+  listKeys: () => string[],
+): PermanentDeleteRisk {
+  let keys: string[]
+  try {
+    keys = listKeys()
+  } catch (error) {
+    return {
+      status: 'unknown',
+      risky: false,
+      reason:
+        `could not list the recycle-bin volumes (${error instanceof Error ? error.message : String(error)}); ` +
+        'whether any volume bypasses the recycle bin is unknown',
+    }
+  }
+  if (keys.length === 0) {
+    return {
+      status: 'unknown',
+      risky: false,
+      reason:
+        'the registry lists no recycle-bin volume, so whether any volume bypasses the recycle bin is unknown',
+    }
+  }
+
+  const disablers: string[] = []
+  for (const key of keys) {
+    let result: RegistryReadResult
+    try {
+      result = coerceRegistryRead(read(key, 'NukeOnDelete'))
+    } catch (error) {
+      return {
+        status: 'unknown',
+        risky: false,
+        reason:
+          `could not read NukeOnDelete for volume ${key} ` +
+          `(${error instanceof Error ? error.message : String(error)}); whether it bypasses the recycle bin is unknown`,
+      }
+    }
+    /*
+     * 值不存在 = 默认 0 = 该卷正常使用回收站。这是**确认**的事实，
+     * 因为读取器已经把"读失败"和"不存在"分开了（第三轮复审 R01）。
+     */
+    if (result.kind === 'missing') continue;
+    if (result.kind === 'error') {
+      return {
+        status: 'unknown',
+        risky: false,
+        reason:
+          `could not read NukeOnDelete for volume ${key} (${result.reason}); ` +
+          'whether it bypasses the recycle bin is unknown',
+      }
+    }
+    const value = result.value.trim().toLowerCase()
+    if (value === '1' || value === '0x1' || value === 'true') {
+      disablers.push(key)
+      continue
+    }
+    if (value === '0' || value === '0x0' || value === 'false') continue
+    return {
+      status: 'unknown',
+      risky: false,
+      reason:
+        `volume ${key} has an unrecognised NukeOnDelete value ("${value.slice(0, 40)}"); ` +
+        'whether it bypasses the recycle bin is unknown',
+    }
+  }
+
+  if (disablers.length > 0) {
+    return {
+      status: 'risky',
+      risky: true,
+      reason:
+        `the NukeOnDelete policy is enabled for ${disablers.length} volume(s) ` +
+        `(${disablers.slice(0, 3).join(', ')}${disablers.length > 3 ? ` +${disablers.length - 3} more` : ''}): ` +
+        'deletes on those volumes bypass the recycle bin and are permanently deleted',
+    }
+  }
+  return { status: 'safe', risky: false }
+}
+
+/**
  * 检测「删除会被系统永久执行」的策略。
+ *
+ * ## 两个独立的开关（2026-11-05 第四轮自检）
+ *
+ * 有两处会让删除绕过回收站，必须都查：
+ *
+ * | 开关 | 范围 | 键 |
+ * |---|---|---|
+ * | `NoRecycleFiles` | 全局 | `Policies\Explorer` |
+ * | `NukeOnDelete` | **每卷** | `BitBucket\Volume\{GUID}` |
+ *
+ * 只看全局那一条会漏掉"全局正常、只有系统盘被设成清空"的配置 —— 而那正是
+ * 想彻底删干净的人会设的。
  *
  * ## 读失败 ≠ 确认安全（2026-11-05 第二轮复审 R02）
  *
@@ -1089,12 +1217,14 @@ export function createRegReader(run: RegQueryRunner = runRegQuery): RegistryRead
  *
  * @param options.platform 平台（测试注入，默认 `process.platform`）。
  * @param options.readRegistry 注册表读取替身。
+ * @param options.listVolumeKeys 列卷替身（与 `assessQuota` 同名同义）。
  * @returns 三态判定。`status === 'risky'` 时调用方必须先问人。
  */
 export function detectPermanentDeleteRisk(
   options: {
     platform?: NodeJS.Platform
     readRegistry?: RegistryReader
+    listVolumeKeys?: () => string[]
   } = {},
 ): PermanentDeleteRisk {
   const platform = options.platform ?? process.platform
@@ -1126,31 +1256,45 @@ export function detectPermanentDeleteRisk(
   if (raw.kind === 'error') {
     return { status: 'unknown', risky: false, reason: raw.reason }
   }
-  if (raw.kind === 'missing') return { status: 'safe', risky: false }
-
-  const value = raw.value.trim().toLowerCase()
-  // 注册表里既可能是 DWORD（0x1 / 1），也可能被手工写成字符串。
-  const enabled = value === '1' || value === '0x1' || value === 'true'
-  const disabled = value === '0' || value === '0x0' || value === 'false'
-  if (enabled) {
-    return {
-      status: 'risky',
-      risky: true,
-      reason:
-        'the NoRecycleFiles policy is enabled: Windows will permanently delete instead of using the recycle bin',
-    }
-  }
-  if (disabled) return { status: 'safe', risky: false }
 
   /*
-   * 读到了值，但解析不出含义（`maybe`、被截断的输出、非预期类型）。
-   * 那同样是「不知道」—— 不能因为读到了字符串就当安全。
+   * ## 每卷开关：即使全局策略确认没开，也要继续查（第四轮自检）
+   *
+   * `missing`（全局没设）不再是终点 —— 那是旧实现的第二个静默放行点。
    */
-  return {
-    status: 'unknown',
-    risky: false,
-    reason: `the NoRecycleFiles policy has an unrecognised value ("${value.slice(0, 40)}"); whether Windows will delete permanently is unknown`,
+  const perVolume = detectPerVolumeNukeRisk(
+    read,
+    options.listVolumeKeys ?? listBitBucketVolumeKeys,
+  )
+  // 全局致命优先报，理由更直接。
+  if (raw.kind === 'value') {
+    const value = raw.value.trim().toLowerCase()
+    if (value === '1' || value === '0x1' || value === 'true') {
+      return {
+        status: 'risky',
+        risky: true,
+        reason:
+          'the NoRecycleFiles policy is enabled: Windows will permanently delete instead of using the recycle bin',
+      }
+    }
+    if (!(value === '0' || value === '0x0' || value === 'false')) {
+      /*
+       * 读到了值，但解析不出含义（`maybe`、被截断的输出、非预期类型）。
+       * 那同样是「不知道」—— 不能因为读到了字符串就当安全。
+       */
+      return {
+        status: 'unknown',
+        risky: false,
+        reason: `the NoRecycleFiles policy has an unrecognised value ("${value.slice(0, 40)}"); whether Windows will delete permanently is unknown`,
+      }
+    }
   }
+
+  /*
+   * 走到这里：全局策略确认安全。结论取决于每卷检查 ——
+   * 任一卷为 unknown 就必须是 unknown，不能因为"全局没事"就放行。
+   */
+  return perVolume
 }
 
 /*
