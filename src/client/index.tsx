@@ -75,14 +75,20 @@ interface FieldSpec {
  *
  * 单独渲染在保存按钮之后，既不动那些测试的前提，也让这组开关在视觉上
  * 紧邻「保存」，符合「点了立刻生效」的语义。
+ *
+ * ## hint 只写"选了会怎样"，不写设计取舍（2026-11-06）
+ *
+ * 设置页不是设计文档。原来这段写了两句权衡（会统计大小、大目录慢、卡片不显示
+ * 总大小、超大删除不再额外确认…），用户明确要求"主要保留操作说明"。
+ *
+ * 现在保留的只有**用户需要据此做选择**的信息：文件去哪儿、从哪儿取回。
+ * 速度差异保留一句极短的括注，因为它会让用户看到可感知的行为差异；
+ * 至于"为什么这样设计"，README 的删除去向一节有完整说明。
  */
 const DESTINATION_FIELD: FieldSpec = {
   key: 'deleteDestination',
   label: '删除去向',
-  hint:
-    '放入安全区：会统计文件数与总大小（大目录删除会慢一些），换来「删太多先问一次」和插件内按条目恢复。' +
-    '直接进回收站：跳过统计，删除速度与文件数无关；代价是超大删除不再额外确认、卡片不显示总大小，' +
-    '取回要去系统回收站。',
+  hint: '放入安全区：可在插件内取回（大目录较慢）。直接进回收站：更快，但不再额外确认超大删除，取回要去系统回收站。',
   kind: 'choice',
   options: [
     { value: 'safe-zone', label: '放入安全区' },
@@ -113,7 +119,11 @@ const FIELDS: FieldSpec[] = [
   {
     key: 'retentionDays',
     label: '安全区保留天数',
-    hint: '删除的条目在安全区停留多少天，到期移入系统回收站。填整数，至少 1 天。',
+    /*
+     * 只留"填什么 + 边界"，机制说明交给 README（2026-11-06）。
+     * 原来的"到期移入系统回收站"是在设置页复述实现细节。
+     */
+    hint: '到期后自动移入系统回收站。至少 1 天。',
     /*
      * 用 `number` 而不是新的 `'days'` 类型：天数本身就是整数、没有单位换算，
      * `number` 分支的渲染（`String(current)`）和写回（原值）正好合适。
@@ -127,7 +137,7 @@ const FIELDS: FieldSpec[] = [
   {
     key: 'confirmFileCount',
     label: '单次删除条目数确认',
-    hint: '一次删除超过这么多条就额外问一次。0 表示关闭。',
+    hint: '超过这个数量就先问一次。0 = 关闭。',
     kind: 'number',
     min: 0,
     fallback: 5000,
@@ -135,7 +145,7 @@ const FIELDS: FieldSpec[] = [
   {
     key: 'confirmBytes',
     label: '单次删除大小确认',
-    hint: '一次删除超过这么大就额外问一次。0 表示关闭。',
+    hint: '超过这个大小就先问一次。0 = 关闭。',
     kind: 'bytes',
     min: 0,
     fallback: 2 * GIGABYTE,
@@ -1321,7 +1331,7 @@ export function SafeZoneSettings(): ReactElement {
             安全区设置
           </span>
           <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
-            保存后需重启 DSH 生效。删除的文件先进安全区，可在保留期内取回。
+            保存后需重启 DSH 生效。
           </span>
         </div>
 
@@ -1641,7 +1651,6 @@ export function SafeZoneSettings(): ReactElement {
             type="button"
             onClick={() => armClean()}
             disabled={status !== 'ready' || cleaning}
-            title="把安全区里的条目全部移入系统回收站（会在清空回收站之前可还原）"
             style={{
               alignSelf: 'flex-start',
               padding: '6px 18px',
@@ -1659,7 +1668,7 @@ export function SafeZoneSettings(): ReactElement {
           </button>
         )}
         <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
-          把安全区现有条目全部移入系统回收站，不受保留期与容量上限限制。
+          把安全区里的条目全部移入系统回收站。
         </span>
       </div>
     </div>
