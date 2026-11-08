@@ -1,7 +1,7 @@
 # dsh-safe-delete 交接文档
 
-> 最后更新：2026-11-05
-> 版本：**2.3.0**（含 2026-11-05 四轮复审整改 + 每卷 `NukeOnDelete` 检测）
+> 最后更新：2026-11-08
+> 版本：**2.3.1**（含目录配额的自适应上界、回收站设置在所有通道生效、插件页正文独立成文件）
 >
 > **本文件刻意不写 HEAD 与"工作区干净"**：那两栏每次提交都会过期，而读者会拿它当事实
 > （第二轮复审 R05、第三轮复审 R06 都指出过这一点）。想知道现在在哪，跑
@@ -38,9 +38,9 @@ pre-execute 钩子判定 → 危险路径或超阈值 → 弹审批卡
 
 | 项 | 值 |
 |---|---|
-| 版本 | 2.3.0（本次发版；含 2026-11-05 四轮复审整改 + 每卷 `NukeOnDelete` 检测） |
-| tag | `v2.3.0`（annotated，指向本版提交；上一个 tag 是 `v2.2.0`） |
-| Release | [v2.3.0](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.3.0)（上一个：[v2.2.0](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.2.0)） |
+| 版本 | 2.3.1（目录配额自适应上界 + 回收站设置全通道生效 + 插件页正文独立成文件） |
+| tag | `v2.3.1`（annotated，指向本版提交；上一个 tag 是 `v2.3.0`） |
+| Release | [v2.3.1](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.3.1)（上一个：[v2.3.0](https://github.com/fsk2142/dsh-safe-delete/releases/tag/v2.3.0)） |
 | 源码规模 | 21 个 `.ts`（约 1.2 万行） |
 | 测试 | `tests/` 下的 `*.test.ts`，全绿（**数量会变**：跑 `pnpm gate` 或 `pnpm test` 看当次结果，不要引用本表的数字） |
 | 运行时依赖 | **零** |
@@ -436,6 +436,89 @@ R01/R02 修的是**读取失败**的处理（读到了但异常 / 部分卷失�
 
 ---
 
+## 7h. 2026-11-08 续：回收站的设置必须在**每一条**通道上生效
+
+### 症状
+
+用户把 `deleteDestination` 设成 `recycle-bin`，得到的却是三种行为：
+
+```
+safe_delete 工具     → 检查后进回收站   ✅
+/safe-delete <路径>  → 进安全区         ❌ 设置被忽略
+CLI delete <路径>    → 进安全区，目录一律删不掉
+```
+
+用户的判断是对的：「两个选项里有一个不起作用，等于只做了一个」。
+
+### 三个独立根因
+
+| # | 根因 | 后果 |
+|---|---|---|
+| 1 | `commandAdapter` 与 CLI 调 `deletePath` 时**都没传 `destination`**（它可选，缺省 `safe-zone`） | 设置被静默忽略；预览文案读真实配置，于是它说"会进回收站"而实际进安全区 —— 承诺与行为相反 |
+| 2 | `deletePath` / `deleteMany` 用 `assessQuota(…, { sizeIsLowerBound })` 判配额，目录恒 `unknown` → 要审批；CLI 的 `requestApproval` 恒 `rejected` | CLI 删不了**任何**目录，哪怕几 KB |
+| 3 | 7g 的有界枚举只接在**钩子层**，工具体 / 斜杠命令 / CLI 三条路都没接 | 它们仍停在"下界 → unknown" |
+
+### 修法
+
+- `commandAdapter` 与 CLI 都传 `destination`；CLI 新增从 profile patch 读 `deleteDestination`
+- `delete-core` 与 `tools` 在目录下界不足以判定时**默认**做有界枚举，不再要求调用方记得传可选字段（漏传就退回"一律问人"，那正是 CLI 删不掉东西的原因）
+- `createSharedMeasure` 从插件入口移到 `describe.ts` —— `delete-core` 与 `tools` 都要用它，不该为了一个预算函数去 import 整份 `apply`
+
+### 语义没有放宽
+
+| 情况 | 行为 |
+|---|---|
+| 实测证明放得下 | 放行 |
+| 实测超过上限 | 仍然审批 |
+| 枚举失败 / 超预算 | 退回 `unknown`，仍然审批 |
+
+### 验收
+
+`tests/destination-wiring-all-routes.test.ts`（8 条，**5 条在修复前变红**）。
+
+`tests/r01-lower-bound-quota.test.ts` 里有一条旧断言被新语义推翻：「下界没超就问人」收紧成「下界没超**且测不出来**才问人」。已按新语义改写，并补了反面用例（枚举证明放得下时不弹卡）。
+
+真实工程目录实测（不经测试替身）：`synth`（顶层下界约 730 KB）与 `doc`（约 337 KB）在回收站模式下均 `asked=0`。
+
+---
+
+## 7i. 2026-11-08 续：插件页正文独立成文件
+
+### 为什么反复修不好
+
+前两次都改**设置组件的文案**，而屏幕上的大段内容是**详情文档整篇**渲染 —— 改的是另一个地方。
+
+真正的约束一直没查清楚：DSH 的详情文档按固定顺序选源：
+
+1. `locale/<语言>.json` 的 `meta.detail` 指向的 Markdown
+2. 包根的 `README.md`
+3. 仓库 README（只有市场条目）
+
+之前只用得上第 2 条，于是 README 被迫兼任「npm 项目说明」与「插件界面正文」—— 它天然会越长越全，插件页就成了开发笔记。
+
+### 修法
+
+用第 1 条：新增 `locale/zh.json` / `locale/en.json`，`meta.detail` → `docs/DETAIL.md`（46 行，只有删除 / 取回 / 设置 / 遇到提示）。
+
+| 文件 | 行数 | 用途 |
+|---|---|---|
+| `docs/DETAIL.md` | 46 | 插件页正文 |
+| `README.md` | 35 | 项目说明 |
+| `docs/REFERENCE.md` | — | 参数表、配置全表、路径分级、审批策略 |
+| `docs/BOUNDARIES.md` | — | 保证什么、不保证什么、为什么 |
+
+### 连带改动
+
+- `package.json` 的 `files` 补 `locale/` 与 `docs/`。locale 不发布则 `meta.detail` 读不到；docs 不发布则详情页指向不存在的文件，报 `DetailFailure invalid`
+- `check-docs.mjs` 的校验对象从 README 换成 `docs/REFERENCE.md` —— 检查不删，只是搬家
+- `sync-install.mjs` 增加同步 `locale/` 与 `docs/`
+
+### 验收
+
+`tests/plugin-page-detail-source.test.ts`（6 条）守住：locale 声明 detail、detail 文件存在、路径形如 `docs/*.md`、DETAIL 与 README 都不再长成手册、`files` 确实发布这两个目录。
+
+---
+
 ## 7f. 附：2026-11-04/05 自检修复（更早的一批，按时间排在最后）
 
 8 个发现，**5 个是修改过程中自己引入的**。
@@ -565,9 +648,10 @@ git push origin main && git push origin vX.Y.Z
 
 ### 当前遗留
 
-- `v2.3.0` 是本版 tag（annotated）。上一个 `v2.2.0` 指向 `eb2e53c`，保持不动。2.2.0 → 2.3.0 含 breaking change：`pnpm build` / `npm test` 现在要审批，`never + 回收站 + pattern` 现在直接拒绝
+- `v2.3.1` 是本版 tag（annotated）。上一个 `v2.3.0` 指向 `4ddbbc3`，保持不动。
+- `v2.3.0` 曾含 breaking change（相对 2.2.0）：`pnpm build` / `npm test` 现在要审批，`never + 回收站 + pattern` 现在直接拒绝
 - `match: "build"` 匹配目录名返回 0 结果——语义有歧义（删目录本身还是删里面？），未改
-- 目录配额只量顶层（已改成 unknown + 问人，但**没有**真正测出嵌套大小；要精确就得 O(文件数) 扫描，与本模式的取舍冲突）
+- **目录配额的下界问题在 2.3.1 已有出口**：下界不足以判定时做一次有界早退枚举（1.5 s 整批共享预算，超了退回 unknown）。但这仍不是"精确统计所有情况"——超预算或撞条目上限时仍然问人。模式形态（`root` + `match`）在 `never + 回收站` 下依然直接拒绝，它连目标清单都没有
 - `privacy-audit.mjs` 只扫工作区 + 暂存区；历史扫描现在是独立脚本 `privacy-history-audit.mjs`，**范围有限**（不覆盖 reflog / 不可达对象 / 二进制 / Release 附件）。发布前仍应跑 `gitleaks` / `trufflehog`
 - 历史里 4 处命中是**知情接受**，不是遗忘（见 §7b 表格），已写进 `scripts/privacy-history-baseline.json`
 - **没有 CI**（没有 `.github/`），所以 `gate-report.json` 只是本地文件，远端没有对应 artifact（第三轮复审 R07）
