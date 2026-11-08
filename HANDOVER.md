@@ -581,7 +581,8 @@ git push origin main && git push origin vX.Y.Z
 
 | 文件 | 内容 |
 |---|---|
-| `README.md` | 用户向：功能、用法、配置（**插件页整篇渲染它**，只放使用说明） |
+| `README.md` | 用户向：怎么删、怎么取回、提示什么意思（**插件页整篇渲染它**，所以只放操作说明，35 行） |
+| `docs/REFERENCE.md` | 参数表、配置全表、路径分级、审批策略、兼容性 |
 | `docs/BOUNDARIES.md` | 保证什么、不保证什么、为什么（第 2 层边界 / 两个开关 / 2.0 锁变更 / 保护范围 / 证明只读） |
 | `docs/DEVELOPING.md` | 开发命令、验证脚本、两套隐私扫描的分工 |
 | `docs/CLEANUP-ARCHITECTURE.md` | 清理架构与三条已知边界 |

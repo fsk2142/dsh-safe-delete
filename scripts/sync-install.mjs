@@ -26,7 +26,7 @@
  * 目标目录默认是 desktop profile，可用第一个参数覆盖。
  */
 
-import { copyFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -160,6 +160,22 @@ for (const name of srcNames) {
 for (const name of ['package.json', 'README.md']) {
   const src = join(SRC_ROOT, name)
   if (existsSync(src)) copyFileSync(src, join(target, name))
+}
+
+/*
+ * 4. 同步 docs/。
+ *
+ * README 现在只放操作说明，参数与配置全表在 `docs/REFERENCE.md` —— README
+ * 里那个链接指向它。不同步的话，插件页里「更多」那一行会指向不存在的文件。
+ */
+const srcDocs = join(SRC_ROOT, 'docs')
+const dstDocs = join(target, 'docs')
+if (existsSync(srcDocs)) {
+  mkdirSync(dstDocs, { recursive: true })
+  for (const name of readdirSync(srcDocs)) {
+    if (!name.endsWith('.md')) continue
+    copyFileSync(join(srcDocs, name), join(dstDocs, name))
+  }
 }
 
 const { version } = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'))

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "安全删除 (dsh-safe-delete)",
+    "description": "DSH 删除的撤销层：删除先进安全区，到期移入系统回收站，清空回收站才真正消失。",
+    "detail": "docs/DETAIL.md"
+  }
+}

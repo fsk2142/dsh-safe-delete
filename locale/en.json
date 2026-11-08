@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Safe delete (dsh-safe-delete)",
+    "description": "Reversible deletion for DeepSeek Harness: deletions land in a safe zone you can restore, then move to the system recycle bin.",
+    "detail": "docs/DETAIL.md"
+  }
+}

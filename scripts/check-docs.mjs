@@ -3,10 +3,18 @@
  *
  * 为什么值得单独做：文档写着"默认 5000 条目"，代码里其实是 500，这类偏差
  * 不会让测试变红，却会让人按错误预期配置插件。
+ *
+ * ## 为什么读 docs/REFERENCE.md 而不是 README.md（2026-11-08）
+ *
+ * DSH 的插件页把整篇 `README.md` 渲染进界面。README 因此必须是**操作说明**，
+ * 不能塞参数表和配置全表 —— 那些在 `docs/REFERENCE.md`。
+ *
+ * 但这个检查的目的不变：**参数与默认值必须有一份会和实现一起改的文档**。
+ * 所以它跟着搬家，而不是被删掉。
  */
 import { readFileSync } from 'node:fs'
 
-const readme = readFileSync('README.md', 'utf8')
+const readme = readFileSync('docs/REFERENCE.md', 'utf8')
 const indexSrc = readFileSync('src/index.ts', 'utf8')
 const configSrc = readFileSync('src/config.ts', 'utf8')
 const toolsSrc = readFileSync('src/tools.ts', 'utf8')
@@ -14,7 +22,7 @@ const cliSrc = readFileSync('bin/dsh-safe-delete.mjs', 'utf8')
 
 const mismatches = []
 
-/** 从 README 的配置表里取默认值。 */
+/** 从 REFERENCE 的配置表里取默认值。 */
 function docDefault(key) {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const re = new RegExp('\\|\\s*`' + escaped + '`\\s*\\|\\s*([^|]+?)\\s*\\|')
@@ -89,7 +97,7 @@ const documentedKeys = [
   'confirmBytes',
 ]
 
-console.log('=== README 配置表 vs 实现默认值 ===')
+console.log('=== REFERENCE 配置表 vs 实现默认值 ===')
 for (const key of documentedKeys) {
   const rawDoc = docDefault(key)
   const rawCode = codeDefault(key)
@@ -124,29 +132,29 @@ for (const key of documentedKeys) {
   else if (!same) mismatches.push(`${key}: 文档写 ${rawDoc}，实现是 ${rawCode}`)
 }
 
-// schema 里声明了 volatile 的字段，必须都能在 README 表里找到 ——
+// schema 里声明了 volatile 的字段，必须都能在 REFERENCE 表里找到 ——
 // 否则用户在界面上看到一个参数，却不知道它是什么。
-console.log('\n=== schema 的 volatile 字段是否都在 README 里 ===')
+console.log('\n=== schema 的 volatile 字段是否都在 REFERENCE 里 ===')
 const volatileKeys = [...configSrc.matchAll(/^\s+(\w+):\s*z\.[^\n]*\.volatile\(\)/gm)].map((m) => m[1])
 for (const key of volatileKeys) {
   const documented = docDefault(key) !== null
   console.log(`${documented ? 'ok  ' : 'MISSING'}  ${key}`)
-  if (!documented) mismatches.push(`volatile 字段 ${key}: README 未列出`)
+  if (!documented) mismatches.push(`volatile 字段 ${key}: REFERENCE 未列出`)
 }
 
-console.log('\n=== README 提到的工具是否都存在 ===')
+console.log('\n=== REFERENCE 提到的工具是否都存在 ===')
 const uniqueTools = [...new Set([...readme.matchAll(/`(safe_[a-z_]+)`/g)].map((m) => m[1]))]
 for (const name of uniqueTools) {
   const exists = toolsSrc.includes(`name: '${name}'`)
   console.log(`${exists ? 'ok  ' : 'MISSING'}  ${name}`)
-  if (!exists) mismatches.push(`${name}: README 提到但不存在`)
+  if (!exists) mismatches.push(`${name}: REFERENCE 提到但不存在`)
 }
 
-console.log('\n=== README 的 CLI 命令是否都存在 ===')
+console.log('\n=== REFERENCE 的 CLI 命令是否都存在 ===')
 for (const cmd of ['delete', 'list', 'undo', 'prune', 'status', 'check', 'journal']) {
   const exists = cliSrc.includes(`case '${cmd}'`)
   console.log(`${exists ? 'ok  ' : 'MISSING'}  ${cmd}`)
-  if (!exists) mismatches.push(`cli:${cmd}: README 提到但不存在`)
+  if (!exists) mismatches.push(`cli:${cmd}: REFERENCE 提到但不存在`)
 }
 
 // 斜杠命令的子命令必须都能在 commands.ts 里处理到。
@@ -159,14 +167,14 @@ for (const sub of ['list', 'restore', 'clean', 'config', 'status']) {
 }
 
 /*
- * `safe_delete` 的参数：README 那一行必须列出 schema 里的全部参数。
+ * `safe_delete` 的参数：REFERENCE 那一行必须列出 schema 里的全部参数。
  *
  * 为什么值得单独查：v1.1.0 给 safe_delete 加了 root / match / olderThan /
- * exclude，README 的「模型侧工具」表那一行**没跟着改**，仍然是旧的
+ * exclude，REFERENCE 的「模型侧工具」表那一行**没跟着改**，仍然是旧的
  * 「path 或 paths，preview，reason」。使用者照着那行调用会漏掉新能力，
  * 而所有测试仍然全绿 —— 文档脱节是静默的。
  */
-console.log('\n=== safe_delete 的参数是否都在 README 里 ===')
+console.log('\n=== safe_delete 的参数是否都在 REFERENCE 里 ===')
 {
   const idx = toolsSrc.indexOf("name: 'safe_delete'")
   const paramStart = idx < 0 ? -1 : toolsSrc.indexOf('parameters: {', idx)
@@ -192,14 +200,14 @@ console.log('\n=== safe_delete 的参数是否都在 README 里 ===')
     const schemaKeys = [...block.matchAll(/^\s{6}([A-Za-z_]\w*):/gm)].map((m) => m[1])
     const docLine = readme.split('\n').find((l) => l.includes('`safe_delete` | `'))
     if (docLine === undefined) {
-      mismatches.push('safe_delete: README 里没有参数说明那行')
-      console.log('MISSING  README 那行')
+      mismatches.push('safe_delete: REFERENCE 里没有参数说明那行')
+      console.log('MISSING  REFERENCE 那行')
     } else {
       const docKeys = [...docLine.matchAll(/`([a-zA-Z_]\w*)`/g)].map((m) => m[1]).filter((k) => k !== 'safe_delete')
       for (const key of schemaKeys) {
         const documented = docKeys.includes(key)
         console.log(`${documented ? 'ok  ' : 'MISSING'}  ${key}`)
-        if (!documented) mismatches.push(`safe_delete 参数 ${key}: README 未列出`)
+        if (!documented) mismatches.push(`safe_delete 参数 ${key}: REFERENCE 未列出`)
       }
     }
   }
@@ -213,3 +221,6 @@ if (mismatches.length === 0) {
   for (const m of mismatches) console.log(`  - ${m}`)
   process.exitCode = 1
 }
+
+
+
