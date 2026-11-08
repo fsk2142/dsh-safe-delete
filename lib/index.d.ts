@@ -1,4 +1,5 @@
-import { r as DeleteDestination } from "./delete-core-BpCB5vMX.js";
+import { t as BoundedMeasure } from "./types-CPMa0scL.js";
+import { r as DeleteDestination } from "./delete-core-NoipwHvs.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**
@@ -256,6 +257,14 @@ export declare function decideHookRisk(input: {
    * 默认全 `false`（单文件、或安全区模式已做全树统计）。
    */
   lowerBoundFlags?: readonly boolean[];
+  /**
+   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   *
+   * 只在**确实无法给出结论**且调用方认为值得付这次遍历时才传。钩子在
+   * `never` 策略下传它 —— 那里 `unknown` 等于拒绝，而拒绝一个明显放得下的
+   * 目录是不可接受的（244.8 MB 对 48.5 GB）。
+   */
+  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure;
 }): {
   kind: 'ask';
   reason: string;

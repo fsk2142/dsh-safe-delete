@@ -1,5 +1,5 @@
-import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle-C9F69IyP.js";
-import { n as TargetDescription, r as TrashEntry, t as Classification } from "./types-BuaWcYtz.js";
+import { i as TrashEntry, n as Classification, r as TargetDescription } from "./types-CPMa0scL.js";
+import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle--9MR2yeX.js";
 //#region src/classify.d.ts
 /** 分类所需的路径事实。 */
 interface ClassifyEnv {

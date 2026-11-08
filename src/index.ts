@@ -31,10 +31,11 @@ import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
 import { detectPermanentDeleteRisk, assessQuota } from './recycle'
-import { describeTarget } from './describe'
+import { describeTarget, measureTreeBounded } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
 import { createTools, normaliseDeleteTargets, type ApprovalOutcome, type ToolDefinition } from './tools'
+import type { BoundedMeasure } from './types'
 
 export const name = 'dsh-safe-delete'
 
@@ -702,6 +703,17 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         targets: plan.resolved,
         sizes: plan.targetSizes,
         lowerBoundFlags: plan.lowerBoundFlags,
+        /*
+         * `never` 策略下 `unknown` 等于**拒绝**，而目录的下界判定永远是
+         * `unknown` —— 于是一个 244.8 MB 的目录，对着 48.5 GB 的回收站上限，
+         * 也删不掉。这里花一次有界遍历把它变成确定结论（2026-11-08）。
+         *
+         * 只在 `never` 下传：其余策略里 `ask` 本来就能弹卡，没有理由为了一次
+         * 审批去遍历整棵树。
+         */
+        ...(approvalPolicy(session) === 'never'
+          ? { measureBounded: (target: string, limitBytes: number) => measureTreeBounded(target, limitBytes) }
+          : {}),
       })
       if (riskVerdict.kind === 'ask') {
         /*
@@ -1471,6 +1483,14 @@ export function decideHookRisk(input: {
    * 默认全 `false`（单文件、或安全区模式已做全树统计）。
    */
   lowerBoundFlags?: readonly boolean[]
+  /**
+   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   *
+   * 只在**确实无法给出结论**且调用方认为值得付这次遍历时才传。钩子在
+   * `never` 策略下传它 —— 那里 `unknown` 等于拒绝，而拒绝一个明显放得下的
+   * 目录是不可接受的（244.8 MB 对 48.5 GB）。
+   */
+  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure
 }): { kind: 'ask'; reason: string } | { kind: 'next' } {
   /*
    * 只有回收站模式才可能「不可恢复」：安全区模式的条目还能取回，
@@ -1517,10 +1537,14 @@ export function decideHookRisk(input: {
   const flagged = input.targets
     .map((target, i) => {
       const size = input.sizes[i]
+      const lowerBound = input.lowerBoundFlags?.[i] === true
       return {
         target,
         quota: assessQuota(typeof size === 'number' ? size : 0, {
-          ...(input.lowerBoundFlags?.[i] === true ? { sizeIsLowerBound: true } : {}),
+          ...(lowerBound ? { sizeIsLowerBound: true } : {}),
+          ...(lowerBound && input.measureBounded !== undefined
+            ? { measureBounded: (limitBytes: number) => input.measureBounded!(target, limitBytes) }
+            : {}),
         }),
       }
     })

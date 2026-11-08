@@ -12,13 +12,104 @@
 import { lstatSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
-import type { TargetDescription } from './types'
+import type { BoundedMeasure, TargetDescription } from './types'
 
 /** 顶层条目最多列多少个。 */
 const MAX_TOP_ENTRIES = 20
 
 /** 递归遍历时最多访问多少个条目，防止超大目录拖死事件循环。 */
 const MAX_WALK_ENTRIES = 200_000
+
+/**
+ * 带早退的有界枚举：只为了回答「这棵树有没有超过 `limitBytes`」。
+ *
+ * ## 为什么需要它（2026-11-08）
+ *
+ * 回收站模式下钩子不递归统计目录，`bytes` 只是一个下界。下界小于上限时
+ * `assessQuota` 只能返回 `unknown`，钩子据此 `ask`；策略是 `never` 时
+ * 管线驳回 `ask`，整个删除被拒绝 —— 于是「244.8 MB 的目录，回收站上限
+ * 48.5 GB」这种一眼就知道能放下的删除也删不掉。
+ *
+ * 这里的取舍是**用一次有界遍历换一个确定结论**：
+ *
+ *   - 累计一旦超过上限就立刻停 → `over`（此时继续走没有任何价值）；
+ *   - 走完都没超 → `exact`（确定放得进去）；
+ *   - 出错 / 撞到条目上限 → `incomplete`（仍然按风险处理）。
+ *
+ * 代价只落在「确实小于上限」的目录上，而那正是删除时本来就要遍历的树。
+ *
+ * 语义与 `describeTarget` 的 `walk` 保持一致：不跟随符号链接（避免链接环），
+ * 链接只按 0 字节计，读不到的条目让结论退回 `incomplete` 而不是少算。
+ *
+ * @param absPath 目录绝对路径（也接受单文件）。
+ * @param limitBytes 配额上限（字节）。
+ * @param options.maxEntries 条目上限，用于测试与极端目录保护。
+ * @returns 三态结论。
+ */
+export function measureTreeBounded(
+  absPath: string,
+  limitBytes: number,
+  options: { maxEntries?: number } = {},
+): BoundedMeasure {
+  const maxEntries = options.maxEntries ?? MAX_WALK_ENTRIES
+
+  let rootStat
+  try {
+    rootStat = lstatSync(absPath)
+  } catch {
+    return { kind: 'incomplete', reason: 'the target could not be inspected' }
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    // 单文件没有「下界」问题，直接给确定值。
+    return { kind: 'exact', bytes: rootStat.size }
+  }
+
+  const pending = [absPath]
+  let total = 0
+  let visited = 0
+
+  while (pending.length > 0) {
+    const current = pending.pop() as string
+    let names: string[]
+    try {
+      names = readdirSync(current)
+    } catch {
+      return {
+        kind: 'incomplete',
+        reason: `part of the tree could not be read (${path.basename(current) || current})`,
+      }
+    }
+    for (const name of names) {
+      if (visited >= maxEntries) {
+        return {
+          kind: 'incomplete',
+          reason: `the tree exceeded ${maxEntries} entries, so its total size could not be established`,
+        }
+      }
+      visited += 1
+      const full = path.join(current, name)
+      let st
+      try {
+        st = lstatSync(full)
+      } catch {
+        return {
+          kind: 'incomplete',
+          reason: `an entry could not be inspected (${name})`,
+        }
+      }
+      if (st.isSymbolicLink()) continue
+      if (st.isDirectory()) {
+        pending.push(full)
+        continue
+      }
+      total += st.size
+      // 早退：继续走不会改变"已经超了"这个结论。
+      if (total > limitBytes) return { kind: 'over', bytes: total }
+    }
+  }
+
+  return { kind: 'exact', bytes: total }
+}
 
 /**
  * 递归累加目录的大小与文件数。

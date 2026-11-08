@@ -30,6 +30,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import type { BoundedMeasure } from './types'
+
 /** 移入回收站的结果。 */
 export type RecycleOutcome =
   | { ok: true }
@@ -1459,6 +1461,16 @@ export function assessQuota(
     readCapacityMb?: (volumeKey: string) => number | undefined
     listVolumeKeys?: () => string[]
     sizeIsLowerBound?: boolean
+    /**
+     * 当下界不足以判定时，做一次**有界早退枚举**来拿到确定结论。
+     *
+     * 只在 `sizeIsLowerBound === true` 且上限已读到时才会被调用。不传就保持
+     * 原有行为（返回 `unknown`，走审批）。
+     *
+     * 为什么要有它：`never` 策略下 `unknown` 等于拒绝，而目录的下界判定
+     * 永远是 `unknown` —— 244.8 MB 的目录对 48.5 GB 的回收站也删不掉。
+     */
+    measureBounded?: (limitBytes: number) => BoundedMeasure
   } = {},
 ): QuotaAssessment {
   const platform = options.platform ?? process.platform
@@ -1489,6 +1501,41 @@ export function assessQuota(
   }
 
   if (options.sizeIsLowerBound === true) {
+    /*
+     * 下界不足以判定时，允许调用方补一次有界枚举把它变成确定结论（2026-11-08）。
+     *
+     * 这条分支是「目录在 never 策略下永远删不掉」的出口：
+     * exact → 真值比较；over → 已经确定超了；incomplete → 仍然是 unknown。
+     */
+    const measure = options.measureBounded
+    if (measure !== undefined) {
+      const measured = measure(limitBytes)
+      if (measured.kind === 'over') {
+        return {
+          status: 'over',
+          reason:
+            `the directory is already larger than the recycle bin's per-volume limit ` +
+            `(${Math.round(limitBytes / (1024 * 1024))} MB): Windows will delete its contents permanently ` +
+            `instead of recycling them`,
+        }
+      }
+      if (measured.kind === 'exact') {
+        if (measured.bytes > limitBytes) {
+          return {
+            status: 'over',
+            reason:
+              `the directory is ${Math.round(measured.bytes / (1024 * 1024))} MB, larger than the recycle bin's ` +
+              `per-volume limit (${Math.round(limitBytes / (1024 * 1024))} MB): Windows will delete its contents ` +
+              `permanently instead of recycling them`,
+          }
+        }
+        return { status: 'within' }
+      }
+      return {
+        status: 'unknown',
+        reason: `${measured.reason}: whether this item exceeds it cannot be verified`,
+      }
+    }
     return {
       status: 'unknown',
       reason:

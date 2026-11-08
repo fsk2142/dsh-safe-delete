@@ -1,5 +1,5 @@
-import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./recycle-C9F69IyP.js";
-import { C as ClassifyEnv, r as DeleteDestination } from "./delete-core-BpCB5vMX.js";
+import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./recycle--9MR2yeX.js";
+import { C as ClassifyEnv, r as DeleteDestination } from "./delete-core-NoipwHvs.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
