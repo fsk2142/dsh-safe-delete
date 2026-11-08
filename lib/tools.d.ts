@@ -1,5 +1,6 @@
+import { t as BoundedMeasure } from "./types-BXwaxl_n.js";
 import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./recycle--9MR2yeX.js";
-import { C as ClassifyEnv, r as DeleteDestination } from "./delete-core-JUdgiG8q.js";
+import { C as ClassifyEnv, r as DeleteDestination } from "./delete-core-RsSdZuLv.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -95,6 +96,13 @@ export interface ToolDeps {
    * 由插件入口在 apply 时算一次传进来：命中时删除前必须问人。
    */
   permanentDeleteRisk?: PermanentDeleteRisk;
+  /**
+   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   *
+   * 回收站模式只量顶层，所以目录恒为 `unknown` → 每次都要审批。不传则保持
+   * 原来的保守行为。
+   */
+  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure;
   /** 当前时间（测试可注入）。 */
   now?: () => number;
 }

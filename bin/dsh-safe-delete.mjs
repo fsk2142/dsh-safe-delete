@@ -150,6 +150,14 @@ function readConfigDefaults() {
     confirmFileCount: 5000,
     confirmBytes: 2 * 1024 ** 3,
     crossVolumeCopy: false,
+    /*
+     * 删除去向的缺省是**安全区** —— 与 schema 一致。
+     *
+     * 这个字段此前压根没读：用户把设置改成 `recycle-bin` 之后，CLI 仍然把
+     * 文件塞进安全区（`deletePath` 的 `destination` 可选，缺省 `safe-zone`）。
+     * 两个选项里有一个不起作用，等于只做了一个。
+     */
+    deleteDestination: 'safe-zone',
     source: 'default',
     note: 'built-in defaults — DSH settings not read (run /safe-delete config inside DSH for live values)',
   }
@@ -262,6 +270,7 @@ function readConfigDefaults() {
        * DSH 起不来时 CLI 是唯一能救数据的东西。它指向错误目录等于救援通道失效。
        */
       stateDir: pickString('stateDir', undefined),
+      deleteDestination: pickString('deleteDestination', fallback.deleteDestination),
       source: 'file',
       note: `read from ${patchFile}`,
     }
@@ -538,7 +547,8 @@ async function main(argv) {
         process.stderr.write('usage: dsh-safe-delete delete <path> [--preview]\n')
         return 2
       }
-      const { deletePath, describeMoved, describePreview } = await import('../lib/delete-core.js')
+      const { deletePath, describeMoved, describePreview, describeRecycled } = await import('../lib/delete-core.js')
+      const { createSharedMeasure } = await import('../lib/describe.js')
       const cfg = readConfigDefaults()
       if (cfg.source !== 'file') process.stdout.write(`(${cfg.note})\n`)
       const result = await deletePath(
@@ -556,6 +566,18 @@ async function main(argv) {
           confirmFileCount: cfg.confirmFileCount,
           confirmBytes: cfg.confirmBytes,
           crossVolumeCopy: cfg.crossVolumeCopy,
+          /*
+           * 删除去向必须传（2026-11-08）。缺了它 `deletePath` 一律走安全区 ——
+           * 用户设了 `recycle-bin` 却仍然被塞进插件安全区，两个选项等于一个。
+           */
+          destination: cfg.deleteDestination,
+          /*
+           * 目录配额的下界不足以判定时实测一次。
+           *
+           * 不传的话，回收站模式下**每个目录**都会被判 unknown → 需要审批，
+           * 而终端的审批通道恒拒绝 —— CLI 连一个几 MB 的目录都删不掉。
+           */
+          measureBounded: createSharedMeasure(),
           // 终端里没有 DSH 的审批卡片：需要确认时一律拒绝，并提示改用插件内的命令。
           requestApproval: async () => 'rejected',
           now: () => Date.now(),
@@ -578,7 +600,13 @@ async function main(argv) {
        * 恢复"，实际第二天就进回收站了。用户可见的错误承诺，必须修。
        */
       process.stdout.write(
-        `${result.kind === 'preview' ? describePreview(result, cfg.retentionDays) : describeMoved(result, cfg.retentionDays)}\n`,
+        `${
+          result.kind === 'preview'
+            ? describePreview(result, cfg.retentionDays, cfg.deleteDestination === 'recycle-bin' ? 'recycle-bin' : 'safe-zone')
+            : result.kind === 'recycled'
+              ? describeRecycled(result)
+              : describeMoved(result, cfg.retentionDays)
+        }\n`,
       )
       return 0
     }

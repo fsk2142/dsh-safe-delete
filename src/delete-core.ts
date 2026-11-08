@@ -18,7 +18,7 @@ import path from 'node:path'
 
 import { appendAudit } from './audit'
 import { classifyPath, normalize as normalizeForCompare, requiresApproval, type ClassifyEnv } from './classify'
-import { describeTarget } from './describe'
+import { describeTarget, measureTreeBounded } from './describe'
 import { moveToSafeZone } from './store'
 import {
   assessQuota,
@@ -26,7 +26,7 @@ import {
   type PermanentDeleteRisk,
   type RecycleManyOutcome,
 } from './recycle'
-import type { Classification, TargetDescription, TrashEntry } from './types'
+import type { BoundedMeasure, Classification, TargetDescription, TrashEntry } from './types'
 
 /** 删除请求。 */
 export interface DeleteRequest {
@@ -71,6 +71,16 @@ export interface DeleteContext {
    * 缺省按 `safe-zone` 处理（旧调用方不受影响）。
    */
   destination?: DeleteDestination
+  /**
+   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   *
+   * 回收站模式只量顶层，所以目录的 `bytes` 是下界 —— 下界没超时 `assessQuota`
+   * 只能返回 `unknown`，也就是**每次都要审批**。CLI 的审批通道恒拒绝，于是
+   * CLI 连一个几 MB 的目录都删不掉。
+   *
+   * 传了它就让判定去把不确定变成确定；不传则保持原来的保守行为。
+   */
+  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure
   /**
    * 批量交给回收站的实现（测试可注入）。
    *
@@ -483,8 +493,20 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
      * 下界没超 → **unknown**，同样要问。目录的完整大小在此模式下刻意不测，
      * 所以"不知道"才是诚实的答案。
      */
+    const isDir = description.isDirectory === true
+    /*
+     * 目录在回收站模式下只有顶层大小，是个**下界**。
+     *
+     * 下界不足时补一次有界早退枚举 —— 默认就做，不要求调用方记得传：
+     * 「选了回收站就必须真的进回收站」是配置承诺，不能因为某个调用方漏传
+     * 一个可选字段就退回「一律要审批」（终端的审批通道恒拒绝，那等于删不掉）。
+     */
+    const measure =
+      ctx.measureBounded ??
+      ((t: string, limitBytes: number): BoundedMeasure => measureTreeBounded(t, limitBytes))
     const quota = assessQuota(description.bytes, {
-      ...(description.isDirectory === true ? { sizeIsLowerBound: true } : {}),
+      ...(isDir ? { sizeIsLowerBound: true } : {}),
+      ...(isDir ? { measureBounded: (limitBytes: number) => measure(target, limitBytes) } : {}),
     })
     if (quota.status !== 'within') {
       const outcome = await ctx.requestApproval(

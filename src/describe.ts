@@ -32,6 +32,35 @@ const MAX_WALK_ENTRIES = 200_000
 export const DEFAULT_MEASURE_BUDGET_MS = 1500
 
 /**
+ * 造一个**整批共享预算**的测量函数。
+ *
+ * 每个目标各自计时会退化成「目标数 × 单次预算」的阻塞：一次调用里十个目录就是
+ * 十五秒的事件循环停顿。共享一个截止时间之后，前面的目标用掉多少，后面的就少
+ * 多少，超了退回 `incomplete` —— 保守方向不变（那仍然是按风险处理）。
+ *
+ * 放在 `describe.ts` 而不是插件入口：`delete-core` 与 `tools` 都要用它，而它们
+ * 不该 import 插件入口（那会把整份 apply 连工具注册一起拉进来）。
+ *
+ * @param budgetMs 整批可用时间。
+ * @returns 符合 `assessQuota` / `decideHookRisk` 需要的测量回调。
+ */
+export function createSharedMeasure(
+  budgetMs = DEFAULT_MEASURE_BUDGET_MS,
+): (target: string, limitBytes: number) => BoundedMeasure {
+  const deadline = Date.now() + budgetMs
+  return (target, limitBytes) => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      return {
+        kind: 'incomplete',
+        reason: `the measurement budget for this batch (${budgetMs} ms) was exhausted`,
+      }
+    }
+    return measureTreeBounded(target, limitBytes, { budgetMs: remaining })
+  }
+}
+
+/**
  * 带早退的有界枚举：只为了回答「这棵树有没有超过 `limitBytes`」。
  *
  * ## 为什么需要它（2026-11-08）

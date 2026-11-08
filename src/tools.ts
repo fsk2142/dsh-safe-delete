@@ -29,7 +29,7 @@ import {
   type DeleteRequest,
 } from './delete-core'
 import { readCleanupJob, requestCleanup } from './cleanup'
-import { describeTarget } from './describe'
+import { describeTarget, measureTreeBounded } from './describe'
 import { matchInTree, parseDuration } from './match'
 import { safeZoneBytes } from './prune'
 import type { PermanentDeleteRisk, Recycler, RecycleManyOutcome } from './recycle'
@@ -37,6 +37,7 @@ import { assessQuota } from './recycle'
 import { recycleManyToSystemBin } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
+import type { BoundedMeasure } from './types'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
@@ -168,6 +169,13 @@ export interface ToolDeps {
    * 由插件入口在 apply 时算一次传进来：命中时删除前必须问人。
    */
   permanentDeleteRisk?: PermanentDeleteRisk
+  /**
+   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   *
+   * 回收站模式只量顶层，所以目录恒为 `unknown` → 每次都要审批。不传则保持
+   * 原来的保守行为。
+   */
+  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure
   /** 当前时间（测试可注入）。 */
   now?: () => number
 }
@@ -663,13 +671,24 @@ async function deleteMany(
      * **下界**参与判定：下界已超 → over；下界没超但真实大小未知 → unknown。
      * 两者都落进 `atRisk`，都要求审批。
      */
+    const sharedMeasure =
+      ctx.measureBounded ??
+      ((t: string, limitBytes: number): BoundedMeasure => measureTreeBounded(t, limitBytes))
     const atRisk = plans
-      .map((p) => ({
-        plan: p,
-        quota: assessQuota(p.description.bytes, {
-          ...(p.description.isDirectory === true ? { sizeIsLowerBound: true } : {}),
-        }),
-      }))
+      .map((p) => {
+        const isDir = p.description.isDirectory === true
+        return {
+          plan: p,
+          quota: assessQuota(p.description.bytes, {
+            ...(isDir ? { sizeIsLowerBound: true } : {}),
+            /*
+             * 下界不足时补一次有界枚举。默认就做 —— 「选了回收站就必须真的
+             * 进回收站」是配置承诺，不该因为某个调用方漏传可选字段而失效。
+             */
+            ...(isDir ? { measureBounded: (limitBytes: number) => sharedMeasure(p.target, limitBytes) } : {}),
+          }),
+        }
+      })
       .filter((entry) => entry.quota.status !== 'within')
     if (atRisk.length > 0) {
       const sample = atRisk.slice(0, 3).map((entry) => entry.plan.target)
@@ -1070,6 +1089,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         ...(deps.permanentDeleteRisk === undefined
           ? {}
           : { permanentDeleteRisk: deps.permanentDeleteRisk }),
+        /* 有界枚举同样透传：否则这条路仍然会把每个目录判成 unknown。 */
+        ...(deps.measureBounded === undefined ? {} : { measureBounded: deps.measureBounded }),
         // 容量层已移除，所以没有容量相关的字段要传。
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,

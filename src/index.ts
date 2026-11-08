@@ -31,7 +31,7 @@ import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
 import { detectPermanentDeleteRisk, assessQuota } from './recycle'
-import { DEFAULT_MEASURE_BUDGET_MS, describeTarget, measureTreeBounded } from './describe'
+import { createSharedMeasure, describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
 import { createTools, normaliseDeleteTargets, type ApprovalOutcome, type ToolDefinition } from './tools'
@@ -357,6 +357,13 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
      * 检测函数会被 tree-shake 掉，README 的承诺就成了空话。
      */
     permanentDeleteRisk: hookPermanentDeleteRisk,
+    /*
+     * 目录配额的下界不足以判定时去实测一次（2026-11-08）。
+     *
+     * 不接线的话，`safe_delete` 删目录在 `never` 策略下永远被拒 —— 与回收站
+     * 上限多大、目录多小无关。
+     */
+    measureBounded: createSharedMeasure(),
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined
@@ -1030,10 +1037,21 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 必须传：否则用户在配置里打开了跨卷复制，`/safe-delete <跨卷路径>`
          * 仍然按禁用处理 —— 同一个开关在模型工具与斜杠命令上行为不一致。
          */
-        crossVolumeCopy: booleanOf('crossVolumeCopy', false),
-        requestApproval,
-        now: () => Date.now(),
-      })
+          /*
+           * 目的地必须传（2026-11-08）。
+           *
+           * 它此前是漏的：`deletePath` 的 `destination` 可选，缺省 `safe-zone`，
+           * 于是用户把设置改成 `recycle-bin` 之后，`/safe-delete <路径>` 仍然
+           * 把文件塞进安全区 —— 而预览文案读的是真实配置，会说「会直接移入
+           * 系统回收站」。承诺与行为相反。
+           */
+          destination: normalizeDestination(unwrap(raw['deleteDestination'])),
+          crossVolumeCopy: booleanOf('crossVolumeCopy', false),
+          /* 目录配额的下界不足以判定时，去把不确定变成确定（2026-11-08）。 */
+          measureBounded: createSharedMeasure(),
+          requestApproval,
+          now: () => Date.now(),
+        })
       if (!result.ok) return { ok: false, text: result.error }
       return {
         ok: true,
@@ -1446,32 +1464,6 @@ async function maybeRunRequestedClean(
     } catch {
       /* logger 也不可用就算了 */
     }
-  }
-}
-
-/**
- * 造一个**整批共享预算**的测量函数。
- *
- * 每个目标各自计时会退化成「目标数 × 单次预算」的阻塞：一次调用里十个目录就是
- * 十五秒的事件循环停顿。共享一个截止时间之后，前面的目标用掉多少，后面的就少
- * 多少，超了退回 `incomplete` —— 保守方向不变（那仍然是按风险处理）。
- *
- * @param budgetMs 整批可用时间。
- * @returns 符合 `decideHookRisk` 需要的测量回调。
- */
-export function createSharedMeasure(
-  budgetMs = DEFAULT_MEASURE_BUDGET_MS,
-): (target: string, limitBytes: number) => BoundedMeasure {
-  const deadline = Date.now() + budgetMs
-  return (target, limitBytes) => {
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
-      return {
-        kind: 'incomplete',
-        reason: `the measurement budget for this batch (${budgetMs} ms) was exhausted`,
-      }
-    }
-    return measureTreeBounded(target, limitBytes, { budgetMs: remaining })
   }
 }
 

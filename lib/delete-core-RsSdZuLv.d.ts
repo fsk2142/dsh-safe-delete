@@ -1,4 +1,4 @@
-import { i as TrashEntry, n as Classification, r as TargetDescription } from "./types-BXwaxl_n.js";
+import { i as TrashEntry, n as Classification, r as TargetDescription, t as BoundedMeasure } from "./types-BXwaxl_n.js";
 import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle--9MR2yeX.js";
 //#region src/classify.d.ts
 /** 分类所需的路径事实。 */
@@ -63,6 +63,16 @@ interface DeleteContext {
    * 缺省按 `safe-zone` 处理（旧调用方不受影响）。
    */
   destination?: DeleteDestination;
+  /**
+   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   *
+   * 回收站模式只量顶层，所以目录的 `bytes` 是下界 —— 下界没超时 `assessQuota`
+   * 只能返回 `unknown`，也就是**每次都要审批**。CLI 的审批通道恒拒绝，于是
+   * CLI 连一个几 MB 的目录都删不掉。
+   *
+   * 传了它就让判定去把不确定变成确定；不传则保持原来的保守行为。
+   */
+  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure;
   /**
    * 批量交给回收站的实现（测试可注入）。
    *

@@ -123,11 +123,60 @@ describe('R01: 批量删除对目录目标按 unknown 处理', () => {
     rmSync(root, { recursive: true, force: true })
   })
 
-  it('asks before sending a directory with unmeasured contents to the recycle bin', async () => {
+  /*
+   * 2026-11-08 起，「下界没超」不再等于「一律问人」：能枚举出确定大小时就
+   * 按实际值判，证明放得下就放行。但**证明不出来时**仍然必须问 —— 这条保护
+   * 没变，只是触发条件从「目录」收紧成「目录 + 测不出来」。
+   */
+  it('asks before sending a directory whose size cannot be established', async () => {
     const { createTools } = await import('../src/tools')
     const dir = join(root, 'nested-big')
     mkdirSync(join(dir, 'deep'), { recursive: true })
     writeFileSync(join(dir, 'deep', 'huge.bin'), Buffer.alloc(2048))
+
+    const asked: string[] = []
+    const tool = createTools({
+      stateDir: join(root, 'state'),
+      env: {
+        home: join(root, 'home'),
+        workdir: join(root, 'work'),
+        dshHome: join(root, 'home', '.dsh'),
+        safeZoneDir: join(root, 'state'),
+        tmpdir: join(root, 'not-the-temp'),
+      },
+      retentionDays: 1,
+      confirmFileCount: 0,
+      confirmBytes: 0,
+      crossVolumeCopy: false,
+      destination: 'recycle-bin',
+      // 枚举失败：这一条必须仍然走审批。
+      measureBounded: () => ({ kind: 'incomplete', reason: 'access denied' }),
+      requestApproval: async (text: string) => {
+        asked.push(text)
+        return 'rejected'
+      },
+      recyclerMany: () => ({ ok: true, recycled: 1 }),
+    } as never).find((t) => t.name === 'safe_delete')
+
+    expect(tool).toBeDefined()
+    const result = (await tool!.execute({ path: dir } as never)) as { ok: boolean; error?: string }
+
+    expect(asked.length, '大小证明不出来时必须先问').toBeGreaterThan(0)
+    // 用户拒绝 → 什么都不动。
+    expect(result.ok).toBe(false)
+  })
+
+  /*
+   * 反面：目录真的很小、而枚举证明了这一点时，不该再弹卡。
+   *
+   * 这正是「两个选项」里那个 `recycle-bin` 的意义 —— 选了它就必须真的进
+   * 回收站，不能因为目标恰好是个目录就永远删不掉。
+   */
+  it('does not ask when the enumeration proves the directory fits', async () => {
+    const { createTools } = await import('../src/tools')
+    const dir = join(root, 'small')
+    mkdirSync(join(dir, 'deep'), { recursive: true })
+    writeFileSync(join(dir, 'deep', 'tiny.bin'), Buffer.alloc(64))
 
     const asked: string[] = []
     const tool = createTools({
@@ -151,11 +200,9 @@ describe('R01: 批量删除对目录目标按 unknown 处理', () => {
       recyclerMany: () => ({ ok: true, recycled: 1 }),
     } as never).find((t) => t.name === 'safe_delete')
 
-    expect(tool).toBeDefined()
     const result = (await tool!.execute({ path: dir } as never)) as { ok: boolean; error?: string }
 
-    expect(asked.length, '目录内容大小未知时必须先问').toBeGreaterThan(0)
-    // 用户拒绝 → 什么都不动。
-    expect(result.ok).toBe(false)
+    expect(asked.length, '实测远低于上限，不该再问').toBe(0)
+    expect(result.ok, '证明放得下就该真的删掉').toBe(true)
   })
 })

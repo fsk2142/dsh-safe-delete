@@ -18,7 +18,8 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { createSharedMeasure, decideHookRisk } from '../src/index'
+import { createSharedMeasure } from '../src/describe'
+import { decideHookRisk } from '../src/index'
 import { resetQuotaCache } from '../src/recycle'
 
 const MB = 1024 * 1024
@@ -127,3 +128,4 @@ describe('整批共享预算，避免「目标数 × 单次预算」的阻塞', 
     expect(result.kind === 'incomplete' && result.reason).toMatch(/budget/i)
   })
 })
+
