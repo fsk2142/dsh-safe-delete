@@ -137,6 +137,36 @@ describe('measureTreeBounded：无法证明 → incomplete', () => {
     const result = measureTreeBounded(root, 1_000_000, { maxEntries: 1 })
     expect(result.kind).toBe('incomplete')
   })
+
+  /*
+   * 这个函数在钩子里是**同步**跑的，几万个条目就是几秒的事件循环阻塞。
+   * 预算耗尽必须退回 incomplete，而不是继续走完。
+   */
+  it('returns incomplete when the wall-clock budget is exhausted', () => {
+    const root = scratch()
+    writeSized(path.join(root, 'a.txt'), 10)
+
+    const result = measureTreeBounded(root, 1_000_000, { budgetMs: 0 })
+    expect(result.kind).toBe('incomplete')
+    expect(result.kind === 'incomplete' && result.reason).toMatch(/budget|within/i)
+  })
+
+  it('stops walking as soon as the budget runs out mid-traversal', () => {
+    const root = scratch()
+    for (let i = 0; i < 600; i += 1) {
+      writeSized(path.join(root, `f${i}.bin`), 1)
+    }
+    // 时钟每次读都往前走：第 256 个条目处必然超时。
+    let ticks = 0
+    const result = measureTreeBounded(root, 1_000_000, {
+      now: () => {
+        ticks += 1
+        return ticks * 10_000
+      },
+    })
+    expect(result.kind).toBe('incomplete')
+    expect(ticks, '不该等到走完全部 600 个条目').toBeLessThan(590)
+  })
 })
 
 describe('assessQuota：下界 + 有界枚举 = 确定结论', () => {

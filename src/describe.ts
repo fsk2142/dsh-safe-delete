@@ -21,6 +21,17 @@ const MAX_TOP_ENTRIES = 20
 const MAX_WALK_ENTRIES = 200_000
 
 /**
+ * 有界枚举的墙钟预算。
+ *
+ * 这个函数在钩子里**同步**跑，而钩子对每次工具调用都要跑一遍 —— 几万个条目的
+ * `lstatSync` 就是几秒的事件循环阻塞。超时退回 `incomplete`（按风险处理），
+ * 比"卡住所有工具调用"要好。
+ *
+ * 1.5 s 的取法：实测 2238 个文件 39 ms，十万级目录才会接近这个量级。
+ */
+export const DEFAULT_MEASURE_BUDGET_MS = 1500
+
+/**
  * 带早退的有界枚举：只为了回答「这棵树有没有超过 `limitBytes`」。
  *
  * ## 为什么需要它（2026-11-08）
@@ -34,7 +45,7 @@ const MAX_WALK_ENTRIES = 200_000
  *
  *   - 累计一旦超过上限就立刻停 → `over`（此时继续走没有任何价值）；
  *   - 走完都没超 → `exact`（确定放得进去）；
- *   - 出错 / 撞到条目上限 → `incomplete`（仍然按风险处理）。
+ *   - 出错 / 撞到条目上限 / 预算耗尽 → `incomplete`（仍然按风险处理）。
  *
  * 代价只落在「确实小于上限」的目录上，而那正是删除时本来就要遍历的树。
  *
@@ -44,14 +55,30 @@ const MAX_WALK_ENTRIES = 200_000
  * @param absPath 目录绝对路径（也接受单文件）。
  * @param limitBytes 配额上限（字节）。
  * @param options.maxEntries 条目上限，用于测试与极端目录保护。
+ * @param options.budgetMs 墙钟预算（毫秒），见 `DEFAULT_MEASURE_BUDGET_MS`。`0` 表示直接放弃。
+ * @param options.now 时钟，测试注入。
  * @returns 三态结论。
  */
 export function measureTreeBounded(
   absPath: string,
   limitBytes: number,
-  options: { maxEntries?: number } = {},
+  options: { maxEntries?: number; budgetMs?: number; now?: () => number } = {},
 ): BoundedMeasure {
   const maxEntries = options.maxEntries ?? MAX_WALK_ENTRIES
+  const budgetMs = options.budgetMs ?? DEFAULT_MEASURE_BUDGET_MS
+  const clock = options.now ?? Date.now
+
+  if (budgetMs <= 0) {
+    return { kind: 'incomplete', reason: 'no time budget was available to measure the tree' }
+  }
+  const deadline = clock() + budgetMs
+  const exhausted = (): BoundedMeasure | undefined =>
+    clock() > deadline
+      ? {
+          kind: 'incomplete',
+          reason: `the tree could not be measured within ${budgetMs} ms, so its total size is unknown`,
+        }
+      : undefined
 
   let rootStat
   try {
@@ -69,6 +96,8 @@ export function measureTreeBounded(
   let visited = 0
 
   while (pending.length > 0) {
+    const over = exhausted()
+    if (over !== undefined) return over
     const current = pending.pop() as string
     let names: string[]
     try {
@@ -85,6 +114,11 @@ export function measureTreeBounded(
           kind: 'incomplete',
           reason: `the tree exceeded ${maxEntries} entries, so its total size could not be established`,
         }
+      }
+      // 每 256 个条目看一次表，避免把 Date.now() 的成本摊到每个条目上。
+      if ((visited & 0xff) === 0) {
+        const over = exhausted()
+        if (over !== undefined) return over
       }
       visited += 1
       const full = path.join(current, name)
@@ -179,9 +213,8 @@ export function shallowBytes(dir: string): number {
  *
  * 递归统计是「删之前让你看清」的代价：每个条目一次 `lstatSync`，全在审批
  * 卡片出现**之前**同步跑完。回收站模式不需要这两个数字（它也不做按大小的
- * 确认），所以允许跳过 —— 目录只读顶层一层，`bytes`/`fileCount` 记 0 并带
- * `statsOmitted: true`（`bytes` 仍取 `shallowBytes` 的下界，好让配额判定
- * 至少能覆盖「顶层有个巨大文件」）。
+ * 确认），所以允许跳过 —— 目录只读顶层一层，`fileCount` 记 0，`bytes` 取
+ * `shallowBytes` 的下界，并带 `statsOmitted: true`。
  *
  * 顶层使用 `lstatSync`，链接只描述自身；单文件保留实际大小，跳过反而
  * 让「删一个 3 GB 镜像」显示成「0 条目 0 B」。

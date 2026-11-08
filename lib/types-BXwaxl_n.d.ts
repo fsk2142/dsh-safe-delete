@@ -21,14 +21,15 @@ interface TargetDescription {
   fileCount: number;
   topEntries: string[];
   truncated: boolean;
+  /** 遍历撞到工作量上限，或有条目读不到 —— 此时 `bytes` 不是精确值。 */
+  statsIncomplete?: boolean;
   /**
    * 目录统计被跳过（回收站模式）。
    *
-   * 为 `true` 时 `bytes` 与 `fileCount` 都是 0，**不代表目标真的是空的** ——
-   * 只是没去数。显示层必须据此改写文案，不能报「0 个文件」。
+   * 为 `true` 时 `fileCount` 是 0，`bytes` 只等于**顶层直接子项**之和，
+   * 也就是说它是一个**下界** —— 不代表目标真的只有这么大。显示层必须据此
+   * 改写文案，不能报「0 个文件」。
    */
-  /** Traversal hit its work limit or could not inspect part of the tree. */
-  statsIncomplete?: boolean;
   statsOmitted?: boolean;
 }
 /**

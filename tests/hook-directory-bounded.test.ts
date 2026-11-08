@@ -18,7 +18,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { decideHookRisk } from '../src/index'
+import { createSharedMeasure, decideHookRisk } from '../src/index'
 import { resetQuotaCache } from '../src/recycle'
 
 const MB = 1024 * 1024
@@ -101,5 +101,29 @@ describe('目录 + 下界 + 有界测量：能证明放得下就放行', () => {
 
     expect(verdict.kind).toBe('next')
     expect(calls, '确定大小的文件不该再付一次遍历').toBe(1)
+  })
+})
+
+describe('整批共享预算，避免「目标数 × 单次预算」的阻塞', () => {
+  it('gives every target the same shrinking budget instead of a fresh one each', () => {
+    const measure = createSharedMeasure(0)
+    const verdict = decideHookRisk({
+      destination: 'recycle-bin',
+      permanentDeleteRisk: safePolicy,
+      targets: ['C:\\a', 'C:\\b'],
+      sizes: [0, 0],
+      lowerBoundFlags: [true, true],
+      measureBounded: measure,
+    })
+
+    // 预算为 0：两次测量都应立刻放弃，于是按风险处理。
+    expect(verdict.kind).toBe('ask')
+  })
+
+  it('reports an exhausted batch budget rather than silently allowing', () => {
+    const measure = createSharedMeasure(0)
+    const result = measure('C:\\a', 1000)
+    expect(result.kind).toBe('incomplete')
+    expect(result.kind === 'incomplete' && result.reason).toMatch(/budget/i)
   })
 })

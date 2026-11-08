@@ -1,5 +1,5 @@
-import { t as BoundedMeasure } from "./types-CPMa0scL.js";
-import { r as DeleteDestination } from "./delete-core-NoipwHvs.js";
+import { t as BoundedMeasure } from "./types-BXwaxl_n.js";
+import { r as DeleteDestination } from "./delete-core-JUdgiG8q.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**
@@ -217,6 +217,17 @@ export interface PluginContext {
  * 插件入口。任何注册异常都在这里被吞掉并记日志 —— 见文件头「fail-soft」。
  */
 export declare function apply(ctx: PluginContext, config?: SafeDeleteConfig): void;
+/**
+ * 造一个**整批共享预算**的测量函数。
+ *
+ * 每个目标各自计时会退化成「目标数 × 单次预算」的阻塞：一次调用里十个目录就是
+ * 十五秒的事件循环停顿。共享一个截止时间之后，前面的目标用掉多少，后面的就少
+ * 多少，超了退回 `incomplete` —— 保守方向不变（那仍然是按风险处理）。
+ *
+ * @param budgetMs 整批可用时间。
+ * @returns 符合 `decideHookRisk` 需要的测量回调。
+ */
+export declare function createSharedMeasure(budgetMs?: number): (target: string, limitBytes: number) => BoundedMeasure;
 /**
  * 钩子层的「这次删除会不可恢复」判定。
  *

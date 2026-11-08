@@ -31,7 +31,7 @@ import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
 import { detectPermanentDeleteRisk, assessQuota } from './recycle'
-import { describeTarget, measureTreeBounded } from './describe'
+import { DEFAULT_MEASURE_BUDGET_MS, describeTarget, measureTreeBounded } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
 import { createTools, normaliseDeleteTargets, type ApprovalOutcome, type ToolDefinition } from './tools'
@@ -710,10 +710,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          *
          * 只在 `never` 下传：其余策略里 `ask` 本来就能弹卡，没有理由为了一次
          * 审批去遍历整棵树。
+         *
+         * 预算在**整批内共享**：一次调用里十个目录各自 1.5 s 会变成 15 s 的
+         * 事件循环阻塞，那不是"慢一点"，是所有工具调用都停住。共享之后，超过
+         * 预算的目标退回 `incomplete`（按风险处理），结论仍然保守。
          */
-        ...(approvalPolicy(session) === 'never'
-          ? { measureBounded: (target: string, limitBytes: number) => measureTreeBounded(target, limitBytes) }
-          : {}),
+        ...(approvalPolicy(session) === 'never' ? { measureBounded: createSharedMeasure() } : {}),
       })
       if (riskVerdict.kind === 'ask') {
         /*
@@ -1444,6 +1446,32 @@ async function maybeRunRequestedClean(
     } catch {
       /* logger 也不可用就算了 */
     }
+  }
+}
+
+/**
+ * 造一个**整批共享预算**的测量函数。
+ *
+ * 每个目标各自计时会退化成「目标数 × 单次预算」的阻塞：一次调用里十个目录就是
+ * 十五秒的事件循环停顿。共享一个截止时间之后，前面的目标用掉多少，后面的就少
+ * 多少，超了退回 `incomplete` —— 保守方向不变（那仍然是按风险处理）。
+ *
+ * @param budgetMs 整批可用时间。
+ * @returns 符合 `decideHookRisk` 需要的测量回调。
+ */
+export function createSharedMeasure(
+  budgetMs = DEFAULT_MEASURE_BUDGET_MS,
+): (target: string, limitBytes: number) => BoundedMeasure {
+  const deadline = Date.now() + budgetMs
+  return (target, limitBytes) => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      return {
+        kind: 'incomplete',
+        reason: `the measurement budget for this batch (${budgetMs} ms) was exhausted`,
+      }
+    }
+    return measureTreeBounded(target, limitBytes, { budgetMs: remaining })
   }
 }
 
