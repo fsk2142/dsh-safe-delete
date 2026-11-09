@@ -26,7 +26,7 @@
  * 目标目录默认是 desktop profile，可用第一个参数覆盖。
  */
 
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -73,8 +73,8 @@ if (!existsSync(target)) {
   process.exit(1)
 }
 
+/** 源目录的顶层条目名：决定要复制什么、以及目标里哪些是陈旧的。 */
 const srcNames = new Set(readdirSync(SRC_LIB))
-const dstNames = readdirSync(dstLib)
 
 // 1. 删除目标里多余的陈旧文件（路径必须在 dstLib 之内）。
 const resolvedLib = resolve(dstLib)
@@ -104,50 +104,133 @@ let recycled = 0
 let kept = 0
 /** 保留下来的文件及原因，供用户判断。 */
 const keptReasons = []
-for (const name of dstNames) {
-  if (srcNames.has(name)) continue
-  const full = resolve(join(dstLib, name))
-  // 双保险：只删 dstLib 下的东西。
-  if (!isUnder(full, resolvedLib)) {
-    console.error(`跳过越界路径：${full}`)
-    continue
-  }
-  removedBytes += statSync(full).size
 
-  /*
-   * 先试系统回收站。**失败就留着并报告，不再硬删**
-   * （2026-10-30 复审 SD-O3）。
-   *
-   * ## 为什么改掉了"失败才硬删"
-   *
-   * 第一版的理由是"构建产物是已验证不可达的陈旧文件，硬删可接受"。
-   * 但那个理由有两个漏洞：
-   *
-   * 1. **"已验证不可达"是针对构建产物的判断，不是针对这一份文件的判断**。
-   *    安装目录里可能混有人工补丁、本地调试改动、或别的工具放进来的文件 ——
-   *    它们同样会出现在 lib/ 里。
-   * 2. 回收站不可用**恰好**是"这台机器上文件操作不太正常"的信号。在那种
-   *    时刻选择永久删除，方向反了。
-   *
-   * 现在：回收失败 → 保留文件、计入 `kept`、打印原因。同步可能因此留下
-   * 几个陈旧 chunk，那是可见的小麻烦；永久删掉一份不可恢复的文件，是不可见的大麻烦。
-   *
-   * `moveToSystemRecycleBin` 是同步函数且自带熔断，不会拖慢大批量。
-   */
-  const outcome = moveToSystemRecycleBin(full)
-  if (outcome.ok) {
-    recycled += 1
-    removed += 1
-  } else {
+/**
+ * 把目标里"源目录没有的条目"逐层处理掉。
+ *
+ * ## 为什么必须递归（2026-11-09）
+ *
+ * chunk 挪进 `lib/chunks/` 之后，只比顶层就看不见子目录里的东西：源目录的
+ * `chunks` 项在目标里也存在（名字相同），于是整个子目录被跳过 ——
+ * 而里面可能躺着上一版留下的 `store-OLDHASH.js`。它们不影响运行（无人 import），
+ * 但会让人以为"两套并存"。
+ *
+ * @param sourceDir 源目录（构建产物）；传 `null` 表示"这一整棵在源里不存在"。
+ * @param destDir 目标目录（安装副本）。
+ * @param depth 当前深度，只用于日志缩进。
+ */
+function pruneStale(sourceDir, destDir, depth = 0) {
+  let destNames
+  try {
+    destNames = readdirSync(destDir)
+  } catch {
+    return
+  }
+  // 源整棵不存在（`null`）：目标这边全都是陈旧的。
+  const srcNames =
+    sourceDir === null ? new Set() : new Set(readdirSync(sourceDir, { withFileTypes: true }).map((e) => e.name))
+  for (const name of destNames) {
+    const full = resolve(join(destDir, name))
+    // 双保险：只动 dstLib 之内的东西。
+    if (!isUnder(full, resolvedLib)) {
+      console.error(`跳过越界路径：${full}`)
+      continue
+    }
+    if (srcNames.has(name)) {
+      // 两边都有：源是目录就继续往下比，源是文件就不动（覆盖在后面做）。
+      const srcChild = join(sourceDir, name)
+      if (statSync(full, { throwIfNoEntry: false })?.isDirectory() === true) {
+        if (statSync(srcChild, { throwIfNoEntry: false })?.isDirectory() === true) {
+          pruneStale(srcChild, full, depth + 1)
+        }
+      }
+      continue
+    }
+
+    // 只有目标里有 —— 陈旧条目。
+    const st = statSync(full, { throwIfNoEntry: false })
+    if (st === undefined) continue
+    if (st.isDirectory()) {
+      /*
+       * 整个子目录都不在源里：逐个文件走回收站，最后清掉空目录。
+       *
+       * 不直接 `rm -rf` —— 那条路径会把"回收失败就保留"的保护一起绕过。
+       */
+      for (const child of readdirSync(full)) {
+        const childFull = join(full, child)
+        const childSt = statSync(childFull, { throwIfNoEntry: false })
+        if (childSt === undefined) continue
+        if (childSt.isDirectory()) {
+          // 嵌套目录：整棵都不在源里，按空源目录递归处理。
+          pruneStale(null, childFull, depth + 1)
+          continue
+        }
+        removedBytes += childSt.size
+        const outcome = moveToSystemRecycleBin(childFull)
+        if (outcome.ok) {
+          recycled += 1
+          removed += 1
+        } else {
+          kept += 1
+          keptReasons.push(`${child} — ${outcome.reason}`)
+        }
+      }
+      // 目录空了就移除；还有残留（回收失败）就留着。
+      try {
+        /*
+         * 用 `rmdirSync` 而不是 `rmSync(..., { recursive: false })`。
+         *
+         * Node 22+ 里后者对**目录**直接报 `ERR_FS_EISDIR`（"Path is a directory"），
+         * 于是空目录永远删不掉 —— 实测删完 `oldsub2` 里的文件之后，那个空目录
+         * 仍留在原地。`rmdirSync` 才是"删一个空目录"的正确 API；非空时报
+         * `ENOTEMPTY`，那正是想要的保护（有残留就留着）。
+         */
+        if (readdirSync(full).length === 0) rmdirSync(full)
+      } catch {
+        /* 留着一个空目录不影响运行 */
+      }
+      continue
+    }
+
+    removedBytes += st.size
+
     /*
-     * 留在原地，让用户看到并自行决定。
+     * 先试系统回收站。**失败就留着并报告，不再硬删**
+     * （2026-10-30 复审 SD-O3）。
      *
-     * 不抛错中断整个同步 —— 那会让"一个陈旧文件回收失败"挡住其余的正常清理。
+     * ## 为什么改掉了"失败才硬删"
+     *
+     * 第一版的理由是"构建产物是已验证不可达的陈旧文件，硬删可接受"。
+     * 但那个理由有两个漏洞：
+     *
+     * 1. **"已验证不可达"是针对构建产物的判断，不是针对这一份文件的判断**。
+     *    安装目录里可能混有人工补丁、本地调试改动、或别的工具放进来的文件 ——
+     *    它们同样会出现在 lib/ 里。
+     * 2. 回收站不可用**恰好**是"这台机器上文件操作不太正常"的信号。在那种
+     *    时刻选择永久删除，方向反了。
+     *
+     * 现在：回收失败 → 保留文件、计入 `kept`、打印原因。同步可能因此留下
+     * 几个陈旧 chunk，那是可见的小麻烦；永久删掉一份不可恢复的文件，是不可见的大麻烦。
+     *
+     * `moveToSystemRecycleBin` 是同步函数且自带熔断，不会拖慢大批量。
      */
-    kept += 1
-    keptReasons.push(`${full.split(/[\\/]/).pop()} — ${outcome.reason}`)
+    const outcome = moveToSystemRecycleBin(full)
+    if (outcome.ok) {
+      recycled += 1
+      removed += 1
+    } else {
+      /*
+       * 留在原地，让用户看到并自行决定。
+       *
+       * 不抛错中断整个同步 —— 那会让"一个陈旧文件回收失败"挡住其余的正常清理。
+       */
+      kept += 1
+      keptReasons.push(`${full.split(/[\\/]/).pop()} — ${outcome.reason}`)
+    }
   }
 }
+
+pruneStale(SRC_LIB, dstLib)
 
 // 2. 覆盖复制构建产物。
 let copied = 0
