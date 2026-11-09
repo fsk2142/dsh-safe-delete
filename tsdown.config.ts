@@ -64,6 +64,21 @@ const hostConfig: UserConfig = {
      * `Cannot find module`。
      */
     'cleanup-run': 'src/cleanup-run.ts',
+    /*
+     * `describe` 也必须是独立入口（2026-11-09）。
+     *
+     * `bin/dsh-safe-delete.mjs` 用 `import('../lib/describe.js')` 拿
+     * `createSharedMeasure` —— 目录配额判定的有界枚举要用它。漏了这个入口，
+     * bundle 照样成功（代码被并进 `index.js`），但那个文件根本不存在，
+     * CLI 的 `delete` 在真机上直接崩：
+     *
+     * ```
+     * Cannot find module '.../lib/describe.js' imported from bin/dsh-safe-delete.mjs
+     * ```
+     *
+     * 这正是上面注释说的那件事：**构建通过不代表那个文件作为独立模块存在**。
+     */
+    describe: 'src/describe.ts',
   },
   outDir: 'lib',
   format: 'esm',
