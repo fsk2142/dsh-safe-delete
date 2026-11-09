@@ -26,7 +26,7 @@
  * 目标目录默认是 desktop profile，可用第一个参数覆盖。
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -152,7 +152,21 @@ for (const name of dstNames) {
 // 2. 覆盖复制构建产物。
 let copied = 0
 for (const name of srcNames) {
-  copyFileSync(join(SRC_LIB, name), join(dstLib, name))
+  /*
+   * **必须处理子目录**（2026-11-09，与 `chunkFileNames: 'chunks/[name].js'` 同批改）。
+   *
+   * 第一版无条件 `copyFileSync(join(SRC_LIB, name), join(dstLib, name))`。
+   * 在 chunk 平铺于 `lib/` 根目录时没问题 —— 那个目录里只有文件。改成
+   * `lib/chunks/` 之后，`readdirSync` 会返回一个目录名，而 `copyFileSync`
+   * 对目录抛 `EPERM`，整个同步在最后一步崩掉（前面的删除已经执行完，
+   * 于是安装目录停在"删了旧的、没复制新的"这个状态）。
+   *
+   * 实测复现：`sync-install.mjs` → EPERM copyfile lib\\chunks。
+   *
+   * `cpSync` 的 `recursive: true` 对**文件**同样有效（只是不递归），所以两条路
+   * 合并成一次调用，不需要判断类型。
+   */
+  cpSync(join(SRC_LIB, name), join(dstLib, name), { recursive: true })
   copied += 1
 }
 
