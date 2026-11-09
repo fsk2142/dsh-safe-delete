@@ -1,4 +1,4 @@
-import { i as TrashEntry } from "./types-BXwaxl_n.js";
+import { i as TrashEntry } from "./chunks/types.js";
 //#region src/prune.d.ts
 /** 清理策略的输入。 */
 export interface PruneOptions {

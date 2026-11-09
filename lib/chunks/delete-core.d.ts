@@ -1,5 +1,5 @@
-import { i as TrashEntry, n as Classification, r as TargetDescription, t as BoundedMeasure } from "./types-BXwaxl_n.js";
-import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle--9MR2yeX.js";
+import { i as TrashEntry, n as Classification, r as TargetDescription, t as BoundedMeasure } from "./types.js";
+import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle.js";
 //#region src/classify.d.ts
 /** 分类所需的路径事实。 */
 interface ClassifyEnv {

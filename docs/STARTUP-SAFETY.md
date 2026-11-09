@@ -16,9 +16,13 @@
 
 | 来源 | 包 |
 |---|---|
-| 本包内部 | `./audit.js`、`./delete-core-*.js`、`./store-*.js`、`./tools.js` |
+| 本包内部 | `./audit.js`、`./delete-core.js`、`./chunks/store.js`、`./chunks/tools.js` |
 | 运行时内置 | `node:fs`、`node:os`、`node:path` |
 | 宿主 peer | `@deepseek-ai/schemastery`（`^3.18.2`） |
+
+> chunk 文件名**不带内容哈希**（2026-11-09 起；原因见 `tsdown.config.ts` 的
+> `chunkFileNames`）。早于该版本的安装目录里可能出现 `./store-ABC123.js` 这类
+> 带哈希的名字 —— 那是旧产物，升级后会被覆盖。
 
 唯一的宿主依赖是 `schemastery`。
 

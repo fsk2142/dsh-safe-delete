@@ -1,5 +1,5 @@
-import { t as BoundedMeasure } from "./types-BXwaxl_n.js";
-import { r as DeleteDestination } from "./delete-core-RsSdZuLv.js";
+import { t as BoundedMeasure } from "./chunks/types.js";
+import { r as DeleteDestination } from "./chunks/delete-core.js";
 import z from "@deepseek-ai/schemastery";
 //#region src/config.d.ts
 /**

@@ -603,6 +603,13 @@ node scripts/sync-install.mjs    # 复制到 profile，陈旧 chunk 走回收站
 # 然后重启 DSH
 ```
 
+> **2026-11-09 起 chunk 名不带哈希**（见 `tsdown.config.ts` 的 `chunkFileNames`）。
+> 在此之前，构建产物叫 `store-B14ysChF.js` 这种形状，每次构建都换一批新名字；
+> 于是 `sync-install.mjs` 会把 profile 里的 chunk 全换成"本地构建的那一套"，
+> 而 `package.json` 版本号没变 —— 插件管理器再装同一 spec 时 pnpm 判定
+> 「已是最新」，直接跳过，安装目录就**永久停在半套文件**的状态（只能 `--force` 修）。
+> 现在名字固定为 `chunks/store.js`，本地构建与 tarball 产生同一组名字，覆盖是安全的。
+
 ### 发版
 
 ```bash

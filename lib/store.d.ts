@@ -1,5 +1,5 @@
-import { i as TrashEntry, r as TargetDescription } from "./types-BXwaxl_n.js";
-import { r as Recycler } from "./recycle--9MR2yeX.js";
+import { i as TrashEntry, r as TargetDescription } from "./chunks/types.js";
+import { r as Recycler } from "./chunks/recycle.js";
 //#region src/store.d.ts
 /** 移入选项。 */
 export interface MoveOptions {

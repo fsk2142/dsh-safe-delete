@@ -75,6 +75,50 @@ const hostConfig: UserConfig = {
   // 且 cordis.patch.yml 按包名解析 main → lib/index.js。
   fixedExtension: false,
   deps: { neverBundle: HOST_PROVIDED },
+  /**
+   * chunk 文件名**不带内容哈希**（2026-11-09 修）。
+   *
+   * ## 为什么
+   *
+   * tsdown 默认给被共享的模块起名 `store-B14ysChF.js` —— 后缀是内容哈希。
+   * 于是**每次构建都会产生一批新文件名**，而 `lib/` 是提交进 git 的，
+   * 每个版本带着自己那一套名字：
+   *
+   * ```
+   * 2.3.0 发布时：store-CwWWfFFR.js  tools--GeJEyQY.js
+   * 2.3.1 构建后：store-B14ysChF.js  tools-DVoS58JJ.js
+   * ```
+   *
+   * 这在「本地构建直接同步进 profile」的工作流下会**把安装目录弄坏**：
+   *
+   * 1. `scripts/sync-install.mjs` 先删掉目标里"源目录没有"的文件，再覆盖复制；
+   * 2. 于是安装目录里的 chunk 换成了本地构建的名字，`index.js` 也跟着换了版本，
+   *    它 `import "./store-B14ysChF.js"`；
+   * 3. 但 `package.json` 版本号仍与 GitHub 上的 tarball 相同；
+   * 4. 插件管理器再装同一 spec 时，pnpm 看到版本未变 → 跳过 → **文件永久缺失**。
+   *
+   * 实测复现过：装完是好的，跑一次 `sync:install` 之后 `index.js` 引用的两个
+   * chunk 就不存在了，且再装同一 spec 也修不回来（只能 `--force`）。
+   *
+   * ## 为什么去掉哈希就够了
+   *
+   * 文件名稳定之后，本地构建与 tarball 产生的是**同一组名字**：覆盖是安全的，
+   * `sync-install` 没有"源目录没有"的文件可删，两边内容差异也只表现为覆盖。
+   *
+   * 缓存失效不是问题：宿主按文件系统加载，不缓存 ESM 模块的文件名。
+   *
+   * ## 之前试过但不行的写法
+   *
+   * `chunkFileNames: 'chunks/[name]-[hash].js'` —— tsdown **直接忽略**这个选项，
+   * 产物名完全没变。保留 `[name]`、去掉 `[hash]` 才生效（实测两次构建 +
+   * 改两行源码再构建，文件名都不变）。
+   *
+   * ## 子目录是必要的
+   *
+   * 不能写成 `'[name].js'`（平铺回 `lib/`）：`store.js` / `tools.js` 这些名字
+   * 已经被**入口 shim** 占用，chunk 撞名会互相覆盖。`chunks/` 子目录天然隔离。
+   */
+  outputOptions: { chunkFileNames: 'chunks/[name].js' },
 }
 
 /**
