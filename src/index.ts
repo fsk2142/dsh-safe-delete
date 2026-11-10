@@ -885,8 +885,25 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
        * `never` 的语义是"不要弹窗"。而这条路径恰恰是"看不清的 rm -rf"，
        * 最该保守的时刻 —— 降级放行的理由（"没有审批通道会让任务卡住"）
        * 对只读目标成立，对已知的删除不成立。
+       *
+       * ## 只有**认出的删除**才 deny（2026-11-10 回归修复）
+       *
+       * 第一版这里无条件 deny，结果把正常调用也拒了：
+       *
+       * ```
+       * terminal_send "C:\...\launch_rebuild.bat"  → deny
+       * terminal_send "Get-Process -Name vivado"    → deny
+       * ```
+       *
+       * 根因：`parseCommand` 用 `destructive: true, target: null` 同时表达
+       * 「认出了删除但目标解析不了」和「什么都没认出来、只是证明不了无害」。
+       * 后者是"未知必须问人"的架构决定，对 `ask` 合理，但 `never` 下把
+       * **所有不在只读白名单里的命令**都拒掉，等于废掉工具调用。
+       *
+       * 现在按 `confidence` 分流：`identified` → deny（D02 要挡的正是这个）；
+       * `unverifiable` → 沿用原行为（`never` 下放行，`ask` 下问人）。
        */
-      if (policy === 'never') {
+      if (policy === 'never' && verdict.confidence === 'identified') {
         appendAudit(stateDir, {
           event: 'deny',
           tool: toolName,
@@ -906,6 +923,21 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         }
       }
       appendAudit(stateDir, { event: 'ask', tool: toolName, detail })
+      /*
+       * 走到这里有两种人：
+       *
+       * - `ask` 策略下的**任意**不可解析删除 —— 弹卡让人看原文（原有行为）；
+       * - `never` 下的**未识别**命令（`confidence === 'unverifiable'`）——
+       *   没有删除证据，也没有审批通道，放行是唯一不废掉工具调用的选择。
+       */
+      if (policy === 'never') {
+        appendAudit(stateDir, {
+          event: 'ask',
+          tool: toolName,
+          detail: `allowed under the never policy (no delete identified): ${detail}`,
+        })
+        return next()
+      }
       return {
         kind: 'ask',
         reason:

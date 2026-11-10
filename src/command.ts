@@ -2055,7 +2055,7 @@ export function parseCommand(command: string): CommandVerdict {
    * 这比在别处加一堆长度检查更可靠：所有调用方都经过这个入口。
    */
   if (raw.length > MAX_COMMAND_CHARS) {
-    return { destructive: true, kind: 'delete', recursive: false, target: null }
+    return { destructive: true, kind: 'delete', confidence: 'unverifiable', recursive: false, target: null }
   }
 
   // 去掉注释（注释里的删除字样不会执行），再做转义归一化。
@@ -2091,7 +2091,13 @@ export function parseCommand(command: string): CommandVerdict {
   // 那串字符不含删除动词，会被判成无害放行。那是真实绕过。
   if (OPAQUE_EXECUTION.some((pattern) => pattern.test(raw))) {
     const recursive = RECURSIVE_FLAGS.some((flag) => lower.includes(flag))
-    return { destructive: true, kind: 'delete', recursive, target: null }
+    /*
+     * 不透明执行是 `unverifiable`：我们**看不到**内容，不是"看到了删除"。
+     * 它必须仍然要求审批（`ask` 下会弹卡），但 `never` 下不该被当成
+     * "认出的删除"而拒绝 —— 那会把 `powershell -EncodedCommand` 之外的
+     * 正常用法一起误伤。
+     */
+    return { destructive: true, kind: 'delete', confidence: 'unverifiable', recursive, target: null }
   }
 
   // 包装器命令：`cmd /c "…"`、`sh -c "…"`、`powershell -Command "…"`、
@@ -2129,7 +2135,7 @@ export function parseCommand(command: string): CommandVerdict {
     if (isPlainlyHarmless(wrapped)) return { destructive: false }
 
     // 否则仍然要让人看一眼：内层可能有静态看不出来的构造。
-    return { destructive: true, kind: 'delete', recursive: false, target: null }
+    return { destructive: true, kind: 'delete', confidence: 'unverifiable', recursive: false, target: null }
   }
 
   // 不经过删除动词的构造（find -delete / rsync --delete / .Delete() / unlink …）。
@@ -2241,6 +2247,7 @@ export function parseCommand(command: string): CommandVerdict {
     return {
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive,
       target: targetFromPattern(commentFree, patternHit.label),
     }
@@ -2315,7 +2322,7 @@ export function parseCommand(command: string): CommandVerdict {
     // 一个 token，主循环认不出 `rm`。这类命令在 shell 里**真的会删**，
     // 所以宁可判成删除（目标不可解析 → 交给人看），也不能放行。
     if (containsDeleteCommand(text)) {
-      return { destructive: true, kind: 'delete', recursive: false, target: null }
+      return { destructive: true, kind: 'delete', confidence: 'identified', recursive: false, target: null }
     }
 
     /*
@@ -2342,7 +2349,7 @@ export function parseCommand(command: string): CommandVerdict {
      * `node -e 'm.delete("k")'` 会被当成删除（第六轮复审测过）。
      */
     if (!isContainerDeleteOnly(text) && hasCallStyleDelete(blankQuotedContent(text))) {
-      return { destructive: true, kind: 'delete', recursive: false, target: null }
+      return { destructive: true, kind: 'delete', confidence: 'identified', recursive: false, target: null }
     }
 
     /*
@@ -2363,13 +2370,13 @@ export function parseCommand(command: string): CommandVerdict {
      */
     for (const substitution of commandSubstitutions(text)) {
       if (containsDeleteCommand(substitution)) {
-        return { destructive: true, kind: 'delete', recursive: false, target: null }
+        return { destructive: true, kind: 'delete', confidence: 'identified', recursive: false, target: null }
       }
       if (tokenize(substitution).some((t) => isDeleteArgumentMarker(t))) {
-        return { destructive: true, kind: 'delete', recursive: false, target: null }
+        return { destructive: true, kind: 'delete', confidence: 'identified', recursive: false, target: null }
       }
       if (hasCallStyleDelete(blankQuotedContent(substitution))) {
-        return { destructive: true, kind: 'delete', recursive: false, target: null }
+        return { destructive: true, kind: 'delete', confidence: 'identified', recursive: false, target: null }
       }
     }
 
@@ -2424,9 +2431,18 @@ export function parseCommand(command: string): CommandVerdict {
        */
       if (inner !== null && isReadOnlyExpression(inner)) continue
       if (provenHarmless(segment)) continue
+      /*
+       * ## 这里是 `unverifiable`，不是"认出删除"（2026-11-10 回归修复）
+       *
+       * 走到这里说明既没认出删除、也没能证明无害。它必须仍然返回
+       * `destructive: true`（`ask` 下要问人），但可信度是 `unverifiable` ——
+       * 否则 `never` 策略会把 `Get-Process vivado`、`launch_rebuild.bat`
+       * 这类正常调用全部拒绝。
+       */
       return {
         destructive: true,
         kind: 'delete',
+        confidence: 'unverifiable',
         recursive: RECURSIVE_FLAGS.some((flag) => tokens.includes(flag)),
         target: targetFromPattern(text, 'unverifiable command') ?? null,
       }
@@ -2450,10 +2466,16 @@ export function parseCommand(command: string): CommandVerdict {
   // 函数式调用：目标取第一个字符串字面量参数。
   const callTarget = extractCallLiteral(text)
   if (callTarget !== null) {
-    return { destructive: true, kind: 'delete', recursive, target: callTarget }
+    return { destructive: true, kind: 'delete', confidence: 'identified', recursive, target: callTarget }
   }
 
-  return { destructive: true, kind: 'delete', recursive, target: targetAfterVerb(tokens, verbIndex, text) }
+  return {
+    destructive: true,
+    kind: 'delete',
+    confidence: 'identified',
+    recursive,
+    target: targetAfterVerb(tokens, verbIndex, text),
+  }
 }
 
 /**

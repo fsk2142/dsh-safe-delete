@@ -6,11 +6,31 @@ export type Classification = 'free' | 'confirm' | 'protected'
  *
  * `target` 为 `null` 表示「命令里有删除动作，但目标无法静态解析」（shell 变量、
  * 管道、通配符、命令替换）。这类情况不是要拒绝，而是要问人 —— 见 `parseCommand`。
+ *
+ * ## `confidence` 为什么必须有（2026-11-10 回归修复）
+ *
+ * 同一个 `destructive: true, target: null` 被用来表达两件完全不同的事：
+ *
+ * | 实际情况 | 该有的处置 |
+ * |---|---|
+ * | **认出**了删除动作，但目标解析不了（`rm -rf "$TARGET"`） | 看不清的删除，`never` 下必须拒绝 |
+ * | **什么都没认出来**，只是没法证明它无害（`Get-Process vivado`） | 未知命令，`never` 下不该拒绝 |
+ *
+ * 第二条是 2026-11-02 的架构决定（"未知必须问人"）—— 它对 `ask` 合理：多弹一次卡。
+ * 但把两者都当"删除"处理，`never` 下就会把**所有**不在只读白名单里的命令都拒掉，
+ * 正常工具调用全废（`launch_rebuild.bat`、`Get-Process` 都被拒过）。
  */
 export interface DeleteIntent {
   kind: 'delete'
   recursive: boolean
   target: string | null
+  /**
+   * 这个判定有多可信。
+   *
+   * - `identified`：真的认出了删除构造（动词、`find -delete`、`fs.rmSync(` …）；
+   * - `unverifiable`：没认出任何删除，但也没能正向证明无害。
+   */
+  confidence: 'identified' | 'unverifiable'
 }
 
 /** `parseCommand` 的判定结果。 */

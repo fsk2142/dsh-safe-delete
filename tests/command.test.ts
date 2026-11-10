@@ -34,6 +34,7 @@ describe('parseCommand', () => {
     expect(parseCommand('Remove-Item -Recurse -Force C:\\Work\\proj\\build')).toEqual({
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive: true,
       target: 'C:\\Work\\proj\\build',
     })
@@ -43,12 +44,14 @@ describe('parseCommand', () => {
     expect(parseCommand('rd /s /q C:\\Work\\proj\\build')).toEqual({
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive: true,
       target: 'C:\\Work\\proj\\build',
     })
     expect(parseCommand('del /s C:\\Work\\proj\\build')).toEqual({
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive: true,
       target: 'C:\\Work\\proj\\build',
     })
@@ -58,6 +61,7 @@ describe('parseCommand', () => {
     expect(parseCommand('rm -rf ./build')).toEqual({
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive: true,
       target: './build',
     })
@@ -67,12 +71,14 @@ describe('parseCommand', () => {
     expect(parseCommand("fs.rmSync('C:\\\\Work\\\\a', { recursive: true })")).toEqual({
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive: true,
       target: 'C:\\Work\\a',
     })
     expect(parseCommand("shutil.rmtree('/tmp/x')")).toEqual({
       destructive: true,
       kind: 'delete',
+      confidence: 'identified',
       recursive: true,
       target: '/tmp/x',
     })
