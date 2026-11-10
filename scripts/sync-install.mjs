@@ -1,23 +1,28 @@
 #!/usr/bin/env node
 /**
- * 把构建产物同步到已安装的 profile 插件目录。
+ * 把构建产物与发布文件同步到已安装的 profile 插件目录。
  *
  * ## 为什么需要专门的脚本
  *
  * 手工 `Copy-Item lib\* <dst>\lib\` 只做**覆盖**，不删除目标目录里多余的旧文件。
- * 而构建产物的文件名带内容哈希（`store-ZBayra6Y.js`），每次构建都会变 ——
- * 于是安装目录里越积越多失效 chunk。
  *
- * 实测：经过 20 轮迭代后，安装目录 `lib/` 里积了 **21 个陈旧 chunk、404 KB**，
- * 本地只有 19 个文件。它们不被任何文件引用，不影响功能，但：
+ * ## 关于 chunk 文件名（2026-11-10 更新）
  *
- *   - 让人误判"装的是哪一版"（磁盘上同时存在好几个版本的 chunk）；
- *   - 排查问题时在错误的文件里找代码。
+ * 2.3.2 之前构建产物带内容哈希（`store-ZBayra6Y.js`），每次构建换一批名字，
+ * 于是安装目录里越积越多失效 chunk（实测 20 轮迭代后积了 21 个、404 KB）。
+ * 那正是当初写这个脚本的原因。
+ *
+ * **现在** `tsdown.config.ts` 用的是稳定名 `chunks/[name].js`，新构建不再换名字。
+ * 但历史遗留的哈希 chunk 仍可能躺在老安装目录里（缺少本脚本时积累下来的），
+ * 所以"先删目标里源目录没有的文件"这条逻辑仍然必要 —— 它清理的是**存量**，
+ * 不是新产生的。
  *
  * ## 做法
  *
- * 先删目标 `lib/` 里"源目录没有"的文件，再覆盖复制。删除前逐个确认路径在
- * 目标 `lib/` 之内，避免误删。
+ * 1. 先删目标 `lib/` 里"源目录没有"的条目，再覆盖复制构建产物。删除前逐个
+ *    确认路径在目标 `lib/` 之内，且**不是链接**（链接会让遍历跑出安装根）。
+ * 2. 按 `package.json#files` 同步其余发布文件（`bin/`、`locale/`、`docs/`、
+ *    `cordis.patch.yml`、`icon.svg` …）—— 判据是清单，不是逐条补漏。
  *
  * ## 用法
  *
@@ -26,7 +31,7 @@
  * 目标目录默认是 desktop profile，可用第一个参数覆盖。
  */
 
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -97,6 +102,67 @@ function isUnder(child, parent) {
   return c.startsWith(p + (process.platform === 'win32' ? '\\' : '/'))
 }
 
+/**
+ * 链接守卫的拒绝记录。
+ *
+ * ## 为什么必须拒绝而不是"跳过继续"（2026-11-10 复审 D05）
+ *
+ * 安装目录是插件的私有副本。里面出现符号链接 / 目录联接只有两种可能：
+ * 别的工具误放、或有人故意把 `lib/chunks` 指向外部。两种情况都不该由
+ * 同步脚本去"猜"。
+ *
+ * 实测过的越界：`mklink /J installed/lib/chunks outside` 之后，`isUnder()`
+ * 仍返回 true（词法路径在 `dstLib` 下），而 `statSync`/`readdirSync` 会走进
+ * `outside`，`pruneStale()` 把那里的 OUTSIDE_MARKER 移进了系统回收站。
+ */
+const linkRefusals = new Set()
+
+/**
+ * 判断一个条目是不是链接（符号链接 / Windows junction）。
+ *
+ * 用 `lstatSync`：它不跟随链接，报告的正是"这个条目本身是什么"。
+ *
+ * @param full 条目绝对路径。
+ * @returns 是链接时返回真。
+ */
+function isLink(full) {
+  const st = lstatSync(full, { throwIfNoEntry: false })
+  return st !== undefined && st.isSymbolicLink()
+}
+
+/**
+ * 目标目录的真实路径，用于核对"没被链接带出安装根"。
+ *
+ * @returns 真实路径；拿不到时 undefined。
+ */
+function realLibRoot() {
+  try {
+    return realpathSync(dstLib)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 一个目录的真实路径是否仍在安装根内。
+ *
+ * 词法前缀只能证明"名字看起来在里面"，而链接可以让实际位置跑到外面。
+ *
+ * @param dir 目录绝对路径。
+ * @returns 在安装根内返回真；拿不到真实路径时保守返回 false。
+ */
+function realUnderLib(dir) {
+  const root = realLibRoot()
+  if (root === undefined) return false
+  let real
+  try {
+    real = realpathSync(dir)
+  } catch {
+    return false
+  }
+  return isUnder(real, root)
+}
+
 let removed = 0
 let removedBytes = 0
 let recycled = 0
@@ -131,9 +197,37 @@ function pruneStale(sourceDir, destDir, depth = 0) {
     sourceDir === null ? new Set() : new Set(readdirSync(sourceDir, { withFileTypes: true }).map((e) => e.name))
   for (const name of destNames) {
     const full = resolve(join(destDir, name))
-    // 双保险：只动 dstLib 之内的东西。
+
+    /*
+     * ## 守卫一：只动安装根之内的东西
+     *
+     * 词法前缀（`isUnder`）只能证明"名字看起来在里面"。链接会让实际位置
+     * 跑到外面，所以这里再用 `realpathSync` 核对一次。
+     */
     if (!isUnder(full, resolvedLib)) {
       console.error(`跳过越界路径：${full}`)
+      continue
+    }
+
+    /*
+     * ## 守卫二：链接一律拒绝，绝不跟进去（2026-11-10 复审 D05）
+     *
+     * `statSync` / `readdirSync` 会**跟随**符号链接与 Windows junction。
+     * 若 `lib/chunks` 被替换成指向外部的链接，路径看着仍在 `dstLib` 下，
+     * 但遍历会走进外部目录 —— 然后对那里"源目录没有的文件"调回收站。
+     *
+     * 实测：`mklink /J installed/lib/chunks outside` 之后跑真实脚本，
+     * `outside/OUTSIDE_MARKER.txt` 确实被移进了系统回收站。
+     *
+     * 安装目录里出现链接本身就是异常信号，没有"猜一个合理动作"的余地：
+     * 拒绝该条目、记下来、继续处理其他条目，最后统一报告。
+     */
+    if (isLink(full)) {
+      linkRefusals.add(full)
+      continue
+    }
+    if (!realUnderLib(destDir)) {
+      linkRefusals.add(destDir)
       continue
     }
     if (srcNames.has(name)) {
@@ -158,6 +252,15 @@ function pruneStale(sourceDir, destDir, depth = 0) {
        */
       for (const child of readdirSync(full)) {
         const childFull = join(full, child)
+        /*
+         * 子条目同样要防链接：`statSync` 会跟随，`lstatSync` 不会。
+         * 一个指向外部的链接若被当作普通文件，下一行就会把**外部**那个
+         * 东西送进回收站。
+         */
+        if (isLink(childFull)) {
+          linkRefusals.add(childFull)
+          continue
+        }
         const childSt = statSync(childFull, { throwIfNoEntry: false })
         if (childSt === undefined) continue
         if (childSt.isDirectory()) {
@@ -249,30 +352,76 @@ for (const name of srcNames) {
    * `cpSync` 的 `recursive: true` 对**文件**同样有效（只是不递归），所以两条路
    * 合并成一次调用，不需要判断类型。
    */
-  cpSync(join(SRC_LIB, name), join(dstLib, name), { recursive: true })
+  /*
+   * 目标位置若已经是链接，`cpSync` 会往链接指向的目录里写 —— 又一个越界路径
+   * （与 `pruneStale` 那条同源）。先看它是什么，是链接就拒绝。
+   */
+  const destination = join(dstLib, name)
+  if (isLink(destination)) {
+    linkRefusals.add(destination)
+    continue
+  }
+  cpSync(join(SRC_LIB, name), destination, { recursive: true })
   copied += 1
 }
 
-// 3. 同步 package.json 与 README（版本号要跟着走）。
-for (const name of ['package.json', 'README.md']) {
+/*
+ * 3. 同步**发布清单**里的文件（2026-11-10 复审 D06）。
+ *
+ * 这里原来只同步 `package.json` / `README.md` / `docs/`。而 `package.json#files`
+ * 声明了更多：`bin/`、`locale/`、`cordis.patch.yml`、`icon.svg`。缺任何一项的后果
+ * 都是「本地构建与发布包行为不一致」：
+ *
+ *   - `locale/` 缺 → 插件页 `meta.detail` 读不到，详情页报 invalid；
+ *   - `bin/` 缺 → CLI 是旧版（或根本没有）；
+ *   - 其余缺 → 图标/补丁不同步，看起来像另一个版本的插件。
+ *
+ * 判据是**清单本身**，不是逐条补漏：新增发布文件时只要它在 `files` 里，
+ * 这里就会带上它。
+ */
+const manifestFiles = JSON.parse(readFileSync(join(SRC_ROOT, 'package.json'), 'utf8')).files ?? []
+
+/*
+ * 逐个复制清单里的条目。`lib/` 已经在上面按构建产物处理过（它有"陈旧检测"），
+ * 这里跳过它以免重复；其余条目一律 `cpSync`（目录递归、文件直接覆盖）。
+ */
+let published = 0
+for (const entry of manifestFiles) {
+  if (entry === 'lib/') continue
+  const name = entry.replace(/\/$/, '')
   const src = join(SRC_ROOT, name)
-  if (existsSync(src)) copyFileSync(src, join(target, name))
+  if (!existsSync(src)) {
+    console.log(`  ⚠ 发布清单里的 ${entry} 在源目录不存在，已跳过`)
+    continue
+  }
+  const dest = join(target, name)
+  if (isLink(dest)) {
+    linkRefusals.add(dest)
+    continue
+  }
+  /*
+   * 先删掉目标里"源目录已经不再有的"同名内容（例如 `docs/` 里删掉的一篇），
+   * 再整体复制。判定同样走 `pruneStale`，所以链接守卫一致生效。
+   */
+  if (existsSync(dest)) pruneStale(src, dest)
+  cpSync(src, dest, { recursive: true })
+  published += 1
 }
 
 /*
- * 4. 同步 docs/。
+ * 链接被拒绝时**必须报告**（2026-11-10 复审 D05）。
  *
- * README 现在只放操作说明，参数与配置全表在 `docs/REFERENCE.md` —— README
- * 里那个链接指向它。不同步的话，插件页里「更多」那一行会指向不存在的文件。
+ * 安装目录里出现符号链接 / 目录联接本身就是异常：要么是别的工具放错，
+ * 要么是有人把它指向了外部。同步脚本不能据此"猜一个动作"，但也绝不能
+ * 静默跳过 —— 用户需要知道"这次只同步了一部分，因为那里有链接"。
  */
-const srcDocs = join(SRC_ROOT, 'docs')
-const dstDocs = join(target, 'docs')
-if (existsSync(srcDocs)) {
-  mkdirSync(dstDocs, { recursive: true })
-  for (const name of readdirSync(srcDocs)) {
-    if (!name.endsWith('.md')) continue
-    copyFileSync(join(srcDocs, name), join(dstDocs, name))
-  }
+if (linkRefusals.size > 0) {
+  console.log('')
+  console.log(`  ⚠ ${linkRefusals.size} 个条目是符号链接/目录联接，已**拒绝**处理（未跟进、未删除）：`)
+  for (const path of [...linkRefusals].slice(0, 10)) console.log(`      ${path}`)
+  if (linkRefusals.size > 10) console.log(`      … 另有 ${linkRefusals.size - 10} 个`)
+  console.log('  安装目录里出现链接通常是异常状态。确认它指向哪里之后再手动处理；')
+  console.log('  同步脚本不会跟随链接，也不会删除链接指向的任何内容。')
 }
 
 const { version } = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'))
@@ -301,5 +450,4 @@ if (kept > 0) {
   console.log('    这些是不可达的旧构建产物，不影响运行。想手动清理请先修好回收站，')
   console.log('    或自行确认后删除 —— 脚本不会替你永久删。')
 }
-console.log(`  复制 ${copied} 个文件`)
-console.log(`  安装版本 ${version}`)
+console.log(`  复制 ${copied} 个构建产物，同步 ${published} 项发布文件`)

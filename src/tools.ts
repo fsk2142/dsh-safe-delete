@@ -47,7 +47,8 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
  *
  * ## 这个数字的依据（实测，不是估的）
  *
- * 清理跑在**独立子进程**里，按 500 条一批聚合后一次回收。实测单轮吞吐：
+ * 清理跑在**独立子进程**里，每批聚合成一个目录后一次回收。实测单轮吞吐
+ * （当年的表，批大小是 500 —— 见下方"历史基准"）：
  *
  * | 条数 | 耗时 | ms/条 | 回收调用 |
  * |---|---|---|---|
@@ -57,13 +58,19 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
  *
  * `tests/worker-throughput.test.ts` 每次运行都会打印这组数字。
  *
+ * ## 为什么是 3000（现行契约）
+ *
+ * **每批的条数上限由 `src/cleanup-run.ts` 的 `BATCH_SIZE` 决定（现在是 3000）**，
+ * 不是这里写的 500 —— 500 是当年的实测基准，保留它是因为那张表就是按 500 测的。
+ * 两个数字不是同一层：这里是"一轮最多处理多少条"，那里是"一批最多聚合多少条"。
+ *
  * ## 为什么不设 200（初值）
  *
  * 初值 200 是 2026-10-30 事故应急时凭感觉设的 —— 当时清理还在主进程里同步跑，
  * 每条一次系统回收站调用（1049 ms），必须限得很死。
  *
- * 现在两个前提都变了：清理在子进程（不占宿主事件循环）、回收按批聚合
- * （500 条一次调用）。200 的结果是积压恢复极慢：
+ * 现在两个前提都变了：清理在子进程（不占宿主事件循环）、回收按批聚合。
+ * 200 的结果是积压恢复极慢：
  *
  * ```
  * 28,724 条积压 ÷ 200 条/小时 = 6 天
@@ -170,12 +177,19 @@ export interface ToolDeps {
    */
   permanentDeleteRisk?: PermanentDeleteRisk
   /**
-   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   * 造一个**本次执行专用**的有界测量函数（2026-11-10 复审 D04）。
    *
-   * 回收站模式只量顶层，所以目录恒为 `unknown` → 每次都要审批。不传则保持
-   * 原来的保守行为。
+   * 上一版这里存的是 `measureBounded: createSharedMeasure()` —— 一个带状态的
+   * 闭包，在 `apply()` 时就把 `deadline = Date.now() + 1500` 记死了。于是插件
+   * 活过 1.5 秒之后，每次目录测量都返回 `incomplete`：不是"这批共享 1.5 秒"，
+   * 而是"整个插件生命周期只测 1.5 秒"。
+   *
+   * 实测（同一闭包，1.8 秒后）：`{"kind":"incomplete","reason":"... budget ... exhausted"}`。
+   *
+   * 现在每次 `safe_delete` 执行开始时调一次本工厂，同一批目录共享那个预算 ——
+   * 既不会一个目录 1.5 秒地叠加，也不会跨调用复用已过期的截止时间。
    */
-  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure
+  makeMeasureBounded?: () => (target: string, limitBytes: number) => BoundedMeasure
   /** 当前时间（测试可注入）。 */
   now?: () => number
 }
@@ -671,8 +685,11 @@ async function deleteMany(
      * **下界**参与判定：下界已超 → over；下界没超但真实大小未知 → unknown。
      * 两者都落进 `atRisk`，都要求审批。
      */
-    const sharedMeasure =
-      ctx.measureBounded ??
+    /*
+     * **每次执行**造一个新预算（2026-11-10 复审 D04）：同一批里的多个目录共享它，
+     * 但下一次 `safe_delete` 会拿到新的截止时间。
+     */
+    const sharedMeasure = ctx.makeMeasureBounded?.() ??
       ((t: string, limitBytes: number): BoundedMeasure => measureTreeBounded(t, limitBytes))
     const atRisk = plans
       .map((p) => {
@@ -743,14 +760,20 @@ async function deleteMany(
     /*
      * `ok:true` 但没给逐条成功清单（老实现 / 测试替身）：以失败清单为准，
      * 其余视为成功 —— 这是唯一能保持既有行为的退化路径。
+     *
+     * **这条路径下每条都有结论**（成功的进 `recycledFromSummary`，失败的进
+     * `remainingPlans`），所以下面不能把它们再算成 unknown —— 否则每一批
+     * 都会因为"没给逐条清单"而报失败（2026-11-10 复审 D08）。
      */
-    const recycledFromSummary =
-      outcome.ok === true && succeededPaths.size === 0 && !ambiguousFailure
-        ? plans.filter((p) => !failedPaths.has(p.target))
-        : recycledPlans
-    const unknownPlans = ambiguousFailure
-      ? plans.filter((p) => !succeededPaths.has(p.target))
-      : plans.filter((p) => !failedPaths.has(p.target) && !succeededPaths.has(p.target))
+    const resolvedBySummary = outcome.ok === true && succeededPaths.size === 0 && !ambiguousFailure
+    const recycledFromSummary = resolvedBySummary
+      ? plans.filter((p) => !failedPaths.has(p.target))
+      : recycledPlans
+    const unknownPlans = resolvedBySummary
+      ? []
+      : ambiguousFailure
+        ? plans.filter((p) => !succeededPaths.has(p.target))
+        : plans.filter((p) => !failedPaths.has(p.target) && !succeededPaths.has(p.target))
     const remainingPlans = plans.filter((p) => failedPaths.has(p.target))
 
     if (recycledFromSummary.length > 0 || unknownPlans.length > 0) {
@@ -782,7 +805,20 @@ async function deleteMany(
       }
       appendAuditBatch(ctx.stateDir, auditRecords)
 
-      const lines = recycledFromSummary.map((p) => `${p.target}  →  system recycle bin`)
+      /*
+       * ## 成功项不逐个列出（2026-11-10 复审 D10）
+       *
+       * 安全区分支早就是这么做的；回收站分支却把每条成功路径全量打印。
+       * 1000 条 × 100–200 字符就是十万字符进模型上下文，而模型接下来
+       * 通常只会说一句"删好了"。
+       *
+       * 失败与未知仍然逐条列（最多 10 条）—— 那些是需要模型处理的异常。
+       */
+      const shownSuccess = recycledFromSummary.slice(0, 3)
+      const lines = shownSuccess.map((p) => `${p.target}  →  system recycle bin`)
+      if (recycledFromSummary.length > shownSuccess.length) {
+        lines.push(`  …and ${recycledFromSummary.length - shownSuccess.length} more`)
+      }
       if (unknownPlans.length > 0) {
         lines.push('', `Outcome UNKNOWN (${unknownPlans.length}) — check the recycle bin before retrying:`)
         for (const p of unknownPlans.slice(0, 10)) lines.push(`  ${p.target}`)
@@ -790,7 +826,11 @@ async function deleteMany(
       }
       if (failedPaths.size > 0) {
         lines.push('', `Not recycled (${failedPaths.size}):`)
-        for (const p of failedPaths) lines.push(`  ${p}`)
+        const shownFailed = [...failedPaths].slice(0, 10)
+        for (const p of shownFailed) lines.push(`  ${p}`)
+        if (failedPaths.size > shownFailed.length) {
+          lines.push(`  …and ${failedPaths.size - shownFailed.length} more`)
+        }
         const reasons = outcome.failed ?? []
         if (reasons.length > 0) {
           lines.push('  Reasons:')
@@ -802,13 +842,23 @@ async function deleteMany(
       }
       if (failed.length > 0) {
         lines.push('', `Skipped (${failed.length}):`)
-        for (const item of failed) lines.push(`  ${item.target} — ${item.error}`)
+        for (const item of failed.slice(0, 10)) lines.push(`  ${item.target} — ${item.error}`)
+        if (failed.length > 10) lines.push(`  …and ${failed.length - 10} more`)
       }
       lines.push(
         '',
         `Moved ${recycledFromSummary.length} item(s) to the system recycle bin. ` +
           'Restore them from the recycle bin itself — this deletion is not tracked in the safe zone.',
       )
+      /*
+       * ## 状态不明不能报告成功（2026-11-10 复审 D08）
+       *
+       * `unknownPlans` 是「回收站没告诉我们这条去哪了」的那一批。旧代码在这里
+       * 仍然 `return { ok: true }` —— 模型只看 `ok`，就会以为删成功继续往下做，
+       * 而文件可能还在原地。
+       *
+       * 只要有一条状态不明，`ok` 必须是 `false`；文本里仍然给出明细。
+       */
       if (remainingPlans.length === 0 && unknownPlans.length === 0) {
         return { ok: true, text: lines.join('\n') }
       }
@@ -850,7 +900,16 @@ async function deleteMany(
         for (const item of failed.slice(0, 10)) lines.push(`  ${item.target} — ${item.error}`)
       }
       if (ctx.afterMove !== undefined) await ctx.afterMove()
-      return { ok: true, text: lines.join('\n') }
+      /*
+       * 走到这里意味着有回收站拒绝的条目 —— 它们要么成功回落进安全区、
+       * 要么在 `failed` 里。
+       *
+       * 判据是「每条都有确定结论」：`unknownPlans` 为空（没有去向不明的）
+       * 且 `failed` 为空（回落的也成功了），才算成功（2026-11-10 复审 D08）。
+       * 只是 `ok:false` 会让"回收站拒绝但安全区接住"这种正常情况也报失败，
+       * 那是另一种撒谎。
+       */
+      return { ok: unknownPlans.length === 0 && failed.length === 0, text: lines.join('\n') }
     }
     // 回落：把原因记进审计，让用户能看到「本想进回收站，结果进了安全区」。
     appendAuditBatch(ctx.stateDir, [
@@ -1090,8 +1149,8 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           ? {}
           : { permanentDeleteRisk: deps.permanentDeleteRisk }),
         /* 有界枚举同样透传：否则这条路仍然会把每个目录判成 unknown。 */
-        ...(deps.measureBounded === undefined ? {} : { measureBounded: deps.measureBounded }),
-        // 容量层已移除，所以没有容量相关的字段要传。
+        /* 有界枚举同样透传：否则这条路仍然会把每个目录判成 unknown。 */
+        ...(deps.makeMeasureBounded === undefined ? {} : { makeMeasureBounded: deps.makeMeasureBounded }),
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
         now,

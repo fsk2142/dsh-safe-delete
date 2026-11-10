@@ -70,9 +70,11 @@ interface DeleteContext {
    * 只能返回 `unknown`，也就是**每次都要审批**。CLI 的审批通道恒拒绝，于是
    * CLI 连一个几 MB 的目录都删不掉。
    *
-   * 传了它就让判定去把不确定变成确定；不传则保持原来的保守行为。
+   * **工厂，不是一次性闭包**（2026-11-10 复审 D04）：传进来的函数如果是
+   * 在插件加载时创建好的，它的 1.5 秒预算早就过期了，之后每次目录测量都
+   * 返回 `incomplete`。这里每次调用现造一个。
    */
-  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure;
+  makeMeasureBounded?: () => (target: string, limitBytes: number) => BoundedMeasure;
   /**
    * 批量交给回收站的实现（测试可注入）。
    *
@@ -247,7 +249,17 @@ declare function describeApprovalRequest(target: string, description: TargetDesc
 /** 把审批结果翻译成可区分的错误文本。 */
 declare function approvalFailureText(outcome: ApprovalOutcome, target: string): string;
 /**
- * 把删除理由收进安全长度。
+ * 抹掉自由文本里明显的凭据。
+ *
+ * 只处理**能识别**的形态 —— 认不出来的内容不能静默保留，所以调用方仍然
+ * 靠长度上限兜底。这不是完整的 DLP：真正的发布检查仍应跑专用工具。
+ *
+ * @param text 原始文本。
+ * @returns 脱敏后的文本。
+ */
+declare function redactReason(text: string): string;
+/**
+ * 把删除理由收进安全长度并脱敏。
  *
  * ## 为什么要截
  *
@@ -260,9 +272,10 @@ declare function approvalFailureText(outcome: ApprovalOutcome, target: string): 
  *
  * 实测：传 10000 字符，索引与审计里各存了 10000 字符。
  *
- * ## 为什么保留开头
+ * ## 为什么先脱敏再截
  *
- * 理由的前半段通常更有信息量（"清理构建产物…"），截尾比截头损失小。
+ * 顺序反过来的话，一个长键值对可能正好被截在令牌中间 —— 前缀留在文本里、
+ * 令牌本身也在。先抹掉整段再截，才不会留下半截凭据。
  *
  * @param reason 原始理由（可能为空或超长）。
  * @returns 长度不超过 `MAX_REASON_CHARS` 的理由；空输入返回 undefined。
@@ -308,4 +321,4 @@ declare function describeRecycled(result: Extract<DeleteResult, {
  */
 declare function hardRefusal(target: string, stateDir: string): string | undefined;
 //#endregion
-export { ClassifyEnv as C, normalizeDestination as S, forecastSpace as _, DeleteResult as a, isDriveRoot as b, approvalFailureText as c, deletePath as d, describeApprovalRequest as f, describeSpaceRisks as g, describeRecycled as h, DeleteRequest as i, boundReason as l, describePreview as m, DeleteContext as n, GateDecision as o, describeMoved as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, decideGate as u, hardRefusal as v, isInsideStateDir as x, humanBytes as y };
+export { redactReason as C, normalizeDestination as S, forecastSpace as _, DeleteResult as a, isDriveRoot as b, approvalFailureText as c, deletePath as d, describeApprovalRequest as f, describeSpaceRisks as g, describeRecycled as h, DeleteRequest as i, boundReason as l, describePreview as m, DeleteContext as n, GateDecision as o, describeMoved as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, decideGate as u, hardRefusal as v, ClassifyEnv as w, isInsideStateDir as x, humanBytes as y };

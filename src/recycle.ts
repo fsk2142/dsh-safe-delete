@@ -1317,15 +1317,32 @@ export function detectPermanentDeleteRisk(
  * 记住 `unknown` 是安全的（它不可能变成一个错误的安全结论），记住一个
  * 缺了某个卷的数字则不是。
  */
-let quotaLimitCache: QuotaLimit | undefined
+/**
+ * 配额结论的缓存有效期（2026-11-10 复审 D14）。
+ *
+ * 上面那段"运行期不会变"说的是**同一瞬间**多次判定要复用 —— 它不该
+ * 扩展成"整个进程生命周期都信这个值"。用户可以在 DSH 运行期间改回收站
+ * 容量（组策略推送、磁盘管理、cleanmgr 设置），而插件不会热重载。
+ *
+ * 60 秒的取法：既能把 `deleteMany` 那种「每个文件判一次」的密集判定
+ * 压到几次读，又不会让一个旧结论在长任务里一直生效。
+ */
+const QUOTA_CACHE_TTL_MS = 60_000
 let quotaCacheReader: ((key: string) => number | undefined) | undefined
 let quotaCacheLister: (() => string[]) | undefined
+let quotaLimitCache: QuotaLimit | undefined
+/** 缓存写入时刻，用于 TTL 判定。 */
+let quotaCacheAt = 0
 
 /**
- * 清空配额缓存（测试用；生产路径不需要）。
+ * 清空配额缓存。
+ *
+ * 测试用它做隔离；**生产路径也应该在"高风险删除前"调用它** —— 用户在
+ * DSH 运行期间改了回收站容量之后，下一次删除不能还按旧结论走。
  */
 export function resetQuotaCache(): void {
   quotaLimitCache = undefined
+  quotaCacheAt = 0
   quotaCacheReader = undefined
   quotaCacheLister = undefined
 }
@@ -1363,13 +1380,26 @@ function quotaLimitBytes(
   readCapacity: (volumeKey: string) => number | undefined,
   listKeys: () => string[],
 ): QuotaLimit {
-  if (quotaCacheReader === readCapacity && quotaCacheLister === listKeys && quotaLimitCache !== undefined) {
+  /*
+   * TTL 之外的结论不可信（2026-11-10 复审 D14）。
+   *
+   * 命中的前提是**同一个 reader**、**同一个 lister**，且缓存还没过期。
+   * 时间一到就重读注册表 —— 用户可能刚在磁盘管理里改了容量。
+   */
+  const cacheFresh = Date.now() - quotaCacheAt < QUOTA_CACHE_TTL_MS
+  if (
+    cacheFresh &&
+    quotaCacheReader === readCapacity &&
+    quotaCacheLister === listKeys &&
+    quotaLimitCache !== undefined
+  ) {
     return quotaLimitCache
   }
   const remember = (limit: QuotaLimit): QuotaLimit => {
     quotaCacheReader = readCapacity
     quotaCacheLister = listKeys
     quotaLimitCache = limit
+    quotaCacheAt = Date.now()
     return limit
   }
 

@@ -130,7 +130,7 @@ describe('回收站模式 + 目录：有界枚举之后可以真的删掉', () =
       confirmFileCount: 0,
       confirmBytes: 0,
       // 上限压到 1 KB：那棵树的确超了。
-      measureBounded: () => ({ kind: 'over', bytes: 8192 }),
+      makeMeasureBounded: () => () => ({ kind: 'over', bytes: 8192 }),
       requestApproval: async () => {
         asked += 1
         return 'rejected'
@@ -156,7 +156,7 @@ describe('回收站模式 + 目录：有界枚举之后可以真的删掉', () =
       destination: 'recycle-bin',
       confirmFileCount: 0,
       confirmBytes: 0,
-      measureBounded: () => ({ kind: 'incomplete', reason: 'access denied' }),
+      makeMeasureBounded: () => () => ({ kind: 'incomplete', reason: 'access denied' }),
       requestApproval: async () => {
         asked += 1
         return 'allowed-once'
@@ -181,7 +181,7 @@ describe('回收站模式 + 目录：有界枚举之后可以真的删掉', () =
       destination: 'safe-zone',
       confirmFileCount: 0,
       confirmBytes: 0,
-      measureBounded: () => {
+      makeMeasureBounded: () => () => {
         measured += 1
         return { kind: 'exact', bytes: 10 }
       },

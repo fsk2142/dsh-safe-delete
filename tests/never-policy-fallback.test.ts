@@ -26,16 +26,27 @@ describe('unresolvable shell delete under the never policy', () => {
     expect(decision.kind).toBe('ask')
   })
 
-  it('does not turn into a silent rejection when the policy is never', async () => {
-    // 回归点：以前这里返回 ask，而 never 会把它驳回成拒绝。
+  /*
+   * 2026-11-10（复审 D02）改写了这里的契约。
+   *
+   * 原来断言 `never` 下这条命令 **allow** —— 理由是"没有审批通道，返回 ask 会被
+   * 驳回成拒绝，任务卡住"。但这条命令是 `... | Remove-Item -Recurse`：
+   * **已经判定是删除**，只是目标不可静态解析。放行意味着它绕过安全区与回收站，
+   * 而用户同时开着 `blockShellDeletes: true`、也被告知删除都可反悔。
+   *
+   * `never` 的语义是"不要弹窗"，不是"绕过删除保护"。现在它明确 deny，
+   * 并给出可执行的下一步（先解析路径，再用 `safe_delete`）。
+   */
+  it('denies an unresolvable destructive command instead of allowing it', async () => {
     const ctx = makeFakeCtx({ approvalPolicy: 'never' })
     apply(ctx as never, { stateDir: 'C:\\tmp\\state' })
     const decision = await ctx.preExecute({
       name: 'pwsh',
       arguments: { command: 'Get-ChildItem C:\\Work | Remove-Item -Recurse' },
     })
-    expect(decision.kind).not.toBe('ask')
-    expect(decision.kind).toBe('allow')
+    expect(decision.kind, 'never 不等于放行看不清的删除').not.toBe('ask')
+    expect(decision.kind).toBe('deny')
+    expect(decision.reason ?? '', '必须给出可执行的下一步').toMatch(/safe_delete/)
   })
 
   it('still denies a resolvable recursive delete under never', async () => {

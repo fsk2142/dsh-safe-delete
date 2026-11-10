@@ -78,9 +78,11 @@ export interface DeleteContext {
    * 只能返回 `unknown`，也就是**每次都要审批**。CLI 的审批通道恒拒绝，于是
    * CLI 连一个几 MB 的目录都删不掉。
    *
-   * 传了它就让判定去把不确定变成确定；不传则保持原来的保守行为。
+   * **工厂，不是一次性闭包**（2026-11-10 复审 D04）：传进来的函数如果是
+   * 在插件加载时创建好的，它的 1.5 秒预算早就过期了，之后每次目录测量都
+   * 返回 `incomplete`。这里每次调用现造一个。
    */
-  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure
+  makeMeasureBounded?: () => (target: string, limitBytes: number) => BoundedMeasure
   /**
    * 批量交给回收站的实现（测试可注入）。
    *
@@ -501,8 +503,12 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
      * 「选了回收站就必须真的进回收站」是配置承诺，不能因为某个调用方漏传
      * 一个可选字段就退回「一律要审批」（终端的审批通道恒拒绝，那等于删不掉）。
      */
+    /*
+     * **每次调用**造一个新预算（2026-11-10 复审 D04）：带状态的闭包会
+     * 在创建 1.5 秒后永久失效，而这个入口在每个通道上都会被反复调用。
+     */
     const measure =
-      ctx.measureBounded ??
+      ctx.makeMeasureBounded?.() ??
       ((t: string, limitBytes: number): BoundedMeasure => measureTreeBounded(t, limitBytes))
     const quota = assessQuota(description.bytes, {
       ...(isDir ? { sizeIsLowerBound: true } : {}),
@@ -640,7 +646,52 @@ export function approvalFailureText(outcome: ApprovalOutcome, target: string): s
 const MAX_REASON_CHARS = 200
 
 /**
- * 把删除理由收进安全长度。
+ * 自由文本里的凭据形态。
+ *
+ * ## 为什么需要它们（2026-11-10 复审 D11）
+ *
+ * `reason` 是模型或用户给的自由文本，会进索引、进 `journal.jsonl`，
+ * 而 `safe_zone_journal` / `safe_zone_list` 会把它**原样返回模型上下文**。
+ * shell 命令原文早就不记了（改成长度+SHA-256 指纹），这条是同一类暴露面
+ * 剩下的那一半。
+ *
+ * 200 字符的上限不是脱敏：20 字符的令牌会完整进去。
+ */
+const SECRET_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
+  // `Bearer <token>`
+  { pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, replacement: 'Bearer <redacted>' },
+  // `Authorization: <anything>`
+  { pattern: /\b(authorization)\s*[:=]\s*[^\s,;]+/gi, replacement: '$1: <redacted>' },
+  // `token=…` / `api_key: …` / `password=…` 这类键值
+  {
+    pattern:
+      /\b(?:(?:access|api|auth|refresh|id)?[_-]?(?:token|key|secret)|password|passwd|pwd|credential)s?\s*[:=]\s*[^\s,;&"']+/gi,
+    replacement: '<redacted-credential>',
+  },
+  // URL query 里的凭据
+  {
+    pattern: /(?<=[?&](?:token|key|secret|sig|signature|password|access_token)=)[^\s&#"']+/gi,
+    replacement: '<redacted>',
+  },
+]
+
+/**
+ * 抹掉自由文本里明显的凭据。
+ *
+ * 只处理**能识别**的形态 —— 认不出来的内容不能静默保留，所以调用方仍然
+ * 靠长度上限兜底。这不是完整的 DLP：真正的发布检查仍应跑专用工具。
+ *
+ * @param text 原始文本。
+ * @returns 脱敏后的文本。
+ */
+export function redactReason(text: string): string {
+  let out = text
+  for (const { pattern, replacement } of SECRET_PATTERNS) out = out.replace(pattern, replacement)
+  return out
+}
+
+/**
+ * 把删除理由收进安全长度并脱敏。
  *
  * ## 为什么要截
  *
@@ -653,16 +704,18 @@ const MAX_REASON_CHARS = 200
  *
  * 实测：传 10000 字符，索引与审计里各存了 10000 字符。
  *
- * ## 为什么保留开头
+ * ## 为什么先脱敏再截
  *
- * 理由的前半段通常更有信息量（"清理构建产物…"），截尾比截头损失小。
+ * 顺序反过来的话，一个长键值对可能正好被截在令牌中间 —— 前缀留在文本里、
+ * 令牌本身也在。先抹掉整段再截，才不会留下半截凭据。
  *
  * @param reason 原始理由（可能为空或超长）。
  * @returns 长度不超过 `MAX_REASON_CHARS` 的理由；空输入返回 undefined。
  */
 export function boundReason(reason: string | undefined): string | undefined {
   if (reason === undefined || reason === '') return undefined
-  return reason.length <= MAX_REASON_CHARS ? reason : `${reason.slice(0, MAX_REASON_CHARS - 1)}…`
+  const clean = redactReason(reason)
+  return clean.length <= MAX_REASON_CHARS ? clean : `${clean.slice(0, MAX_REASON_CHARS - 1)}…`
 }
 
 /** 人类可读的体积。 */

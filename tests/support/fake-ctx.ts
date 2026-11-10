@@ -55,7 +55,7 @@ export interface FakeCtx {
   /** 已注册的系统提示段（断言插件注入了行为约定）。 */
   systemPromptSections: Array<{ name: string; order?: number; text: string }>
   /** 已注册的斜杠命令（断言命令真的挂上了）。 */
-  registeredCommands: Array<{ name: string; description: string }>
+  registeredCommands: Array<{ name: string; description: string; handler?: (input: { rawInput: string }) => Promise<unknown> }>
   /** 已注册的 UI 槽位（断言插件页「配置」入口挂对了 key）。 */
   registeredSlots: Array<Record<string, unknown>>
   /** cordis 服务注入（等 `configForms` 就绪用）。 */
@@ -67,15 +67,15 @@ export interface FakeCtx {
 export function makeFakeCtx(options: FakeCtxOptions = {}): FakeCtx {
   const warnings: string[] = []
   const registeredTools: FakeRegisteredTool[] = []
-  const registeredCommands: Array<{ name: string; description: string }> = []
+  const registeredCommands: Array<{ name: string; description: string; handler?: (input: { rawInput: string }) => Promise<unknown> }> = []
   const registeredSlots: Array<Record<string, unknown>> = []
   const systemPromptSections: Array<{ name: string; order?: number; text: string }> = []
   const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
 
   /** commands 服务的最小形状。 */
   const commandRegistry = {
-    register(spec: { name: string; description: string }) {
-      registeredCommands.push({ name: spec.name, description: spec.description })
+    register(spec: { name: string; description: string; handler?: (input: { rawInput: string }) => Promise<unknown> }) {
+      registeredCommands.push({ name: spec.name, description: spec.description, handler: spec.handler })
       return () => {}
     },
   }

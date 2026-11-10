@@ -150,7 +150,7 @@ describe('R01: 批量删除对目录目标按 unknown 处理', () => {
       crossVolumeCopy: false,
       destination: 'recycle-bin',
       // 枚举失败：这一条必须仍然走审批。
-      measureBounded: () => ({ kind: 'incomplete', reason: 'access denied' }),
+      makeMeasureBounded: () => () => ({ kind: 'incomplete', reason: 'access denied' }),
       requestApproval: async (text: string) => {
         asked.push(text)
         return 'rejected'

@@ -1,6 +1,6 @@
 import { t as BoundedMeasure } from "./chunks/types.js";
 import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./chunks/recycle.js";
-import { C as ClassifyEnv, r as DeleteDestination } from "./chunks/delete-core.js";
+import { r as DeleteDestination, w as ClassifyEnv } from "./chunks/delete-core.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -97,12 +97,19 @@ export interface ToolDeps {
    */
   permanentDeleteRisk?: PermanentDeleteRisk;
   /**
-   * 目录下界不足以判定时的补救：做一次有界早退枚举（2026-11-08）。
+   * 造一个**本次执行专用**的有界测量函数（2026-11-10 复审 D04）。
    *
-   * 回收站模式只量顶层，所以目录恒为 `unknown` → 每次都要审批。不传则保持
-   * 原来的保守行为。
+   * 上一版这里存的是 `measureBounded: createSharedMeasure()` —— 一个带状态的
+   * 闭包，在 `apply()` 时就把 `deadline = Date.now() + 1500` 记死了。于是插件
+   * 活过 1.5 秒之后，每次目录测量都返回 `incomplete`：不是"这批共享 1.5 秒"，
+   * 而是"整个插件生命周期只测 1.5 秒"。
+   *
+   * 实测（同一闭包，1.8 秒后）：`{"kind":"incomplete","reason":"... budget ... exhausted"}`。
+   *
+   * 现在每次 `safe_delete` 执行开始时调一次本工厂，同一批目录共享那个预算 ——
+   * 既不会一个目录 1.5 秒地叠加，也不会跨调用复用已过期的截止时间。
    */
-  measureBounded?: (target: string, limitBytes: number) => BoundedMeasure;
+  makeMeasureBounded?: () => (target: string, limitBytes: number) => BoundedMeasure;
   /** 当前时间（测试可注入）。 */
   now?: () => number;
 }

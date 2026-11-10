@@ -362,8 +362,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
      *
      * 不接线的话，`safe_delete` 删目录在 `never` 策略下永远被拒 —— 与回收站
      * 上限多大、目录多小无关。
+     *
+     * **必须是工厂**（2026-11-10 复审 D04）：这里写 `createSharedMeasure()` 的话，
+     * 那个闭包会在 apply 时就记下 `deadline = Date.now() + 1500`，插件活过
+     * 1.5 秒之后每次目录测量都返回 `incomplete`。
      */
-    measureBounded: createSharedMeasure(),
+    makeMeasureBounded: () => createSharedMeasure(),
   })
 
   const registry = ctx.get('tools') as { register?: (tool: ToolDefinition) => unknown } | undefined
@@ -871,13 +875,35 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
        * 追查只需要「哪一条、多长、哪一类目标」，所以记指纹与目标形态。
        */
       const detail = `unresolvable target; command ${commandFingerprint(text)}`
+      /*
+       * ## `never` 不是"绕过删除保护"（2026-11-10 复审 D02）
+       *
+       * 这里原来在 `never` 下 `return next()` —— 原始命令照常执行。于是
+       * `rm -rf "$TARGET"`、`Remove-Item $env:X` 这类**已经判定为删除**、
+       * 只是不知道删的是什么的操作，完全绕过安全区与回收站。
+       *
+       * `never` 的语义是"不要弹窗"。而这条路径恰恰是"看不清的 rm -rf"，
+       * 最该保守的时刻 —— 降级放行的理由（"没有审批通道会让任务卡住"）
+       * 对只读目标成立，对已知的删除不成立。
+       */
       if (policy === 'never') {
         appendAudit(stateDir, {
-          event: 'ask',
+          event: 'deny',
           tool: toolName,
-          detail: `allowed under the never policy: ${detail}`,
+          detail: `dynamic destructive target under the never policy; ${detail}`,
         })
-        return next()
+        return {
+          kind: 'deny',
+          reason:
+            'This destructive command has a target that cannot be resolved statically (a variable, ' +
+            'wildcard or pipeline), and the approval policy is `never`, so there is no way to confirm ' +
+            'what it would delete. Resolve the paths first, then delete them with `safe_delete` ' +
+            '(`paths: [...]`) so they land in the safe zone and stay recoverable.',
+          displayReason: {
+            en: 'A destructive command targets something that cannot be resolved, and the approval policy is `never`. Resolve the paths first and use `safe_delete` instead.',
+            zh: '有一条删除命令的目标无法静态解析（变量、通配符或管道），而审批策略是 `never`。请先解析出明确路径，改用 `safe_delete` 删除。',
+          },
+        }
       }
       appendAudit(stateDir, { event: 'ask', tool: toolName, detail })
       return {
@@ -1048,8 +1074,29 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           destination: normalizeDestination(unwrap(raw['deleteDestination'])),
           crossVolumeCopy: booleanOf('crossVolumeCopy', false),
           /* 目录配额的下界不足以判定时，去把不确定变成确定（2026-11-08）。 */
-          measureBounded: createSharedMeasure(),
-          requestApproval,
+          makeMeasureBounded: () => createSharedMeasure(),
+          /*
+           * ## 斜杠命令没有审批通道，所以**明确拒绝**（2026-11-10 复审 D03）
+           *
+           * 上面那个 `requestApproval` 桩恒返回 `allowed-once`，它的前提是
+           * 「管线已经问过了」—— 而 `/safe-delete` 走宿主的 `commands` 服务，
+           * **不经过** `tools/pre-execute`。共用那个桩等于：protected 路径、
+           * 超配额、回收站被设成永久删除，全部静默放行。
+           *
+           * 同一个核心在 CLI 上恒 `rejected`、在斜杠命令上恒 `allowed-once`，
+           * 两个入口得出相反的授权结果 —— 那本身就是缺陷信号。
+           *
+           * 用户敲斜杠命令可以视为"请求删除"，但不能等同于"授权任何不可恢复
+           * 后果"。没有真实确认通道时，保守拒绝并说清下一步。
+           */
+          requestApproval: async (reason: string): Promise<ApprovalOutcome> => {
+            appendAudit(stateDir, {
+              event: 'deny',
+              tool: 'slash-command',
+              detail: `needs approval but the slash command has no approval channel: ${reason.slice(0, 120)}`,
+            })
+            return 'rejected'
+          },
           now: () => Date.now(),
         })
       if (!result.ok) return { ok: false, text: result.error }
@@ -1206,6 +1253,19 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
     | { section?: (spec: { name: string; order?: number; text: string }) => unknown }
     | undefined
   if (systemPrompt?.section !== undefined) {
+    /*
+     * ## 末句必须跟着目的地走（2026-11-10 复审 D09）
+     *
+     * 这里原来固定写 `Deleted items are restorable via safe_zone_restore ...`。
+     * 而 `deleteDestination = recycle-bin` 时文件**直接进系统回收站** ——
+     * `safe_zone_list` 看不到它，`safe_zone_restore` 也取不回。工具描述
+     * （`tools.ts`）已经按目的地动态生成，两处互相矛盾，模型会照着一个假承诺
+     * 反复调用取回。
+     */
+    const restoreLine =
+      normalizeDestination(unwrap(raw['deleteDestination'])) === 'recycle-bin'
+        ? '- Deleted items go to the system recycle bin, not the safe zone: restore them from the recycle bin itself (the safe zone does not track them).'
+        : '- Deleted items are restorable via `safe_zone_restore id=<id>` until they expire.'
     systemPrompt.section({
       name: 'dsh-safe-delete:policy',
       order: 200,
@@ -1217,7 +1277,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
         '- Unsure about a path? Call `safe_delete` with `preview: true` first — it reports size, entry count and danger level without changing anything.\n' +
         '- Pass `paths: [...]` to delete several items in one call; a batch needs one approval, not one each.\n' +
         '- Blocked shell deletes: do NOT retry, switch tools, or rename/encode around it. If an approval is rejected, ask the user what they want instead of looking for another route.\n' +
-        '- Deleted items are restorable via `safe_zone_restore id=<id>` until they expire.',
+        restoreLine,
     })
   }
 }

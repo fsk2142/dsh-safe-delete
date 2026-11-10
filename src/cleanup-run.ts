@@ -25,21 +25,168 @@
  * ## 失败保守
  *
  * 聚合阶段任何一条失败：**只回滚本批**，不动其他条目，也不动索引里的记录。
- * 回收阶段失败：条目留在批次目录里，索引仍指向它们 —— 下次会重新尝试。
+ *
+ * 回收阶段失败（`recycler` 报错、或报成功但批次目录里内容还在）：**优先把
+ * 内容搬回 `items/`**，让用户还能 `safe_zone_restore`。只有搬不回去的（目标
+ * 被占用、权限不足）才留在批次目录并保留 manifest —— 那时数据仍在磁盘上，
+ * 下次启动的恢复扫描会再试。
+ *
+ * 闸门拒绝（策略/配额无法证明可恢复）走同一套回滚：内容原样回 `items/`，
+ * 安全区条目不变，只是这一轮没清成。
+ *
  * 绝不因为"回收失败"就永久删除用户内容。
  *
  * @module dsh-safe-delete/cleanup-run
  */
 
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
-import type { Recycler } from './recycle'
+import type { PermanentDeleteRisk, Recycler } from './recycle'
 import { appendAuditBatch } from './audit'
-import { moveToSystemRecycleBin } from './recycle'
+import { assessQuota, detectPermanentDeleteRisk, moveToSystemRecycleBin } from './recycle'
 import { listSafeZone, writeIndexFiltered } from './store'
 import { selectForPrune } from './prune'
 import { listBatchIds, recoverAllBatches, updateManifestStatus, writeManifest } from './batch-manifest'
+
+/**
+ * 后台回收前的安全闸门结论。
+ *
+ * ## 为什么 Worker 必须自己判（2026-11-10 复审 D01）
+ *
+ * `safe_delete` 进回收站前会查 `NoRecycleFiles` / `NukeOnDelete` 与每卷配额，
+ * 命中就弹审批。而安全区条目**到期之后**由后台 Worker 送回收站 —— 那条路径
+ * 此前**一个检查都没有**。
+ *
+ * 后果：用户以为"到期后还有系统回收站这层保险"，实际在 `NukeOnDelete=1`
+ * 或配额不足的机器上，Worker 会在无人值守的深夜把内容永久删掉。
+ * 而 Worker 没有审批通道，唯一正确的动作是**留在安全区**。
+ */
+export type RecycleGate =
+  | { kind: 'allow' }
+  | { kind: 'hold'; reason: string }
+
+/**
+ * 判定这一批能不能交给系统回收站。
+ *
+ * 保守方向与直接删除入口一致：`unknown` 不当作 `safe`。
+ *
+ * @param actualBytes 这一批**实际**要回收的字节数（由调用方量出来）。
+ * @param direction 检测方向；测试注入替身。
+ * @returns 允许回收或留下原因。
+ */
+function gateForRecycle(
+  actualBytes: number,
+  direction: {
+    detectPermanentDeleteRisk?: () => PermanentDeleteRisk
+    assessQuota?: (bytes: number) => { status: 'within' | 'over' | 'unknown'; reason?: string }
+  } = {},
+): RecycleGate {
+  const detect = direction.detectPermanentDeleteRisk ?? (() => detectPermanentDeleteRisk())
+  const quota = direction.assessQuota ?? ((bytes) => assessQuota(bytes, {}))
+
+  let risk: PermanentDeleteRisk
+  try {
+    risk = detect()
+  } catch (error) {
+    return {
+      kind: 'hold',
+      reason: `the permanent-delete policy could not be read (${error instanceof Error ? error.message : String(error)})`,
+    }
+  }
+  const status = risk.status ?? (risk.risky ? 'risky' : 'safe')
+  if (status !== 'safe') {
+    return {
+      kind: 'hold',
+      reason: risk.reason ?? (status === 'risky' ? 'the recycle bin is not in effect' : 'the policy is unknown'),
+    }
+  }
+
+  /*
+   * ## 配额按"这批实际要回收的内容"算，不信任索引里的 `bytes`
+   *
+   * 索引里的 `bytes` 可能是旧值，也可能从来没算过（回收站模式下目录只量顶层）。
+   * 所以调用方会把 `batches/<id>/items` 的真实总大小量出来传进来。
+   */
+  let verdict: { status: 'within' | 'over' | 'unknown'; reason?: string }
+  try {
+    verdict = quota(actualBytes)
+  } catch (error) {
+    return {
+      kind: 'hold',
+      reason: `the recycle-bin capacity could not be read (${error instanceof Error ? error.message : String(error)})`,
+    }
+  }
+  if (verdict.status !== 'within') {
+    return { kind: 'hold', reason: verdict.reason ?? 'the recycle-bin capacity could not rule out a permanent delete' }
+  }
+
+  return { kind: 'allow' }
+}
+
+/**
+ * 把已经搬进批次目录的内容原样搬回 `items/`。
+ *
+ * 闸门拒绝时用：内容必须回到用户能 `safe_zone_restore` 的位置。
+ * 搬不回去的留在批次目录（数据还在磁盘上，下次恢复扫描会再试）。
+ *
+ * @param stateDir 安全区目录。
+ * @param batchItems 批次的内容目录。
+ * @param moved 已搬进去的条目。
+ * @returns 搬回去的条数。
+ */
+function restoreMovedToItems(
+  stateDir: string,
+  batchItems: string,
+  moved: Array<{ id: string }>,
+): { restored: number } {
+  let restored = 0
+  for (const m of moved) {
+    const from = join(batchItems, m.id)
+    const to = join(stateDir, 'items', m.id)
+    try {
+      if (!existsSync(from)) continue
+      if (existsSync(to)) continue
+      renameSync(from, to)
+      restored += 1
+    } catch {
+      /* 搬不回去就留在批次目录，数据仍在磁盘上 */
+    }
+  }
+  return { restored }
+}
+
+/**
+ * 量一个目录里所有文件的真实总字节数（只走一层，`items/<id>` 每条是一次
+ * 目录或文件 rename 的结果，所以这是精确的）。
+ *
+ * @param dir 目录。
+ * @returns 字节数；读不到时 `undefined`（调用方按 unknown 处理）。
+ */
+function measureDirectoryBytes(dir: string): number | undefined {
+  let total = 0
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return undefined
+  }
+  for (const name of names) {
+    const full = join(dir, name)
+    try {
+      const st = statSync(full, { throwIfNoEntry: false })
+      if (st === undefined) continue
+      if (st.isDirectory()) {
+        total += measureDirectoryBytes(full) ?? 0
+        continue
+      }
+      total += st.size
+    } catch {
+      return undefined
+    }
+  }
+  return total
+}
 
 /**
  * 一批最多聚合成一个目录。
@@ -82,6 +229,13 @@ export interface WorkerResult {
   recycled: number
   /** 回收失败、留在安全区的条数。 */
   skipped: number
+  /**
+   * 因为「无法证明可恢复」而整轮跳过的原因（2026-11-10 复审 D01）。
+   *
+   * 为空表示本轮没有被闸门拦下。有值时 `recycled` 必然是 0，且所有条目
+   * 仍在安全区 —— 无人值守的跳过必须留下原因，否则用户只会看到"清理没动"。
+   */
+  blockedReason?: string
 }
 
 /**
@@ -141,6 +295,8 @@ export async function recoverResidualBatches(stateDir: string): Promise<number> 
  * @param now 当前时间；省略用 `Date.now()`。测试注入可控时钟。
  * @param mode 选中哪些条目：`expired`（只清过期）或 `all`（清空安全区）。
  *   见下方"为什么必须显式区分"。
+ * @param gate 安全闸门的检测方向；省略时读真实注册表。**测试必须注入**，
+ *   否则会在测试机上真的读注册表、并因 `NukeOnDelete` 等真实配置而拒绝回收。
  * @returns 统计。
  */
 export async function pruneNowForWorker(
@@ -149,6 +305,10 @@ export async function pruneNowForWorker(
   recycler: Recycler = moveToSystemRecycleBin,
   now: () => number = Date.now,
   mode: 'expired' | 'all' = 'expired',
+  gate: {
+    detectPermanentDeleteRisk?: () => PermanentDeleteRisk
+    assessQuota?: (bytes: number) => { status: 'within' | 'over' | 'unknown'; reason?: string }
+  } = {},
 ): Promise<WorkerResult> {
   /*
    * **先恢复上次的残留批次**，再开始新一轮。
@@ -180,6 +340,8 @@ export async function pruneNowForWorker(
 
   let recycled = 0
   let skipped = 0
+  /** 本轮被闸门拦下的原因；有值时 recycled 必然是 0。 */
+  let blockedReason: string | undefined
 
   /*
    * 按批处理：每批聚合 → 回收 → 从索引移除。
@@ -221,9 +383,10 @@ export async function pruneNowForWorker(
       continue
     }
 
-    const outcome = await recycleBatch(stateDir, batch, recycler)
+    const outcome = await recycleBatch(stateDir, batch, recycler, gate)
     recycled += outcome.recycled
     skipped += outcome.skipped
+    if (outcome.blockedReason !== undefined) blockedReason = outcome.blockedReason
 
     /*
      * ## 每批写审计（2026-10-30 复审 SD-F1）
@@ -290,7 +453,7 @@ export async function pruneNowForWorker(
     cursor += batch.length
   }
 
-  return { recycled, skipped }
+  return blockedReason === undefined ? { recycled, skipped } : { recycled, skipped, blockedReason }
 }
 
 /**
@@ -314,7 +477,18 @@ async function recycleBatch(
   stateDir: string,
   batch: Array<{ id: string; bytes?: number; originalPath?: string }>,
   recycler: Recycler,
-): Promise<{ recycled: number; skipped: number; removedIds: string[]; batchId: string; vanished: string[] }> {
+  gateDirection: {
+    detectPermanentDeleteRisk?: () => PermanentDeleteRisk
+    assessQuota?: (bytes: number) => { status: 'within' | 'over' | 'unknown'; reason?: string }
+  } = {},
+): Promise<{
+  recycled: number
+  skipped: number
+  removedIds: string[]
+  batchId: string
+  vanished: string[]
+  blockedReason?: string
+}> {
   if (batch.length === 0) return { recycled: 0, skipped: 0, removedIds: [], batchId: '', vanished: [] }
 
   const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -404,6 +578,56 @@ async function recycleBatch(
 
   // 全部搬完，进入"准备提交回收"状态。
   updateManifestStatus(stateDir, batchId, 'staged')
+
+  /*
+   * ## 交出去之前先问一句「这真的能还原吗」（2026-11-10 复审 D01）
+   *
+   * 到这一步内容已经在 `batches/<id>/items` 里，还没有交给系统。
+   * 此时是加闸门的唯一正确时机：闸门拒绝就**原样搬回 items/**，
+   * 用户还能 `safe_zone_restore` 取回，只是这一轮没清成。
+   *
+   * 不放在更早的原因是：配额要按**实际搬过来的字节数**算，
+   * 而那时内容还在 items/ 里，量出来的可能不是这一批的真实大小。
+   */
+  const actualBytes = measureDirectoryBytes(batchItems)
+  if (actualBytes === undefined) {
+    const restored = restoreMovedToItems(stateDir, batchItems, moved)
+    const remaining = existsSync(batchItems) ? readdirSync(batchItems) : []
+    if (remaining.length === 0) cleanupBatchDir(batchRoot)
+    else updateManifestStatus(stateDir, batchId, 'staging')
+    return {
+      recycled: 0,
+      skipped: batch.length,
+      removedIds: [],
+      batchId,
+      vanished,
+      blockedReason: `the size of the staged batch could not be measured (${restored.restored}/${moved.length} restored)`,
+    }
+  }
+  const gate = gateForRecycle(actualBytes, gateDirection)
+  if (gate.kind === 'hold') {
+    const restored = restoreMovedToItems(stateDir, batchItems, moved)
+    const remaining = existsSync(batchItems) ? readdirSync(batchItems) : []
+    if (remaining.length === 0) cleanupBatchDir(batchRoot)
+    else updateManifestStatus(stateDir, batchId, 'staging')
+    void restored // 条数只用于判断能否清理目录，不需要再报告
+    appendAuditBatch(stateDir, [
+      {
+        event: 'prune',
+        target: `${batch.length} item(s)`,
+        tool: 'cleanup-worker',
+        detail: `blocked: ${gate.reason}`,
+      },
+    ])
+    return {
+      recycled: 0,
+      skipped: batch.length,
+      removedIds: [],
+      batchId,
+      vanished,
+      blockedReason: gate.reason,
+    }
+  }
 
   /*
    * 阶段二：对**整个批次目录**调一次回收站。
