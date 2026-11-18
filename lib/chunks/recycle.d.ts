@@ -44,6 +44,19 @@ type RecycleManyOutcome = {
   reason: string;
   recycled: number;
   unsupported?: boolean;
+  /**
+   * 这次调用**根本没有碰 shell**（熔断短路 / 平台不支持）。
+   *
+   * ## 为什么必须与 UNKNOWN 分开（2026-11-18 用户事故）
+   *
+   * 「shell 跑过了、但没回报这条路径的去向」是真 unknown：文件可能在
+   * 回收站里，也可能还在原地。而「熔断短路」是**确定没做** —— 一个字节
+   * 都没动过。把后者也叫 unknown，用户就会去查容量、权限、junction，
+   * 全是无关的地方。
+   */
+  notAttempted?: boolean;
+  /** 具体是因为熔断短路（不是平台不支持）。 */
+  skippedByBreaker?: boolean;
   /** 即使总体上失败，也可能有个别条目真的移走了 —— 逐条给出来。 */
   succeededPaths?: string[];
   failedPaths?: string[];

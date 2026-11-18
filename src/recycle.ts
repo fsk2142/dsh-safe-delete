@@ -76,6 +76,19 @@ export type RecycleManyOutcome =
       reason: string
       recycled: number
       unsupported?: boolean
+      /**
+       * 这次调用**根本没有碰 shell**（熔断短路 / 平台不支持）。
+       *
+       * ## 为什么必须与 UNKNOWN 分开（2026-11-18 用户事故）
+       *
+       * 「shell 跑过了、但没回报这条路径的去向」是真 unknown：文件可能在
+       * 回收站里，也可能还在原地。而「熔断短路」是**确定没做** —— 一个字节
+       * 都没动过。把后者也叫 unknown，用户就会去查容量、权限、junction，
+       * 全是无关的地方。
+       */
+      notAttempted?: boolean
+      /** 具体是因为熔断短路（不是平台不支持）。 */
+      skippedByBreaker?: boolean
       /** 即使总体上失败，也可能有个别条目真的移走了 —— 逐条给出来。 */
       succeededPaths?: string[]
       failedPaths?: string[]
@@ -117,16 +130,56 @@ const COMMAND_TIMEOUT_MS = 20_000
  */
 const FAILURE_BREAKER_THRESHOLD = 3
 
+/**
+ * 跳闸之后多久允许**一次**试探。
+ *
+ * ## 为什么必须有它（2026-11-18 用户事故）
+ *
+ * 旧实现跳闸后**永久跳闸**：归零只在成功分支里，而跳闸时根本走不到那里 ——
+ * 于是唯一的出路是重启 DSH。用户的形态正是这样：前一天几条 .log 被占用
+ * （`SHFileOperation` 返回 32）让熔断跳闸，第二天所有回收站删除都返回
+ * "recycle bin unavailable after 3 consecutive failures. Restart DSH to retry."
+ *
+ * 用户看到的是「显式 paths 也删不动」，而真正的原因跟审批策略毫无关系。
+ *
+ * 半开（half-open）是标准做法：冷却期内全部短路（保护宿主不被 20s 超时拖住），
+ * 冷却结束后放行**一次**试探。成功就复位，失败就重新开始冷却。
+ *
+ * 30 秒的取法：够长，不至于让一个真坏掉的 shell 被反复调用；够短，
+ * 用户不用重启就能自己恢复。
+ */
+const FAILURE_BREAKER_COOLDOWN_MS = 30_000
+
 /** 当前连续失败次数（进程内）。成功一次就归零。 */
 let consecutiveFailures = 0
 
+/** 最近一次跳闸（或试探失败）的时刻；`0` 表示从未跳闸。 */
+let trippedAt = 0
+
 /**
- * 回收站是否已被熔断。
+ * 回收站是否已被熔断（冷却期内）。
  *
- * @returns 连续失败达到阈值时返回 `true`。
+ * ## 半开（2026-11-18）
+ *
+ * 冷却期结束后返回 `false` —— 放行一次试探。试探成功就复位，失败则
+ * `recordRecycleFailure` 重新记录跳闸时刻，冷却重新开始。
+ *
+ * @param now 判定时刻（测试注入）。
+ * @returns 冷却期内返回 `true`。
  */
-export function recycleIsTripped(): boolean {
-  return consecutiveFailures >= FAILURE_BREAKER_THRESHOLD
+export function recycleIsTripped(now: number = Date.now()): boolean {
+  if (consecutiveFailures < FAILURE_BREAKER_THRESHOLD) return false
+  if (trippedAt === 0) return true
+  return now - trippedAt < FAILURE_BREAKER_COOLDOWN_MS
+}
+
+/**
+ * 熔断冷却窗口（毫秒）。
+ *
+ * @returns 冷却时长。
+ */
+export function recycleBreakerCooldownMs(): number {
+  return FAILURE_BREAKER_COOLDOWN_MS
 }
 
 /**
@@ -134,6 +187,7 @@ export function recycleIsTripped(): boolean {
  */
 export function resetRecycleBreaker(): void {
   consecutiveFailures = 0
+  trippedAt = 0
 }
 
 /**
@@ -160,11 +214,30 @@ export function recycleBreakerThreshold(): number {
  * 抽成函数是为了让**跳闸路径本身**可以被测试直接驱动：真实失败需要 shell 出问题，
  * 测试无法可靠制造那种环境。生产代码也走这里，所以测的不是影子逻辑。
  *
+ * ## 每次失败都刷新跳闸时刻（2026-11-18 半开）
+ *
+ * 让试探失败也重新开始冷却 —— 否则半开退化成"每 30 秒猛打一批"。
+ *
  * @returns 记录之后的连续失败次数。
  */
-export function recordRecycleFailure(): number {
+export function recordRecycleFailure(now: number = Date.now()): number {
   consecutiveFailures += 1
+  if (consecutiveFailures >= FAILURE_BREAKER_THRESHOLD) trippedAt = now
   return consecutiveFailures
+}
+
+/**
+ * 记录一次成功：把计数与跳闸时刻一起归零。
+ *
+ * ## 为什么成功必须复位（2026-11-18）
+ *
+ * 旧实现只在 `moveToSystemRecycleBin` 的 `ok` 分支里写 `consecutiveFailures = 0`，
+ * 而批量路径（`recycleManyToSystemBin`）的成功分支写的是同一个变量 —— 两处
+ * 各写一次，任何一处漏掉都会让熔断粘住。现在收敛成一个函数。
+ */
+export function recordRecycleSuccess(): void {
+  consecutiveFailures = 0
+  trippedAt = 0
 }
 
 /**
@@ -180,7 +253,8 @@ export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
       ok: false,
       reason:
         `recycle bin unavailable after ${consecutiveFailures} consecutive failures; ` +
-        'nothing was permanently deleted. Restart DSH to retry.',
+        `retrying automatically in ${Math.ceil(recycleBreakerCooldownMs() / 1000)}s, ` +
+        'or restart DSH to retry immediately. Nothing was permanently deleted.',
     }
   }
 
@@ -191,7 +265,7 @@ export function moveToSystemRecycleBin(absPath: string): RecycleOutcome {
 
   const outcome = attemptRecycle(absPath)
   if (outcome.ok) {
-    consecutiveFailures = 0
+    recordRecycleSuccess()
   } else {
     // 走同一个计数入口，保证测试驱动的路径与生产路径是同一份逻辑。
     recordRecycleFailure()
@@ -672,6 +746,7 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
       recycled: 0,
       reason: `recycle-bin destination is only implemented on win32 (current: ${process.platform})`,
       unsupported: true,
+      notAttempted: true,
     }
   }
 
@@ -679,7 +754,16 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
     return {
       ok: false,
       recycled: 0,
-      reason: `recycle bin unavailable after ${consecutiveFailures} consecutive failures. Restart DSH to retry.`,
+      /*
+       * 短路：**一个字节都没动**。标成 notAttempted，让调用方别把它当成
+       * 「shell 没回报去向」那种真正的 unknown。
+       */
+      notAttempted: true,
+      skippedByBreaker: true,
+      reason:
+        `recycle bin unavailable after ${consecutiveFailures} consecutive failures; ` +
+        `retrying automatically in ${Math.ceil(recycleBreakerCooldownMs() / 1000)}s, ` +
+        'or restart DSH to retry immediately. Nothing was deleted.',
     }
   }
 
@@ -763,7 +847,7 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
     }
 
     if (parsed.ok > 0) {
-      consecutiveFailures = 0
+      recordRecycleSuccess()
       if (parsed.fail === 0) {
         return { ok: true, recycled: parsed.ok, succeededPaths: parsed.succeededPaths }
       }

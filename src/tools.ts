@@ -766,17 +766,33 @@ async function deleteMany(
      * 都会因为"没给逐条清单"而报失败（2026-11-10 复审 D08）。
      */
     const resolvedBySummary = outcome.ok === true && succeededPaths.size === 0 && !ambiguousFailure
+    /*
+     * ## 短路（熔断 / 平台不支持）不是 unknown（2026-11-18 用户事故）
+     *
+     * `notAttempted` 表示**一个字节都没动过** —— 它不能和「shell 跑过了但没
+     * 回报去向」混为一谈。旧实现把两者都归进 `unknownPlans`，于是工具输出
+     * "Outcome UNKNOWN (122) — check the recycle bin before retrying"，
+     * 而真正的原因（"recycle bin unavailable after 3 consecutive failures"）
+     * 被丢掉了。用户去查容量、权限、junction，查的全是无关的地方。
+     */
+    const notAttempted = outcome.ok === false && outcome.notAttempted === true
+    /*
+     * 短路时**每一条都有确定结论**：一个字节都没动过，全都在原地。
+     * 它们进 `remainingPlans`（回落安全区）而不是 `unknownPlans`。
+     */
     const recycledFromSummary = resolvedBySummary
       ? plans.filter((p) => !failedPaths.has(p.target))
       : recycledPlans
-    const unknownPlans = resolvedBySummary
+    const unknownPlans = resolvedBySummary || notAttempted
       ? []
       : ambiguousFailure
         ? plans.filter((p) => !succeededPaths.has(p.target))
         : plans.filter((p) => !failedPaths.has(p.target) && !succeededPaths.has(p.target))
-    const remainingPlans = plans.filter((p) => failedPaths.has(p.target))
+    const remainingPlans = notAttempted
+      ? plans
+      : plans.filter((p) => failedPaths.has(p.target))
 
-    if (recycledFromSummary.length > 0 || unknownPlans.length > 0) {
+    if (recycledFromSummary.length > 0 || unknownPlans.length > 0 || notAttempted) {
       const auditRecords: Array<Omit<AuditRecord, 'at'>> = recycledFromSummary.map((p) => ({
         event: 'delete',
         target: p.target,
@@ -818,6 +834,22 @@ async function deleteMany(
       const lines = shownSuccess.map((p) => `${p.target}  →  system recycle bin`)
       if (recycledFromSummary.length > shownSuccess.length) {
         lines.push(`  …and ${recycledFromSummary.length - shownSuccess.length} more`)
+      }
+      /*
+       * ## 短路时把真实原因放到最前面（2026-11-18 用户事故）
+       *
+       * 熔断短路时整批**一个字节都没动**，而原因早就在 `outcome.reason` 里
+       * （"recycle bin unavailable after 3 consecutive failures; retrying
+       * automatically in 30s"）。旧代码把它丢掉、只输出 "Outcome UNKNOWN"，
+       * 用户于是去查容量、权限、junction —— 查的全是无关的地方。
+       *
+       * 这段话必须排在成功/失败明细之前：它是这一整批的**唯一**结论。
+       */
+      if (notAttempted && outcome.ok === false && typeof outcome.reason === 'string' && outcome.reason !== '') {
+        lines.unshift(
+          `NOT ATTEMPTED — nothing was deleted and nothing is at risk: ${outcome.reason}`,
+          `All ${plans.length} item(s) are still at their original paths.`,
+        )
       }
       if (unknownPlans.length > 0) {
         lines.push('', `Outcome UNKNOWN (${unknownPlans.length}) — check the recycle bin before retrying:`)
@@ -894,6 +926,19 @@ async function deleteMany(
       appendAuditBatch(ctx.stateDir, fallbackAudit)
       if (fallbackMoved > 0) {
         lines.push('', `Fell back to the safe zone: ${fallbackMoved} item(s) moved there and can be restored with safe_zone_restore.`)
+      }
+      /*
+       * 短路时把**真实原因**再说一遍（2026-11-18）。
+       *
+       * 上面那段 `NOT ATTEMPTED` 说明"为什么没进回收站"，这里补"所以它们
+       * 去了哪里"。两段一起读，用户才不用去查容量/权限/junction。
+       */
+      if (notAttempted && outcome.ok === false && typeof outcome.reason === 'string' && outcome.reason !== '') {
+        lines.push(
+          '',
+          `Recycle bin was not attempted (${outcome.reason}); ` +
+            `${fallbackMoved} of ${plans.length} item(s) were moved into the safe zone instead.`,
+        )
       }
       if (failed.length > 0) {
         lines.push('', `Still not handled (${failed.length}):`)
