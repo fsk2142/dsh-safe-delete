@@ -66,7 +66,10 @@ function defaultTarget(profile) {
 }
 
 const explicit = process.argv[2]
-const target = explicit !== undefined && explicit !== '' ? resolve(explicit) : defaultTarget('desktop')
+const profile = process.env['DSH_PROFILE'] !== undefined && process.env['DSH_PROFILE'] !== ''
+  ? process.env['DSH_PROFILE']
+  : 'desktop'
+const target = explicit !== undefined && explicit !== '' ? resolve(explicit) : defaultTarget(profile)
 const dstLib = join(target, 'lib')
 
 if (!existsSync(SRC_LIB)) {
@@ -405,6 +408,16 @@ for (const entry of manifestFiles) {
    */
   if (existsSync(dest)) pruneStale(src, dest)
   cpSync(src, dest, { recursive: true })
+  published += 1
+}
+
+// package.json 不在 npm 的 files 清单里，但安装副本必须同步它：
+// 版本、exports、peerDependencies 与 bin 声明都住在这里。
+const manifestDest = join(target, 'package.json')
+if (isLink(manifestDest)) {
+  linkRefusals.add(manifestDest)
+} else {
+  cpSync(join(SRC_ROOT, 'package.json'), manifestDest)
   published += 1
 }
 

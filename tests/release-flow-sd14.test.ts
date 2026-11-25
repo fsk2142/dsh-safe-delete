@@ -68,8 +68,8 @@ describe('SD-14: release script breakpoints', () => {
     expect(src, '不该裸调 pnpm').not.toMatch(/run\(\[\s*"pnpm"/)
     expect(src, '不该裸调 npx').not.toMatch(/run\(\[\s*"npx"/)
     // 必须走 runPnpm。
-    expect(src, '应通过 runPnpm 跑 pnpm').toMatch(/runPnpm\(\["build"\]\)/)
-    expect(src, '应通过 runPnpm 跑 vitest').toMatch(/runPnpm\(\["exec",\s*"vitest"/)
+    expect(src, '应通过 runPnpm 跑完整 gate').toMatch(/runPnpm\(\["gate"\]\)/)
+    expect(src, '不该再单独跑半套 vitest').not.toMatch(/runPnpm\(\["exec",\s*"vitest"/)
   })
 
   it('uses a ref that actually exists for the git log range', () => {
@@ -104,9 +104,9 @@ describe('SD-14: release script breakpoints', () => {
     expect(pushAt, '应能找到 push').toBeGreaterThan(0)
 
     const beforePush = src.slice(0, pushAt)
-    expect(beforePush, 'push 之前应有 typecheck').toMatch(/"exec",\s*"tsc"/)
-    expect(beforePush, 'push 之前应有 vitest').toMatch(/"exec",\s*"vitest"/)
-    expect(beforePush, 'push 之前应有 build').toMatch(/runPnpm\(\["build"\]\)/)
+    expect(beforePush, 'push 之前必须跑完整 gate').toMatch(/runPnpm\(\["gate"\]\)/)
+    expect(beforePush, 'push 之前必须用显式暂存').toMatch(/stageReleaseFiles\(\)/)
+    expect(beforePush, '不能用 git add -A 吞入未跟踪文件').not.toMatch(/"add",\s*"-A"/)
   })
 
   it('exists and parses', () => {

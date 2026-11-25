@@ -26,6 +26,8 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
+import { stageReleaseFiles } from "./release-stage.mjs";
+
 /**
  * 读一个命令的输出。
  *
@@ -298,29 +300,14 @@ async function main() {
     prevTag = "";
   }
 
-  // 2. 写版本号并重建产物（版本号是构建期注入的）。
+  // 2. 写版本号；下面的 gate 会负责重建产物。
   run(["node", "scripts/next-version.mjs", "--write"]);
   console.log("已写回 package.json");
-  /*
-   * ## 用当前 Node 可执行文件跑 pnpm，而不是裸命令（SD-14 断点 2）
-   *
-   * `execFileSync('pnpm', ...)` 在 Windows 上直接 ENOENT —— pnpm 是
-   * `.cmd` 包装，`execFileSync` 不会像 shell 那样解析 PATHEXT。
-   *
-   * 复审在 Windows 上实测 npx / pnpm 入口均 ENOENT。
-   *
-   * 这里改用 `process.execPath` 跑 pnpm 的 JS 入口；找不到就退回
-   * `shell: true`（由 shell 解析 `.cmd`）。两条路都比裸 `execFileSync` 稳。
-   */
-  runPnpm(["build"]);
-  console.log("产物已重建");
-
+  // gate 会负责重建产物。
   // 3. 全量验证：任何一步失败都不该发出去。
-  //
-  // 走 `pnpm exec` 而不是裸 `npx` —— 与 build 同样的跨平台理由（SD-14 断点 2）：
-  // Windows 上 `npx` 是 `.cmd` 包装，`execFileSync` 直接 ENOENT。
-  runPnpm(["exec", "tsc", "--noEmit"]);
-  runPnpm(["exec", "vitest", "run"]);
+  // gate 已包含 build、typecheck、测试、隐私审计、文档一致、死代码、拦截链、
+  // 设置契约、变异检查、对抗/误伤探针与客户端渲染，不能在这里退化成半套检查。
+  runPnpm(["gate"]);
 
   /*
    * ## 所有本地检查必须在**任何远程写**之前完成（SD-14）
@@ -330,7 +317,7 @@ async function main() {
    */
   // 4. 提交 + 打 tag + 推送。
   const tag = `v${next.next}`;
-  run(["git", "add", "-A"]);
+  stageReleaseFiles();
   run(["git", "commit", "-m", `chore(release): ${tag}`]);
   run(["git", "tag", tag]);
   run(["git", "push", "origin", "main", "--tags"]);
