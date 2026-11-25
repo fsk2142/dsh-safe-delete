@@ -84,8 +84,9 @@ if (!existsSync(target)) {
 /** 源目录的顶层条目名：决定要复制什么、以及目标里哪些是陈旧的。 */
 const srcNames = new Set(readdirSync(SRC_LIB))
 
-// 1. 删除目标里多余的陈旧文件（路径必须在 dstLib 之内）。
+// 1. 删除目标里多余的陈旧文件（路径必须在对应安全根目录之内）。
 const resolvedLib = resolve(dstLib)
+const resolvedTarget = resolve(target)
 
 /**
  * `child` 是否在 `parent` 之内（按分隔符边界）。
@@ -134,28 +135,80 @@ function isLink(full) {
 }
 
 /**
- * 目标目录的真实路径，用于核对"没被链接带出安装根"。
+ * 判断一个目录树里任何位置是否有链接。
  *
+ * ## 为什么只查顶层不够（2026-11-25）
+ *
+ * `cpSync(src, dst, { recursive: true })` 会**跟随**目标一侧已有的链接。
+ * 实测：`dst/nested` 是 junction → `cpSync` 之后文件出现在链接指向的外部目录。
+ * 所以复制前必须确认整棵目标树没有链接，而不只是顶层。
+ *
+ * 读不到子树时保守返回真（拒绝复制），因为这正是"说不清"的情形。
+ *
+ * @param root 目标条目（文件或目录）。
+ * @param seen 递归环保护。
+ * @returns 树内存在链接或无法确认时返回真。
+ */
+function treeHasLink(root, seen = new Set()) {
+  if (isLink(root)) return true
+  const st = lstatSync(root, { throwIfNoEntry: false })
+  if (st === undefined) return false
+  if (!st.isDirectory()) return false
+  let real
+  try {
+    real = realpathSync(root)
+  } catch {
+    return true
+  }
+  if (seen.has(real)) return false
+  seen.add(real)
+  let names
+  try {
+    names = readdirSync(root)
+  } catch {
+    return true
+  }
+  for (const name of names) {
+    if (treeHasLink(join(root, name), seen)) return true
+  }
+  return false
+}
+
+/**
+ * 复制前的目标树守卫。
+ *
+ * @param dest 目标条目。
+ * @returns 可以安全复制时返回假。
+ */
+function targetTreeHasLink(dest) {
+  if (!existsSync(dest)) return false
+  return treeHasLink(dest)
+}
+/**
+ * 目标目录的真实路径，用于核对"没被链接带出安全根"。
+ *
+ * @param rootDir 本次清理的安全根目录。
  * @returns 真实路径；拿不到时 undefined。
  */
-function realLibRoot() {
+function realRoot(rootDir) {
   try {
-    return realpathSync(dstLib)
+    return realpathSync(rootDir)
   } catch {
     return undefined
   }
 }
 
 /**
- * 一个目录的真实路径是否仍在安装根内。
+ * 一个目录的真实路径是否仍在安全根内。
  *
  * 词法前缀只能证明"名字看起来在里面"，而链接可以让实际位置跑到外面。
  *
  * @param dir 目录绝对路径。
- * @returns 在安装根内返回真；拿不到真实路径时保守返回 false。
+ * @param rootDir 本次清理的安全根目录。
+ * @returns 在安全根内返回真；拿不到真实路径时保守返回 false。
  */
-function realUnderLib(dir) {
-  const root = realLibRoot()
+function realUnderRoot(dir, rootDir) {
+  const root = realRoot(rootDir)
   if (root === undefined) return false
   let real
   try {
@@ -187,8 +240,9 @@ const keptReasons = []
  * @param sourceDir 源目录（构建产物）；传 `null` 表示"这一整棵在源里不存在"。
  * @param destDir 目标目录（安装副本）。
  * @param depth 当前深度，只用于日志缩进。
+ * @param rootDir 本次清理的安全根目录；递归时必须原样传递。
  */
-function pruneStale(sourceDir, destDir, depth = 0) {
+function pruneStale(sourceDir, destDir, depth = 0, rootDir = resolvedLib) {
   let destNames
   try {
     destNames = readdirSync(destDir)
@@ -207,7 +261,7 @@ function pruneStale(sourceDir, destDir, depth = 0) {
      * 词法前缀（`isUnder`）只能证明"名字看起来在里面"。链接会让实际位置
      * 跑到外面，所以这里再用 `realpathSync` 核对一次。
      */
-    if (!isUnder(full, resolvedLib)) {
+    if (!isUnder(full, rootDir)) {
       console.error(`跳过越界路径：${full}`)
       continue
     }
@@ -229,7 +283,7 @@ function pruneStale(sourceDir, destDir, depth = 0) {
       linkRefusals.add(full)
       continue
     }
-    if (!realUnderLib(destDir)) {
+    if (!realUnderRoot(destDir, rootDir)) {
       linkRefusals.add(destDir)
       continue
     }
@@ -238,7 +292,7 @@ function pruneStale(sourceDir, destDir, depth = 0) {
       const srcChild = join(sourceDir, name)
       if (statSync(full, { throwIfNoEntry: false })?.isDirectory() === true) {
         if (statSync(srcChild, { throwIfNoEntry: false })?.isDirectory() === true) {
-          pruneStale(srcChild, full, depth + 1)
+          pruneStale(srcChild, full, depth + 1, rootDir)
         }
       }
       continue
@@ -268,7 +322,7 @@ function pruneStale(sourceDir, destDir, depth = 0) {
         if (childSt === undefined) continue
         if (childSt.isDirectory()) {
           // 嵌套目录：整棵都不在源里，按空源目录递归处理。
-          pruneStale(null, childFull, depth + 1)
+          pruneStale(null, childFull, depth + 1, rootDir)
           continue
         }
         removedBytes += childSt.size
@@ -360,7 +414,7 @@ for (const name of srcNames) {
    * （与 `pruneStale` 那条同源）。先看它是什么，是链接就拒绝。
    */
   const destination = join(dstLib, name)
-  if (isLink(destination)) {
+  if (targetTreeHasLink(destination)) {
     linkRefusals.add(destination)
     continue
   }
@@ -398,7 +452,7 @@ for (const entry of manifestFiles) {
     continue
   }
   const dest = join(target, name)
-  if (isLink(dest)) {
+  if (targetTreeHasLink(dest)) {
     linkRefusals.add(dest)
     continue
   }
@@ -406,7 +460,7 @@ for (const entry of manifestFiles) {
    * 先删掉目标里"源目录已经不再有的"同名内容（例如 `docs/` 里删掉的一篇），
    * 再整体复制。判定同样走 `pruneStale`，所以链接守卫一致生效。
    */
-  if (existsSync(dest)) pruneStale(src, dest)
+  if (existsSync(dest)) pruneStale(src, dest, 0, resolvedTarget)
   cpSync(src, dest, { recursive: true })
   published += 1
 }

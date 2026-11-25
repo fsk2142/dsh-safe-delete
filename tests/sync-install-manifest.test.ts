@@ -55,4 +55,32 @@ describe('sync-install keeps the installed manifest current', () => {
     const installed = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')) as { version: string }
     expect(installed.version).toBe('9.9.9')
   })
+
+  it('prunes stale files in published directories outside lib without false out-of-bound warnings', () => {
+    const sourceBin = join(source, 'bin')
+    const sourceLocale = join(source, 'locale')
+    mkdirSync(sourceBin)
+    mkdirSync(sourceLocale)
+    writeFileSync(join(sourceBin, 'cli.mjs'), 'new cli\n')
+    writeFileSync(join(sourceLocale, 'en.json'), '{}\n')
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: 'dsh-safe-delete',
+      version: '9.9.9',
+      files: ['lib/', 'bin/', 'locale/'],
+    }))
+
+    const target = join(root, 'installed')
+    mkdirSync(join(target, 'lib'), { recursive: true })
+    mkdirSync(join(target, 'bin'))
+    mkdirSync(join(target, 'locale'))
+    writeFileSync(join(target, 'package.json'), JSON.stringify({ name: 'dsh-safe-delete', version: '1.0.0', files: [] }))
+    writeFileSync(join(target, 'bin', 'stale.mjs'), 'stale\n')
+    writeFileSync(join(target, 'locale', 'zz-old.json'), 'stale\n')
+
+    const output = runSync(target)
+
+    expect(existsSync(join(target, 'bin', 'stale.mjs'))).toBe(false)
+    expect(existsSync(join(target, 'locale', 'zz-old.json'))).toBe(false)
+    expect(output).not.toMatch(/跳过越界路径/)
+  })
 })
