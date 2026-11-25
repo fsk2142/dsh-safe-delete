@@ -31,6 +31,9 @@ const fakeReact = {
   useMemo: (fn) => fn(),
   useRef: (initial) => ({ current: initial }),
   useReducer: (reducer, initial) => [initial, () => {}],
+  // 客户端用 useSyncExternalStore 订阅 configForms 的实时快照。
+  // 这里的假实现只返回初始快照：这些脚本检查的是注册与结构，不是响应式更新。
+  useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const fakeJsx = {
   jsx: (type, props) => element(type, props),
@@ -192,9 +195,18 @@ const checks = [
      */
     ['mutate(ns, ops, revision) 三参数', /\w*mote\s*[!?]?\.mutate!?\(NAMESPACE, ops, revision\)/],
   ['ops 形如 {op, path, value}', /op: 'set' as const/],
-  ['拆远程信封', /unwrapRemote\(result\)/],
+  /*
+   * 这条原来写死 `unwrapRemote(result)` —— 而客户端给它的失败文案补了第二个参数
+   * （`unwrapRemote(result, t('hostRejected'))`），于是门禁误报「契约缺失」。
+   * 契约要守的是「每个远程返回值都经过信封拆解」，不是调用点上写几个参数。
+   */
+  ['拆远程信封', /unwrapRemote\(/],
   ['形状不可信时先验再读', /typeof entry !== 'object'/],
-  ['读不到命名空间时如实说明', /没有读到本插件的配置/],
+  /*
+   * 「读不到配置时如实说明」现在走 locale 键（`t('noConfig')`），不再硬编码中文。
+   * 断言同时接受历史文案与本地化键，避免换语言后门禁再次误报。
+   */
+  ['读不到命名空间时如实说明', /没有读到本插件的配置|t\('noConfig'\)/],
   ['每步单独兜住（guarded）', /const guarded = \(step: string, run: \(\) => void\)/],
 ]
 for (const [label, pattern] of checks) {

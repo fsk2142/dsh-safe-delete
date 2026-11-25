@@ -26,6 +26,9 @@ const fakeReact = {
   useMemo: (fn) => fn(),
   useRef: (initial) => ({ current: initial }),
   useReducer: (reducer, initial) => [initial, () => {}],
+  // 客户端用 useSyncExternalStore 订阅 configForms 的实时快照。
+  // 这里的假实现只返回初始快照：这些脚本检查的是注册与结构，不是响应式更新。
+  useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const fakeJsxRuntime = {
   jsx: (type, props) => element(type, props),
