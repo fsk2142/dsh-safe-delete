@@ -39,7 +39,7 @@
  * @module dsh-safe-delete/cleanup-run
  */
 
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 
 import type { PermanentDeleteRisk, Recycler } from './recycle'
@@ -174,8 +174,13 @@ function measureDirectoryBytes(dir: string): number | undefined {
   for (const name of names) {
     const full = join(dir, name)
     try {
-      const st = statSync(full, { throwIfNoEntry: false })
+      const st = lstatSync(full, { throwIfNoEntry: false })
       if (st === undefined) continue
+      if (st.isSymbolicLink()) {
+        // 链接本身不是批次内容；跟随它会越出安全区，甚至形成递归环。
+        total += st.size
+        continue
+      }
       if (st.isDirectory()) {
         total += measureDirectoryBytes(full) ?? 0
         continue
