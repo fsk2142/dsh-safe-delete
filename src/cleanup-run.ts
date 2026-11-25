@@ -157,24 +157,35 @@ function restoreMovedToItems(
 }
 
 /**
- * 量一个目录里所有文件的真实总字节数（只走一层，`items/<id>` 每条是一次
- * 目录或文件 rename 的结果，所以这是精确的）。
+ * 量一个目录树的真实总字节数。
+ *
+ * `items/<id>` 的每一项都是一次 rename 的结果，所以子树也要算 —— 目录里
+ * 可以嵌套目录。链接不跟随，只计链接自身的大小。
  *
  * @param dir 目录。
- * @returns 字节数；读不到时 `undefined`（调用方按 unknown 处理）。
+ * @param io 可注入的只读文件系统操作（测试用，默认走真实 `node:fs`）。
+ * @returns 字节数；任何一层读不到时 `undefined`（调用方按 unknown 处理）。
  */
-function measureDirectoryBytes(dir: string): number | undefined {
+export function measureDirectoryBytes(
+  dir: string,
+  io: {
+    readdirSync: (dir: string) => string[]
+    lstatSync: (path: string, options?: { throwIfNoEntry?: boolean }) =>
+      | { isSymbolicLink(): boolean; isDirectory(): boolean; size: number }
+      | undefined
+  } = { readdirSync, lstatSync } as never,
+): number | undefined {
   let total = 0
   let names: string[]
   try {
-    names = readdirSync(dir)
+    names = io.readdirSync(dir)
   } catch {
     return undefined
   }
   for (const name of names) {
     const full = join(dir, name)
     try {
-      const st = lstatSync(full, { throwIfNoEntry: false })
+      const st = io.lstatSync(full, { throwIfNoEntry: false })
       if (st === undefined) continue
       if (st.isSymbolicLink()) {
         // 链接本身不是批次内容；跟随它会越出安全区，甚至形成递归环。
@@ -182,7 +193,14 @@ function measureDirectoryBytes(dir: string): number | undefined {
         continue
       }
       if (st.isDirectory()) {
-        total += measureDirectoryBytes(full) ?? 0
+        const nested = measureDirectoryBytes(full, io)
+        /*
+         * 子树读不到时必须向父层返回 unknown，不能 `?? 0` 继续累计：
+         * 未知大小一旦被算成 0，配额闸门就会拿到一个偏小的确定值并放行，
+         * 无人值守清理可能把超配额内容交给系统永久删除。
+         */
+        if (nested === undefined) return undefined
+        total += nested
         continue
       }
       total += st.size
