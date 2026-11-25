@@ -1,6 +1,6 @@
 import { r as DeleteExecutionSnapshot, t as BoundedMeasure } from "./chunks/types.js";
 import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./chunks/recycle.js";
-import { k as ClassifyEnv, r as DeleteDestination } from "./chunks/delete-core.js";
+import { j as ClassifyEnv, r as DeleteDestination } from "./chunks/delete-core.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */

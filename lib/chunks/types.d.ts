@@ -77,10 +77,14 @@ type BoundedMeasure =
  * "当前调用"变量，因此并发工具调用不会串线。
  */
 interface DeleteExecutionSnapshot {
+  /** 本次获批的删除去向；volatile 配置在审批后变化时，执行体仍必须使用它。 */
+  destination: 'safe-zone' | 'recycle-bin';
   /** 钩子看到的每个目标身份；目录还记录当时统计出的条目数与字节数。 */
   targets: DeleteTargetSnapshot[];
   /** 模式删除在钩子阶段不枚举目标；这张卡明确覆盖执行时枚举出的集合。 */
   pattern?: boolean;
+  /** 模式删除的 root 身份；root 被换成链接或另一目录时拒绝枚举。 */
+  root?: DeleteTargetSnapshot;
   /** 本次是否已经覆盖"路径危险 / 超过确认阈值"这类门禁。 */
   gateApproved: boolean;
   /** 本次是否已经覆盖"回收站策略或配额可能导致永久删除"这类风险。 */
@@ -96,6 +100,7 @@ interface DeleteTargetSnapshot {
   ctimeMs: number;
   mode: number;
   isDirectory: boolean;
+  isSymbolicLink: boolean;
   fileCount: number;
   bytes: number;
   /** 快速路径只记录身份时为 false；执行时不比较条目数与字节数。 */

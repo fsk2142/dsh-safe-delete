@@ -19,6 +19,26 @@ export type RecycleGate = {
   kind: 'hold';
   reason: string;
 };
+/**
+ * 量一个目录树的真实总字节数。
+ *
+ * `items/<id>` 的每一项都是一次 rename 的结果，所以子树也要算 —— 目录里
+ * 可以嵌套目录。链接不跟随，只计链接自身的大小。
+ *
+ * @param dir 目录。
+ * @param io 可注入的只读文件系统操作（测试用，默认走真实 `node:fs`）。
+ * @returns 字节数；任何一层读不到时 `undefined`（调用方按 unknown 处理）。
+ */
+export declare function measureDirectoryBytes(dir: string, io?: {
+  readdirSync: (dir: string) => string[];
+  lstatSync: (path: string, options?: {
+    throwIfNoEntry?: boolean;
+  }) => {
+    isSymbolicLink(): boolean;
+    isDirectory(): boolean;
+    size: number;
+  } | undefined;
+}): number | undefined;
 /** worker 的执行结果。 */
 export interface WorkerResult {
   /** 真正送入系统回收站（或永久丢弃）的条数。 */

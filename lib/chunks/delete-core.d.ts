@@ -126,6 +126,8 @@ type DeleteDestination = 'safe-zone' | 'recycle-bin';
 declare function normalizeDestination(raw: unknown): DeleteDestination;
 /** 把一个目标的当前身份与规模固化为审批快照。 */
 declare function captureTargetSnapshot(target: string, description?: TargetDescription): DeleteTargetSnapshot | undefined;
+/** 只核对目标身份，不依赖目录统计。 */
+declare function verifyTargetIdentity(expected: DeleteTargetSnapshot, target: string): string | undefined;
 /**
  * 核对执行时目标是否仍是审批时那一份。
  *
@@ -133,6 +135,8 @@ declare function captureTargetSnapshot(target: string, description?: TargetDescr
  * 大小与两个时间戳仍能拦住最常见的"批准后替换成大文件"。
  */
 declare function verifyTargetSnapshot(expected: DeleteTargetSnapshot, target: string, description: TargetDescription): string | undefined;
+/** 执行体在任意异步步骤之后、真正操作目标之前再核对一次快照。 */
+declare function verifyExecutionTarget(ctx: DeleteContext, target: string, description: TargetDescription): string | undefined;
 /** 门禁审批：快照存在时只认快照，不再调用生产恒放行桩。 */
 declare function approveGate(ctx: DeleteContext, reason: string): Promise<ApprovalOutcome>;
 /** 不可恢复风险审批：快照存在时只认快照，新风险一律拒绝。 */
@@ -343,4 +347,4 @@ declare function describeRecycled(result: Extract<DeleteResult, {
  */
 declare function hardRefusal(target: string, stateDir: string): string | undefined;
 //#endregion
-export { isDriveRoot as C, redactReason as D, permanentRiskOf as E, verifyTargetSnapshot as O, humanBytes as S, normalizeDestination as T, describePreview as _, DeleteResult as a, forecastSpace as b, approvalFailureText as c, boundReason as d, captureTargetSnapshot as f, describeMoved as g, describeApprovalRequest as h, DeleteRequest as i, ClassifyEnv as k, approveGate as l, deletePath as m, DeleteContext as n, GateDecision as o, decideGate as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, approveRecycleRisk as u, describeRecycled as v, isInsideStateDir as w, hardRefusal as x, describeSpaceRisks as y };
+export { verifyTargetSnapshot as A, isDriveRoot as C, redactReason as D, permanentRiskOf as E, verifyExecutionTarget as O, humanBytes as S, normalizeDestination as T, describePreview as _, DeleteResult as a, forecastSpace as b, approvalFailureText as c, boundReason as d, captureTargetSnapshot as f, describeMoved as g, describeApprovalRequest as h, DeleteRequest as i, ClassifyEnv as j, verifyTargetIdentity as k, approveGate as l, deletePath as m, DeleteContext as n, GateDecision as o, decideGate as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, approveRecycleRisk as u, describeRecycled as v, isInsideStateDir as w, hardRefusal as x, describeSpaceRisks as y };
