@@ -542,12 +542,12 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     const succeeded = recycled.succeededPaths
     const failed = recycled.failedPaths
     const reallyRecycled =
-      recycled.ok &&
-      (succeeded !== undefined
+      succeeded !== undefined
         ? succeeded.includes(target)
-        : failed !== undefined
-          ? !failed.includes(target)
-          : recycled.recycled > 0)
+        : recycled.ok &&
+          (failed !== undefined
+            ? !failed.includes(target)
+            : recycled.recycled > 0)
 
     if (reallyRecycled) {
       appendAudit(ctx.stateDir, {

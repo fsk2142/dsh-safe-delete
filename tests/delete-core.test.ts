@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { decideGate, deletePath, describeApprovalRequest, type DeleteContext } from '../src/delete-core'
@@ -153,6 +153,36 @@ describe('deletePath moves into the safe zone', () => {
       const staged = join(ctx.stateDir, 'items', result.entry.id, 'named.txt')
       expect(existsSync(staged)).toBe(true)
     }
+  })
+})
+
+describe('deletePath recycle-bin reconciliation', () => {
+  it('trusts a per-path success even when the batch-level result is failure', async () => {
+    const ctx = makeCtx({
+      destination: 'recycle-bin',
+      permanentDeleteRisk: { status: 'safe', risky: false },
+      recycler: async (paths) => {
+        const target = paths[0] as string
+        // 模拟 SHFileOperation 已经移走目标，但脚本汇总因计数不一致返回 ok:false。
+        unlinkSync(target)
+        return {
+          ok: false,
+          recycled: 0,
+          reason: 'the recycle script report is inconsistent',
+          succeededPaths: [target],
+          failedPaths: [],
+        }
+      },
+    })
+    const file = join(ctx.env.workdir, 'already-recycled.txt')
+    writeFileSync(file, 'x')
+
+    const result = await deletePath({ path: file }, ctx)
+
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.kind).toBe('recycled')
+    expect(existsSync(file)).toBe(false)
+    expect(await listSafeZone(ctx.stateDir)).toHaveLength(0)
   })
 })
 
