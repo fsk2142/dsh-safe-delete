@@ -94,7 +94,7 @@ export interface DeleteContext {
    *
    * 命中时**先问人**，用户不同意就放弃本次删除 —— 绝不静默永久删除。
    */
-  permanentDeleteRisk?: PermanentDeleteRisk
+  permanentDeleteRisk?: PermanentDeleteRisk | (() => PermanentDeleteRisk)
   /** 需要人工确认时调用；返回是否放行。 */
   requestApproval: (reason: string) => Promise<ApprovalOutcome>
   /** 当前时间（测试可注入）。 */
@@ -108,6 +108,12 @@ export interface DeleteContext {
    * 风险必须拒绝，不能调用生产里恒放行的 `requestApproval` 桩。
    */
   executionSnapshot?: DeleteExecutionSnapshot
+}
+
+/** 取当前永久删除风险；生产接线传惰性读取器，测试可传固定值。 */
+export function permanentRiskOf(ctx: Pick<DeleteContext, 'permanentDeleteRisk'>): PermanentDeleteRisk | undefined {
+  const value = ctx.permanentDeleteRisk
+  return typeof value === 'function' ? value() : value
 }
 
 /** 审批结果。 */
@@ -553,12 +559,13 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
      * 也可能是"注册表读不到"——后者被并进 false 之后，"问不到"就变成了"不用问"。
      * 现在 `unknown` 也走审批。
      */
+    const policy = permanentRiskOf(ctx)
     const permStatus =
-      ctx.permanentDeleteRisk?.status ?? (ctx.permanentDeleteRisk?.risky === true ? 'risky' : 'safe')
+      policy?.status ?? (policy?.risky === true ? 'risky' : 'safe')
     if (permStatus !== 'safe') {
       const outcome = await approveRecycleRisk(ctx,
         `This delete will PERMANENTLY remove ${target} — the recycle bin is not in effect.\n\n` +
-          `Reason: ${ctx.permanentDeleteRisk?.reason ?? 'the system is configured to delete permanently'}\n\n` +
+          `Reason: ${policy?.reason ?? 'the system is configured to delete permanently'}\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {

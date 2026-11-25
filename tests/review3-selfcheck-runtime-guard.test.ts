@@ -125,27 +125,22 @@ describe('自检：不可识别的读取结果必须判 unknown，不能抛错',
     }
   })
 
-  it('would throw if the call site ever moved above the guard', async () => {
-    /*
-     * 把"为什么这件事要紧"变成可执行的证据：`applyInner` 里
-     * `detectPermanentDeleteRisk()` 必须先于 `createTools()` 与钩子注册。
-     *
-     * 如果哪天有人把这次调用挪到后面，崩溃的影响面会变小 —— 那时这条测试会红，
-     * 提醒改注释与断言，而不是让文档悄悄失真。
-     */
-    const { readFileSync } = await import('node:fs')
-    const src = readFileSync('src/index.ts', 'utf8')
+  it('contains a thrown probe without disabling later decisions', async () => {
+    const { createPermanentDeleteRiskProvider } = await import('../src/recycle')
+    let calls = 0
+    const provider = createPermanentDeleteRiskProvider({
+      detect: () => {
+        calls += 1
+        if (calls === 1) throw new Error('registry reader exploded')
+        return { status: 'safe', risky: false }
+      },
+      now: () => 1_000,
+    })
 
-    const detectAt = src.indexOf('const hookPermanentDeleteRisk = detectPermanentDeleteRisk()')
-    const createToolsAt = src.indexOf('const tools: ToolDefinition[] = createTools({')
-    const hookAt = src.indexOf("'tools/pre-execute'")
-
-    expect(detectAt, '应能找到风险检测的调用点').toBeGreaterThan(0)
-    expect(createToolsAt, '应能找到工具创建').toBeGreaterThan(0)
-    expect(hookAt, '应能找到钩子注册').toBeGreaterThan(0)
-
-    // 检测排在最前面 —— 这正是"它抛错就什么都装不上"的原因。
-    expect(detectAt).toBeLessThan(createToolsAt)
-    expect(detectAt).toBeLessThan(hookAt)
+    const first = provider()
+    expect(first.status).toBe('unknown')
+    expect(first.risky).toBe(false)
+    expect(provider().status).toBe('unknown')
+    expect(calls).toBe(1)
   })
 })

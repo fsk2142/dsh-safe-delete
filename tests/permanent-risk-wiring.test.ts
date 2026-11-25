@@ -1,37 +1,83 @@
-import { readFileSync } from 'node:fs'
-
 import { describe, expect, it } from 'vitest'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
-/*
- * 接线测试：`detectPermanentDeleteRisk` 必须真的被调用，而不是写好了放着。
- *
- * ## 为什么用静态断言（2026-11-04 审查 Critical-1）
- *
- * 上一版的 `destination` 接线缺口就是这样漏掉的：单元测试直接往 ctx 里塞字段，
- * 于是「配置 → deps → ctx」这条链从没被测过。
- *
- * 这里直接断言源码里有这条调用 —— 一旦有人删掉接线，测试立刻红。
- * 静态断言比行为测试更可靠：它不依赖测试自己注入的字段。
- */
+import { createTools } from '../src/tools'
+import { scratchDir } from './support/tmpdir'
+
 describe('permanent-delete risk wiring', () => {
-  it('index.ts actually calls detectPermanentDeleteRisk', () => {
-    const src = readFileSync('src/index.ts', 'utf8')
-    expect(src).toMatch(/detectPermanentDeleteRisk\s*\(/)
+  it('the single-path route consults the injected risk reader', async () => {
+    const root = scratchDir('dsd-risk-single-')
+    const work = join(root, 'work')
+    const state = join(root, 'state')
+    mkdirSync(work, { recursive: true })
+    const file = join(work, 'a.txt')
+    writeFileSync(file, 'x')
+    let reads = 0
+    let recycled = false
+
+    const tool = createTools({
+      stateDir: state,
+      env: { home: root, workdir: work, dshHome: root, safeZoneDir: state, tmpdir: root },
+      retentionDays: 1,
+      confirmFileCount: 0,
+      confirmBytes: 0,
+      destination: 'recycle-bin',
+      permanentDeleteRisk: () => {
+        reads += 1
+        return { status: 'risky', risky: true, reason: 'policy permanently deletes' }
+      },
+      requestApproval: async () => 'rejected',
+      recyclerMany: () => {
+        recycled = true
+        return { ok: true, recycled: 1 }
+      },
+    } as never).find((t) => t.name === 'safe_delete')!
+
+    const result = await tool.execute({ path: file })
+
+    expect(reads).toBe(1)
+    expect(recycled).toBe(false)
+    expect(existsSync(file)).toBe(true)
+    expect(result.ok).toBe(false)
   })
 
-  it('index.ts passes the risk into the tool deps', () => {
-    const src = readFileSync('src/index.ts', 'utf8')
-    expect(src).toMatch(/permanentDeleteRisk/)
-  })
+  it('the batch route consults the same injected risk reader', async () => {
+    const root = scratchDir('dsd-risk-batch-')
+    const work = join(root, 'work')
+    const state = join(root, 'state')
+    mkdirSync(work, { recursive: true })
+    const a = join(work, 'a.txt')
+    const b = join(work, 'b.txt')
+    writeFileSync(a, 'x')
+    writeFileSync(b, 'y')
+    let reads = 0
+    let recycled = false
 
-  it('tools.ts forwards the risk into the delete context', () => {
-    const src = readFileSync('src/tools.ts', 'utf8')
-    expect(src).toMatch(/permanentDeleteRisk/)
-  })
+    const tool = createTools({
+      stateDir: state,
+      env: { home: root, workdir: work, dshHome: root, safeZoneDir: state, tmpdir: root },
+      retentionDays: 1,
+      confirmFileCount: 0,
+      confirmBytes: 0,
+      destination: 'recycle-bin',
+      permanentDeleteRisk: () => {
+        reads += 1
+        return { status: 'risky', risky: true, reason: 'policy permanently deletes' }
+      },
+      requestApproval: async () => 'rejected',
+      recyclerMany: () => {
+        recycled = true
+        return { ok: true, recycled: 2 }
+      },
+    } as never).find((t) => t.name === 'safe_delete')!
 
-  it('the batch route consults the risk too', () => {
-    const src = readFileSync('src/tools.ts', 'utf8')
-    // deleteMany 里必须出现这个判断，否则「删几千个」那条路依然静默。
-    expect(src).toMatch(/permanentDeleteRisk\?\.risky/)
+    const result = await tool.execute({ paths: [a, b] })
+
+    expect(reads).toBe(1)
+    expect(recycled).toBe(false)
+    expect(existsSync(a)).toBe(true)
+    expect(existsSync(b)).toBe(true)
+    expect(result.ok).toBe(false)
   })
 })

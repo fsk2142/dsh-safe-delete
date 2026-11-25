@@ -1383,6 +1383,48 @@ export function detectPermanentDeleteRisk(
   return perVolume
 }
 
+/** 永久删除风险结论的缓存有效期。 */
+const PERMANENT_RISK_CACHE_TTL_MS = 60_000
+
+/**
+ * 造一个惰性、带 TTL 的永久删除风险读取器。
+ *
+ * ## 为什么不再在 apply 时同步读（2026-11-25 复审）
+ *
+ * 默认部署走安全区，根本不使用回收站策略；旧实现仍在启动时同步跑两次
+ * `reg.exe`，本机实测 221–314ms。策略还会在运行期被组策略修改，因此
+ * 既不能启动时白读，也不能永久缓存第一次结论。
+ *
+ * 现在：第一次回收站决策才读，60 秒内复用，过期重读。读取抛错时保守
+ * 返回 `unknown`，与 `detectPermanentDeleteRisk` 的三态契约一致。
+ */
+export function createPermanentDeleteRiskProvider(options: {
+  detect?: () => PermanentDeleteRisk
+  now?: () => number
+  ttlMs?: number
+} = {}): () => PermanentDeleteRisk {
+  const detect = options.detect ?? detectPermanentDeleteRisk
+  const now = options.now ?? Date.now
+  const ttlMs = options.ttlMs ?? PERMANENT_RISK_CACHE_TTL_MS
+  let cached: PermanentDeleteRisk | undefined
+  let cachedAt = 0
+
+  return () => {
+    if (cached !== undefined && now() - cachedAt < ttlMs) return cached
+    try {
+      cached = detect()
+    } catch (error) {
+      cached = {
+        status: 'unknown',
+        risky: false,
+        reason: `could not read the recycle-bin policy (${error instanceof Error ? error.message : String(error)})`,
+      }
+    }
+    cachedAt = now()
+    return cached
+  }
+}
+
 /*
  * 回收站每卷上限的缓存。
  *

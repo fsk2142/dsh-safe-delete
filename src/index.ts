@@ -30,7 +30,7 @@ import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
 import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, captureTargetSnapshot, type DeleteDestination } from './delete-core'
-import { detectPermanentDeleteRisk, assessQuota } from './recycle'
+import { detectPermanentDeleteRisk, createPermanentDeleteRiskProvider, assessQuota } from './recycle'
 import { createSharedMeasure, describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
@@ -274,12 +274,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   // 工具侧的 `requestApproval` 因此恒为 `'allowed-once'`：走到工具执行体，说明
   // 管线已经把 `ask` 解决了（要么策略放行，要么用户点了允许一次）。
   /**
-   * 删除会被系统永久执行的风险 —— apply 时算一次，钩子与工具共用同一个结论。
-   *
-   * 钩子必须自己拿到它：工具内部那条路是恒放行的桩（见下方 requestApproval
-   * 的注释）。同一个值两处用，避免两处判定漂移。
+   * 回收站策略读取：第一次回收站决策才探测，60 秒内复用。
+   * 安全区部署的启动路径完全不会碰注册表。
    */
-  const hookPermanentDeleteRisk = detectPermanentDeleteRisk()
+  const readPermanentDeleteRisk = createPermanentDeleteRiskProvider({
+    detect: detectPermanentDeleteRisk,
+  })
 
   /** 本次工具调用的审批快照；键是宿主在 pre-execute 与 execute 间传递的同一对象。 */
   const executionSnapshots = new WeakMap<object, DeleteExecutionSnapshot>()
@@ -359,7 +359,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
      * 不接线的话 ctx.permanentDeleteRisk 永远是 undefined，
      * 检测函数会被 tree-shake 掉，README 的承诺就成了空话。
      */
-    permanentDeleteRisk: hookPermanentDeleteRisk,
+    permanentDeleteRisk: readPermanentDeleteRisk,
     executionSnapshot: (context) =>
       context !== null && typeof context === 'object' ? executionSnapshots.get(context) : undefined,
     /*
@@ -549,14 +549,15 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
              * 文案要按三态写：策略确定命中 / 策略读不到 / 策略正常。
              * 中间那一种正是 R02 修的洞 —— 读不到的旧值等于"无风险"。
              */
+            const recyclePolicy = readPermanentDeleteRisk()
             const policyStatus =
-              hookPermanentDeleteRisk.status ??
-              (hookPermanentDeleteRisk.risky ? 'risky' : 'safe')
+              recyclePolicy.status ??
+              (recyclePolicy.risky ? 'risky' : 'safe')
             const policyLine =
               policyStatus === 'risky'
-                ? ` System policy: ${hookPermanentDeleteRisk.reason ?? 'the recycle bin is not in effect'}.`
+                ? ` System policy: ${recyclePolicy.reason ?? 'the recycle bin is not in effect'}.`
                 : policyStatus === 'unknown'
-                  ? ` ${hookPermanentDeleteRisk.reason ?? 'The recycle bin policy could not be read'}.`
+                  ? ` ${recyclePolicy.reason ?? 'The recycle bin policy could not be read'}.`
                   : ' Matched items are not enumerated, so their sizes stay unknown and items above the recycle bin limit could be deleted permanently.'
             return {
               kind: 'deny',
@@ -594,15 +595,16 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 「这次会怎样」那句按三态写（R02）：策略命中 / 策略读不到 / 策略正常。
          * 中间那一种必须说出来 —— 它此前被并进"正常"，于是卡片什么风险都不提。
          */
+        const recyclePolicy = hookDestination === 'recycle-bin' ? readPermanentDeleteRisk() : undefined
         const permStatus =
-          hookPermanentDeleteRisk.status ?? (hookPermanentDeleteRisk.risky ? 'risky' : 'safe')
+          recyclePolicy?.status ?? (recyclePolicy?.risky === true ? 'risky' : 'safe')
         const destinationLine =
           hookDestination === 'recycle-bin'
             ? 'Matched items go to the system recycle bin, not the safe zone. ' +
               (permStatus === 'risky'
-                ? `System policy will permanently delete them: ${hookPermanentDeleteRisk.reason ?? 'recycling is disabled'}. `
+                ? `System policy will permanently delete them: ${recyclePolicy?.reason ?? 'recycling is disabled'}. `
                 : permStatus === 'unknown'
-                  ? `The recycle bin policy could not be read: ${hookPermanentDeleteRisk.reason ?? 'unknown'}. `
+                  ? `The recycle bin policy could not be read: ${recyclePolicy?.reason ?? 'unknown'}. `
                   : 'Matched sizes are unknown before execution; items exceeding recycle-bin capacity may be permanently deleted. ') +
               'safe_zone_restore cannot restore these items. '
             : 'Only matched items inside it move into the safe zone. '
@@ -618,12 +620,6 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 本插件自己的 `requestApproval` 恒返回 `allowed-once` —— 它的前提是
          * "管线已经问过了"。钩子这里必须走管线，否则等于没问。
          */
-        executionSnapshots.set(exec, {
-          targets: [],
-          pattern: true,
-          gateApproved: true,
-          recycleRiskApproved: true,
-        })
         executionSnapshots.set(exec, {
           targets: [],
           pattern: true,
@@ -746,7 +742,9 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
        */
       const riskVerdict = decideHookRisk({
         destination: hookDestination,
-        ...(hookPermanentDeleteRisk === undefined ? {} : { permanentDeleteRisk: hookPermanentDeleteRisk }),
+        ...(hookDestination === 'recycle-bin'
+          ? { permanentDeleteRisk: readPermanentDeleteRisk() }
+          : {}),
         targets: plan.resolved,
         sizes: plan.targetSizes,
         lowerBoundFlags: plan.lowerBoundFlags,

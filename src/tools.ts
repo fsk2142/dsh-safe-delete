@@ -24,6 +24,7 @@ import {
   approveRecycleRisk,
   verifyTargetSnapshot,
   hardRefusal,
+  permanentRiskOf,
   normalizeDestination,
   type DeleteDestination,
   describePreview,
@@ -178,7 +179,7 @@ export interface ToolDeps {
    *
    * 由插件入口在 apply 时算一次传进来：命中时删除前必须问人。
    */
-  permanentDeleteRisk?: PermanentDeleteRisk
+  permanentDeleteRisk?: PermanentDeleteRisk | (() => PermanentDeleteRisk)
   /**
    * 造一个**本次执行专用**的有界测量函数（2026-11-10 复审 D04）。
    *
@@ -679,12 +680,13 @@ async function deleteMany(
      *
      * `risky === true` 只覆盖"确定永久删除"；"读不到策略"同样不可忽略。
      */
+    const policy = permanentRiskOf(ctx)
     const permStatus =
-      ctx.permanentDeleteRisk?.status ?? (ctx.permanentDeleteRisk?.risky === true ? 'risky' : 'safe')
+      policy?.status ?? (policy?.risky === true ? 'risky' : 'safe')
     if (permStatus !== 'safe') {
       const outcome = await approveRecycleRisk(ctx,
         `This delete will PERMANENTLY remove ${plans.length} item(s) — the recycle bin is not in effect.\n\n` +
-          `Reason: ${ctx.permanentDeleteRisk?.reason ?? 'the system is configured to delete permanently'}\n\n` +
+          `Reason: ${policy?.reason ?? 'the system is configured to delete permanently'}\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
