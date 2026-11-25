@@ -156,6 +156,28 @@ let consecutiveFailures = 0
 /** 最近一次跳闸（或试探失败）的时刻；`0` 表示从未跳闸。 */
 let trippedAt = 0
 
+/** 半开探针是否已被某个异步回收调用占用。 */
+let probeInFlight = false
+
+/**
+ * 尝试开始一次回收调用。
+ *
+ * 冷却期内全部拒绝；半开窗口内只有第一个调用能拿到探针，其余立即短路。
+ * 未跳闸时不需要探针，因为并发是正常行为。
+ */
+export function tryBeginRecycleProbe(now: number = Date.now()): boolean {
+  if (recycleIsTripped(now)) return false
+  if (consecutiveFailures < FAILURE_BREAKER_THRESHOLD) return true
+  if (probeInFlight) return false
+  probeInFlight = true
+  return true
+}
+
+/** 释放半开探针；成功/失败记录负责复位或重新跳闸。 */
+export function endRecycleProbe(): void {
+  probeInFlight = false
+}
+
 /**
  * 回收站是否已被熔断（冷却期内）。
  *
@@ -188,6 +210,7 @@ export function recycleBreakerCooldownMs(): number {
 export function resetRecycleBreaker(): void {
   consecutiveFailures = 0
   trippedAt = 0
+  probeInFlight = false
 }
 
 /**
@@ -750,7 +773,7 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
     }
   }
 
-  if (recycleIsTripped()) {
+  if (!tryBeginRecycleProbe()) {
     return {
       ok: false,
       recycled: 0,
@@ -776,6 +799,8 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
   try {
     listDir = mkdtempSync(path.join(tmpdir(), 'dsd-recycle-'))
   } catch (error) {
+    // 探针已占用：这条早退路径必须自己释放，否则半开窗口永远闭不上。
+    endRecycleProbe()
     const message = error instanceof Error ? error.message : String(error)
     return { ok: false, recycled: 0, reason: `could not create the path list: ${message}` }
   }
@@ -878,6 +903,7 @@ export async function recycleManyToSystemBin(absPaths: readonly string[]): Promi
     const message = error instanceof Error ? error.message : String(error)
     return { ok: false, recycled: 0, reason: `SendToRecycleBin failed: ${message}` }
   } finally {
+    endRecycleProbe()
     try {
       rmSync(listDir, { recursive: true, force: true })
     } catch {
