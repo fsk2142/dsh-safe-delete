@@ -570,7 +570,21 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
                 `\`safe-zone\` so the items stay restorable with safe_zone_restore.`,
             }
           }
+          const rootSnapshot = captureTargetSnapshot(rootPath)
+          /*
+           * root 是链接时直接拒绝：链接会让枚举走进批准范围之外的目录。
+           * root 此刻还不存在时不在这里拒绝 —— 那只是"没东西可匹配"，
+           * 但也不记身份，执行体会因此要求重新审批。
+           */
+          if (rootSnapshot?.isSymbolicLink === true) {
+            return {
+              kind: 'deny',
+              reason: `refusing pattern delete because the root "${rootPath}" is a symbolic link/junction; its contents may be outside the approved path.`,
+            }
+          }
           executionSnapshots.set(exec, {
+            destination: hookDestination,
+            ...(rootSnapshot === undefined ? {} : { root: rootSnapshot }),
             targets: [],
             pattern: true,
             gateApproved: true,
@@ -620,7 +634,16 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 本插件自己的 `requestApproval` 恒返回 `allowed-once` —— 它的前提是
          * "管线已经问过了"。钩子这里必须走管线，否则等于没问。
          */
+        const rootSnapshot = captureTargetSnapshot(rootPath)
+        if (rootSnapshot?.isSymbolicLink === true) {
+          return {
+            kind: 'deny',
+            reason: `refusing pattern delete because the root "${rootPath}" is a symbolic link/junction; its contents may be outside the approved path.`,
+          }
+        }
         executionSnapshots.set(exec, {
+          destination: hookDestination,
+          ...(rootSnapshot === undefined ? {} : { root: rootSnapshot }),
           targets: [],
           pattern: true,
           gateApproved: true,
@@ -640,6 +663,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           if (snapshot !== undefined) snapshots.push(snapshot)
         }
         executionSnapshots.set(exec, {
+          destination: hookDestination,
           targets: snapshots,
           gateApproved: true,
           recycleRiskApproved: false,
@@ -746,6 +770,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       const policy = approvalPolicy(session)
       const remember = (gateApproved: boolean, recycleRiskApproved: boolean): void => {
         executionSnapshots.set(exec, {
+          destination: hookDestination,
           targets: plan.snapshots,
           gateApproved,
           recycleRiskApproved,
@@ -1327,17 +1352,25 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
   /*
    * 「立即清理」按钮的宿主侧响应。
    *
-   * 客户端点按钮时把时间戳写进 `cleanRequestedAt`；配置写入触发 HMR 重载插件，
-   * 于是本函数重跑，这里发现时间戳比上次执行的新，就清理一次。
+   * 客户端把时间戳写进 `cleanRequestedAt`；当前 DSH 对 volatile-only 更新不会
+   * 重跑 apply，而是发出 `loader/volatile-update(paths)`。首次激活时消费一次
+   * 残留请求，之后由事件监听继续消费，按钮才真正生效。
    *
-   * 为什么要持久化「上次执行到哪个时间戳」：`apply` 会在**任何**配置改动后重跑
-   * （改容量、改阈值都会），如果只判断「时间戳非 0」，那么改个容量也会顺带触发
-   * 清理 —— 用户没要求的副作用。用一个文件记住已消费的时间戳，才能做到
-   * "只有按钮按过才清理"。
+   * 标记文件记住已消费的时间戳，避免修改其它配置时顺带清理。
    */
   void maybeRunRequestedClean(ctx, {
     stateDir,
     requestedAt: numeric('cleanRequestedAt', 0),
+  })
+  const volatileHost = ctx as unknown as {
+    on?: (event: string, listener: (paths: readonly string[]) => unknown) => (() => void) | void
+  }
+  volatileHost.on?.('loader/volatile-update', (paths) => {
+    if (!Array.isArray(paths) || !paths.includes('cleanRequestedAt')) return
+    void maybeRunRequestedClean(ctx, {
+      stateDir,
+      requestedAt: numeric('cleanRequestedAt', 0),
+    })
   })
 
   // 行为约定：把「怎么删」讲清楚，而不只是拒绝。

@@ -22,6 +22,9 @@ import {
   approvalFailureText,
   approveGate,
   approveRecycleRisk,
+  captureTargetSnapshot,
+  verifyExecutionTarget,
+  verifyTargetIdentity,
   verifyTargetSnapshot,
   hardRefusal,
   permanentRiskOf,
@@ -505,9 +508,6 @@ async function deleteMany(
   }
 
   if (ctx.executionSnapshot !== undefined && !ctx.executionSnapshot.pattern) {
-    if (ctx.executionSnapshot.targets.length !== paths.length) {
-      return { ok: false, text: '', error: 'the target list changed after approval; nothing was moved' }
-    }
     for (const plan of plans) {
       const expected = ctx.executionSnapshot.targets.find((entry) => entry.target === plan.target)
       if (expected === undefined) {
@@ -744,6 +744,10 @@ async function deleteMany(
     }
 
     const recycle = ctx.recycler ?? recycleManyToSystemBin
+    for (const plan of plans) {
+      const changed = verifyExecutionTarget(ctx, plan.target, plan.description)
+      if (changed !== undefined) return { ok: false, text: '', error: changed }
+    }
     const outcome = await recycle(plans.map((p) => p.target))
 
     /*
@@ -988,6 +992,10 @@ async function deleteMany(
     ])
   }
 
+  for (const plan of plans) {
+    const changed = verifyExecutionTarget(ctx, plan.target, plan.description)
+    if (changed !== undefined) return { ok: false, text: '', error: changed }
+  }
   const batch = await moveManyToSafeZone(
     ctx.stateDir,
     plans.map((p) => p.target),
@@ -1171,7 +1179,13 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       const usesPatternForm =
         typeof args.root === 'string' && args.root.trim() !== ''
       let resolvedPaths = targets.paths
+      let effectiveSnapshot = executionSnapshot
       if (usesPatternForm) {
+        const rootPath = path.resolve(args.root as string)
+        if (executionSnapshot?.root !== undefined) {
+          const rootChanged = verifyTargetIdentity(executionSnapshot.root, rootPath)
+          if (rootChanged !== undefined) return { ok: false, text: '', error: rootChanged }
+        }
         const matched = resolveMatchedTargets(args)
         if (matched.paths.length === 0) {
           /*
@@ -1204,6 +1218,12 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
           }
         }
         resolvedPaths = matched.paths
+        if (executionSnapshot !== undefined) {
+          const enumerated = matched.paths
+            .map((target) => captureTargetSnapshot(target))
+            .filter((target): target is NonNullable<typeof target> => target !== undefined)
+          effectiveSnapshot = { ...executionSnapshot, pattern: false, targets: enumerated }
+        }
       }
 
       const deleteCtx = {
@@ -1217,7 +1237,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
          * 目的地与批量回收站实现都从 deps 透传：
          * 前者决定走哪条路，后者让测试不必真的调 PowerShell。
          */
-        ...(deps.destination === undefined ? {} : { destination: deps.destination }),
+        destination: effectiveSnapshot?.destination ?? deps.destination,
         ...(deps.recyclerMany === undefined ? {} : { recycler: deps.recyclerMany }),
         ...(deps.permanentDeleteRisk === undefined
           ? {}
@@ -1227,7 +1247,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         ...(deps.makeMeasureBounded === undefined ? {} : { makeMeasureBounded: deps.makeMeasureBounded }),
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
-        ...(executionSnapshot === undefined ? {} : { executionSnapshot }),
+        ...(effectiveSnapshot === undefined ? {} : { executionSnapshot: effectiveSnapshot }),
         now,
         /*
          * 删除之后的顺带清理：同样只**投递**，不执行。

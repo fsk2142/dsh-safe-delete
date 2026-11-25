@@ -156,6 +156,7 @@ export function captureTargetSnapshot(target: string, description?: TargetDescri
       ctimeMs: st.ctimeMs,
       mode: st.mode,
       isDirectory: st.isDirectory(),
+      isSymbolicLink: st.isSymbolicLink(),
       fileCount: description?.fileCount ?? 0,
       bytes: description?.bytes ?? 0,
       statsChecked: description !== undefined,
@@ -165,17 +166,8 @@ export function captureTargetSnapshot(target: string, description?: TargetDescri
   }
 }
 
-/**
- * 核对执行时目标是否仍是审批时那一份。
- *
- * 目录同时比较规模；文件比较 inode/大小/时间。Windows 上 inode 不可靠时，
- * 大小与两个时间戳仍能拦住最常见的"批准后替换成大文件"。
- */
-export function verifyTargetSnapshot(
-  expected: DeleteTargetSnapshot,
-  target: string,
-  description: TargetDescription,
-): string | undefined {
+/** 只核对目标身份，不依赖目录统计。 */
+export function verifyTargetIdentity(expected: DeleteTargetSnapshot, target: string): string | undefined {
   if (expected.target !== target) return `approved target changed from "${expected.target}" to "${target}"`
   let st
   try {
@@ -191,13 +183,46 @@ export function verifyTargetSnapshot(
     st.ctimeMs !== expected.ctimeMs ||
     st.mode !== expected.mode ||
     st.isDirectory() !== expected.isDirectory ||
-    (expected.statsChecked !== false &&
-      (description.fileCount !== expected.fileCount ||
-       description.bytes !== expected.bytes))
+    st.isSymbolicLink() !== expected.isSymbolicLink
   ) {
     return `target "${target}" changed after approval; refusing to delete a different object`
   }
   return undefined
+}
+
+/**
+ * 核对执行时目标是否仍是审批时那一份。
+ *
+ * 目录同时比较规模；文件比较 inode/大小/时间。Windows 上 inode 不可靠时，
+ * 大小与两个时间戳仍能拦住最常见的"批准后替换成大文件"。
+ */
+export function verifyTargetSnapshot(
+  expected: DeleteTargetSnapshot,
+  target: string,
+  description: TargetDescription,
+): string | undefined {
+  const identityError = verifyTargetIdentity(expected, target)
+  if (identityError !== undefined) return identityError
+  if (
+    expected.statsChecked !== false &&
+    (description.fileCount !== expected.fileCount ||
+     description.bytes !== expected.bytes)
+  ) {
+    return `target "${target}" changed after approval; refusing to delete a different object`
+  }
+  return undefined
+}
+
+/** 执行体在任意异步步骤之后、真正操作目标之前再核对一次快照。 */
+export function verifyExecutionTarget(
+  ctx: DeleteContext,
+  target: string,
+  description: TargetDescription,
+): string | undefined {
+  if (ctx.executionSnapshot === undefined || ctx.executionSnapshot.pattern) return undefined
+  const expected = ctx.executionSnapshot.targets.find((entry) => entry.target === target)
+  if (expected === undefined) return `target "${target}" was not covered by the approval`
+  return verifyTargetSnapshot(expected, target, description)
 }
 
 /** 门禁审批：快照存在时只认快照，不再调用生产恒放行桩。 */
@@ -619,6 +644,8 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     }
 
     const recycler = ctx.recycler ?? recycleManyToSystemBin
+    const changedBeforeRecycle = verifyExecutionTarget(ctx, target, description)
+    if (changedBeforeRecycle !== undefined) return { ok: false, target, error: changedBeforeRecycle }
     const recycled = await recycler([target])
     /*
      * ## `ok` 是批级汇总，不能当成「这一条进去了」（2026-11-05 复审 A05/A06）
@@ -668,6 +695,8 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     })
   }
 
+  const changedBeforeMove = verifyExecutionTarget(ctx, target, description)
+  if (changedBeforeMove !== undefined) return { ok: false, target, error: changedBeforeMove }
   const entry = await moveToSafeZone(ctx.stateDir, target, {
     retentionDays: ctx.retentionDays,
     now: ctx.now(),
