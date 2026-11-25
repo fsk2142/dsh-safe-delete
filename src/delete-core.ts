@@ -144,7 +144,7 @@ export function normalizeDestination(raw: unknown): DeleteDestination {
 }
 
 /** 把一个目标的当前身份与规模固化为审批快照。 */
-export function captureTargetSnapshot(target: string, description: TargetDescription): DeleteTargetSnapshot | undefined {
+export function captureTargetSnapshot(target: string, description?: TargetDescription): DeleteTargetSnapshot | undefined {
   try {
     const st = lstatSync(target)
     return {
@@ -156,8 +156,9 @@ export function captureTargetSnapshot(target: string, description: TargetDescrip
       ctimeMs: st.ctimeMs,
       mode: st.mode,
       isDirectory: st.isDirectory(),
-      fileCount: description.fileCount,
-      bytes: description.bytes,
+      fileCount: description?.fileCount ?? 0,
+      bytes: description?.bytes ?? 0,
+      statsChecked: description !== undefined,
     }
   } catch {
     return undefined
@@ -190,8 +191,9 @@ export function verifyTargetSnapshot(
     st.ctimeMs !== expected.ctimeMs ||
     st.mode !== expected.mode ||
     st.isDirectory() !== expected.isDirectory ||
-    description.fileCount !== expected.fileCount ||
-    description.bytes !== expected.bytes
+    (expected.statsChecked !== false &&
+      (description.fileCount !== expected.fileCount ||
+       description.bytes !== expected.bytes))
   ) {
     return `target "${target}" changed after approval; refusing to delete a different object`
   }

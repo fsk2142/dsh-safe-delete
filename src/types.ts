@@ -128,4 +128,6 @@ export interface DeleteTargetSnapshot {
   isDirectory: boolean
   fileCount: number
   bytes: number
+  /** 快速路径只记录身份时为 false；执行时不比较条目数与字节数。 */
+  statsChecked?: boolean
 }

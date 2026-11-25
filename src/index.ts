@@ -630,6 +630,24 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       }
 
       /*
+       * `never + safe-zone` 的显式路径删除不会弹卡，也不会产生不可恢复风险。
+       * 因此钩子不需要为审批卡片递归统计整棵树；只记录目标身份供执行时核对。
+       */
+      if (hookDestination === 'safe-zone' && approvalPolicy(session) === 'never') {
+        const snapshots: DeleteTargetSnapshot[] = []
+        for (const raw of targets.paths) {
+          const snapshot = captureTargetSnapshot(path.resolve(raw))
+          if (snapshot !== undefined) snapshots.push(snapshot)
+        }
+        executionSnapshots.set(exec, {
+          targets: snapshots,
+          gateApproved: true,
+          recycleRiskApproved: false,
+        })
+        return next()
+      }
+
+      /*
        * 目的地要在描述目标**之前**算好：它决定要不要做全树统计。
        */
 
