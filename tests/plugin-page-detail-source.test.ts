@@ -59,9 +59,9 @@ describe('插件页正文来自 docs/DETAIL.md', () => {
     expect(readme, '配置全表属于 docs/REFERENCE.md').not.toMatch(/confirmFileCount/)
   })
 
-  it('package.json publishes the locale and docs directories', () => {
+  it('package.json publishes the locale resources and detail document', () => {
     const pkg = JSON.parse(readFileSync('package.json', 'utf8')) as { files: string[] }
     expect(pkg.files, 'locale 不发布的话 meta.detail 读不到').toContain('locale/')
-    expect(pkg.files, 'docs 不发布的话详情页指向的文件不存在').toContain('docs/')
+    expect(pkg.files, 'docs/DETAIL.md 不发布的话详情页指向的文件不存在').toContain('docs/DETAIL.md')
   })
 })
