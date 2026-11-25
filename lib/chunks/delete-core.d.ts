@@ -1,4 +1,4 @@
-import { i as TrashEntry, n as Classification, r as TargetDescription, t as BoundedMeasure } from "./types.js";
+import { a as TargetDescription, i as DeleteTargetSnapshot, n as Classification, o as TrashEntry, r as DeleteExecutionSnapshot, t as BoundedMeasure } from "./types.js";
 import { n as RecycleManyOutcome, t as PermanentDeleteRisk } from "./recycle.js";
 //#region src/classify.d.ts
 /** 分类所需的路径事实。 */
@@ -86,14 +86,23 @@ interface DeleteContext {
    *
    * 命中时**先问人**，用户不同意就放弃本次删除 —— 绝不静默永久删除。
    */
-  permanentDeleteRisk?: PermanentDeleteRisk;
+  permanentDeleteRisk?: PermanentDeleteRisk | (() => PermanentDeleteRisk);
   /** 需要人工确认时调用；返回是否放行。 */
   requestApproval: (reason: string) => Promise<ApprovalOutcome>;
   /** 当前时间（测试可注入）。 */
   now: () => number;
   /** 移入安全区之后的清理钩子（可选）。 */
   afterMove?: () => Promise<TrashEntry[]>;
+  /**
+   * `pre-execute` 为本次调用留下的审批快照。
+   *
+   * 存在时，执行体的二次门禁/风险检查只能使用快照里的批准范围；新出现的
+   * 风险必须拒绝，不能调用生产里恒放行的 `requestApproval` 桩。
+   */
+  executionSnapshot?: DeleteExecutionSnapshot;
 }
+/** 取当前永久删除风险；生产接线传惰性读取器，测试可传固定值。 */
+declare function permanentRiskOf(ctx: Pick<DeleteContext, 'permanentDeleteRisk'>): PermanentDeleteRisk | undefined;
 /** 审批结果。 */
 type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
 /** 判定结论：需要哪些确认理由。 */
@@ -115,6 +124,19 @@ type DeleteDestination = 'safe-zone' | 'recycle-bin';
  * @returns 合法去向。
  */
 declare function normalizeDestination(raw: unknown): DeleteDestination;
+/** 把一个目标的当前身份与规模固化为审批快照。 */
+declare function captureTargetSnapshot(target: string, description?: TargetDescription): DeleteTargetSnapshot | undefined;
+/**
+ * 核对执行时目标是否仍是审批时那一份。
+ *
+ * 目录同时比较规模；文件比较 inode/大小/时间。Windows 上 inode 不可靠时，
+ * 大小与两个时间戳仍能拦住最常见的"批准后替换成大文件"。
+ */
+declare function verifyTargetSnapshot(expected: DeleteTargetSnapshot, target: string, description: TargetDescription): string | undefined;
+/** 门禁审批：快照存在时只认快照，不再调用生产恒放行桩。 */
+declare function approveGate(ctx: DeleteContext, reason: string): Promise<ApprovalOutcome>;
+/** 不可恢复风险审批：快照存在时只认快照，新风险一律拒绝。 */
+declare function approveRecycleRisk(ctx: DeleteContext, reason: string): Promise<ApprovalOutcome>;
 /** 删除结果。 */
 type DeleteResult = {
   ok: true;
@@ -247,7 +269,7 @@ declare function deletePath(request: DeleteRequest, ctx: DeleteContext): Promise
  */
 declare function describeApprovalRequest(target: string, description: TargetDescription, gate: GateDecision, retentionDays: number): string;
 /** 把审批结果翻译成可区分的错误文本。 */
-declare function approvalFailureText(outcome: ApprovalOutcome, target: string): string;
+declare function approvalFailureText(outcome: ApprovalOutcome, target: string, snapshotBound?: boolean): string;
 /**
  * 抹掉自由文本里明显的凭据。
  *
@@ -321,4 +343,4 @@ declare function describeRecycled(result: Extract<DeleteResult, {
  */
 declare function hardRefusal(target: string, stateDir: string): string | undefined;
 //#endregion
-export { redactReason as C, normalizeDestination as S, forecastSpace as _, DeleteResult as a, isDriveRoot as b, approvalFailureText as c, deletePath as d, describeApprovalRequest as f, describeSpaceRisks as g, describeRecycled as h, DeleteRequest as i, boundReason as l, describePreview as m, DeleteContext as n, GateDecision as o, describeMoved as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, decideGate as u, hardRefusal as v, ClassifyEnv as w, isInsideStateDir as x, humanBytes as y };
+export { isDriveRoot as C, redactReason as D, permanentRiskOf as E, verifyTargetSnapshot as O, humanBytes as S, normalizeDestination as T, describePreview as _, DeleteResult as a, forecastSpace as b, approvalFailureText as c, boundReason as d, captureTargetSnapshot as f, describeMoved as g, describeApprovalRequest as h, DeleteRequest as i, ClassifyEnv as k, approveGate as l, deletePath as m, DeleteContext as n, GateDecision as o, decideGate as p, DeleteDestination as r, SpaceForecast as s, ApprovalOutcome as t, approveRecycleRisk as u, describeRecycled as v, isInsideStateDir as w, hardRefusal as x, describeSpaceRisks as y };

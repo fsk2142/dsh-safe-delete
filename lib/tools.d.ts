@@ -1,6 +1,6 @@
-import { t as BoundedMeasure } from "./chunks/types.js";
+import { r as DeleteExecutionSnapshot, t as BoundedMeasure } from "./chunks/types.js";
 import { i as moveToSystemRecycleBin, n as RecycleManyOutcome, r as Recycler, t as PermanentDeleteRisk } from "./chunks/recycle.js";
-import { r as DeleteDestination, w as ClassifyEnv } from "./chunks/delete-core.js";
+import { k as ClassifyEnv, r as DeleteDestination } from "./chunks/delete-core.js";
 import { destroyEntry, isEmptySafeZone, listSafeZone, moveToSafeZone, restoreFromSafeZone } from "./store.js";
 //#region src/tools.d.ts
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
@@ -41,7 +41,7 @@ export interface ToolDefinition {
       text: string;
     }>;
   };
-  execute(args: Record<string, unknown>): Promise<ToolResult>;
+  execute(args: Record<string, unknown>, context?: unknown): Promise<ToolResult>;
 }
 /** 工具依赖（由插件入口注入，便于测试）。 */
 export interface ToolDeps {
@@ -95,7 +95,7 @@ export interface ToolDeps {
    *
    * 由插件入口在 apply 时算一次传进来：命中时删除前必须问人。
    */
-  permanentDeleteRisk?: PermanentDeleteRisk;
+  permanentDeleteRisk?: PermanentDeleteRisk | (() => PermanentDeleteRisk);
   /**
    * 造一个**本次执行专用**的有界测量函数（2026-11-10 复审 D04）。
    *
@@ -112,6 +112,8 @@ export interface ToolDeps {
   makeMeasureBounded?: () => (target: string, limitBytes: number) => BoundedMeasure;
   /** 当前时间（测试可注入）。 */
   now?: () => number;
+  /** 从宿主执行对象取出本次调用的审批快照。 */
+  executionSnapshot?: (context: unknown) => DeleteExecutionSnapshot | undefined;
 }
 /**
  * 把工具参数统一成「待删除路径列表」。

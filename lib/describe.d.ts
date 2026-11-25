@@ -1,4 +1,4 @@
-import { r as TargetDescription, t as BoundedMeasure } from "./chunks/types.js";
+import { a as TargetDescription, t as BoundedMeasure } from "./chunks/types.js";
 //#region src/describe.d.ts
 /**
  * 有界枚举的墙钟预算。

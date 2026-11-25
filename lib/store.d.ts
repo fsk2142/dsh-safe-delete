@@ -1,4 +1,4 @@
-import { i as TrashEntry, r as TargetDescription } from "./chunks/types.js";
+import { a as TargetDescription, o as TrashEntry } from "./chunks/types.js";
 import { r as Recycler } from "./chunks/recycle.js";
 //#region src/store.d.ts
 /** 移入选项。 */
