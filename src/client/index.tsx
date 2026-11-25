@@ -21,24 +21,6 @@ import type { ReactElement } from 'react'
 /** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
 const NAMESPACE = 'dsh-safe-delete'
 
-/**
- * 启动诊断记录。
- *
- * 为什么要这个东西：配置页连续几版都不显示，而控制台里看不到任何线索 ——
- * 「apply 没执行」「注册被丢弃」「渲染条件不满足」三种情况在界面上长得一模一样。
- * 把每一步的结果留下来，并渲染到表单顶部，就能一眼区分它们，不必开控制台。
- *
- * 同时挂到 `globalThis` 上，方便在控制台里直接看 `__dshSafeDeleteDiag`。
- */
-const diagnostics: Array<{ at: number; step: string; ok: boolean; detail?: string }> = []
-
-function note(step: string, ok: boolean, detail?: string): void {
-  diagnostics.push({ at: Date.now(), step, ok, ...(detail === undefined ? {} : { detail }) })
-  if (typeof globalThis !== 'undefined') {
-    ;(globalThis as { __dshSafeDeleteDiag?: unknown }).__dshSafeDeleteDiag = diagnostics
-  }
-}
-
 /** 字节单位。 */
 const MB = 1024 * 1024
 const GB = 1024 * MB
@@ -49,7 +31,7 @@ interface FieldSpec {
   label: string
   hint: string
   /** 控件类型。 */
-  kind: 'bytes' | 'number' | 'percent' | 'boolean' | 'duration' | 'choice'
+  kind: 'bytes' | 'number' | 'choice'
   /** 最小值（含）。 */
   min?: number
   max?: number
@@ -97,8 +79,6 @@ const DESTINATION_FIELD: FieldSpec = {
   fallback: 0,
 }
 
-/** 1 GB 的字节数。 */
-const GIGABYTE = 1024 * 1024 * 1024
 
 /**
  * 表单字段。
@@ -148,7 +128,7 @@ const FIELDS: FieldSpec[] = [
     hint: '超过这个大小就先问一次。0 = 关闭。',
     kind: 'bytes',
     min: 0,
-    fallback: 2 * GIGABYTE,
+    fallback: 2 * GB,
   },
 ]
 
@@ -190,32 +170,6 @@ function toBytesInput(value: number): { amount: string; unit: 'MB' | 'GB' } {
   }
   const amount = Math.max(0, value / MB)
   return { amount: Number(amount.toFixed(2)).toString(), unit: 'MB' }
-}
-
-/**
- * 把毫秒换算成「天或小时」的显示值。
- *
- * 为什么给两个单位：清理间隔短则几分钟、长则几天。只给小时的话「1 天」显示成
- * `24`、「30 天」显示成 `720`，用户要在脑子里换算，也容易填错数量级。
- *
- * @param ms 毫秒。
- * @param unit 期望单位。
- * @returns 该单位下的数值字符串（最多两位小数，去掉多余的 0）。
- */
-function toDurationInput(ms: number, unit: 'day' | 'hour'): string {
-  const divisor = unit === 'day' ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000
-  return Number((ms / divisor).toFixed(2)).toString()
-}
-
-/**
- * 选一个读起来最自然的单位：整天的用天，否则用小时。
- *
- * @param ms 毫秒。
- * @returns `'day'` 或 `'hour'`。
- */
-function naturalDurationUnit(ms: number): 'day' | 'hour' {
-  const day = 24 * 60 * 60 * 1000
-  return ms >= day && ms % day === 0 ? 'day' : 'hour'
 }
 
 /** 读取一个数字字段的当前值（兼容 volatile 引用与普通值）。 */
@@ -445,10 +399,8 @@ export function SafeZoneSettings(): ReactElement {
         if (!unwrapped.ok) {
           setStatus('error')
           setMessage(`读取配置失败：${unwrapped.error}`)
-          note('describe() envelope', false, unwrapped.error)
           return
         }
-        note('describe() envelope', true, 'unwrapped')
         const view = pickNamespace(payload)
         setValues(view.value)
         setRevision(view.revision)
@@ -457,37 +409,6 @@ export function SafeZoneSettings(): ReactElement {
         // 混为一谈会让人以为「配置丢了」，而实际什么都没发生。
         const namespaceSeen = Object.keys(view.value).length > 0
         setStatus('ready')
-        // 诊断：把宿主**实际返回**的命名空间列表记下来。
-        // 「磁盘上有值但界面显示默认值」这种病，靠读源码推断过两轮都没定位，
-        // 只有把宿主真实返回的形状摆出来才能判断是"没这个 ns"还是"ns 里没值"。
-        const seen: string[] = []
-        const list = Array.isArray(payload)
-          ? payload
-          : (payload as { namespaces?: unknown } | undefined)?.namespaces
-        if (Array.isArray(list)) {
-          for (const item of list) {
-            if (item === null || typeof item !== 'object') continue
-            const rec = item as Record<string, unknown>
-            const name = typeof rec['ns'] === 'string' ? rec['ns'] : rec['id']
-            const value = rec['value']
-            const keys = value !== null && typeof value === 'object' ? Object.keys(value as object) : []
-            seen.push(`${String(name)}(${keys.length} keys)`)
-          }
-        }
-        note('host namespaces', namespaceSeen, seen.length === 0 ? 'empty list' : seen.join(', '))
-        // 原始形状（截断）：如果宿主返回的字段名不是 ns/id、或者 value 被投影剥离，
-        // 只有看原始 JSON 才能知道。这一步是为了结束"读源码推断"。
-        try {
-          const raw = JSON.stringify(payload)
-          note('describe() raw', true, raw.length > 400 ? `${raw.slice(0, 400)}…` : raw)
-        } catch {
-          note('describe() raw', false, 'not serializable')
-        }
-        note(
-          'picked namespace value',
-          namespaceSeen,
-          `${Object.keys(view.value).length} keys, revision=${String(view.revision)}`,
-        )
         if (!namespaceSeen) {
           setMessage('没有读到本插件的配置（显示的是默认值）。若刚安装，重启 DSH 后再看。')
         }
@@ -529,7 +450,7 @@ export function SafeZoneSettings(): ReactElement {
   }, [])
 
   /**
-   * 设置某个字段的单位（`MB`/`GB` 或 `hour`/`day`）。
+   * 设置某个字段的单位（`MB`/`GB`）。
    *
    * **不能复用 `setField`**：它会把 key 拼成 `<key>.draft`，于是写进去的是
    * `key.unit.draft`，而读取时查的是 `values[key.unit]` —— 单位选择永远读不到
@@ -556,7 +477,7 @@ export function SafeZoneSettings(): ReactElement {
    *
    * @param spec 字段。
    * @param raw 输入框里的原始文本（显示单位下的数字）。
-   * @returns 换算后的字节/毫秒；不合法时 undefined。
+   * @returns 换算后的字节或整数；不合法时 undefined。
    */
   const coerce = useCallback((spec: FieldSpec, raw: unknown): number | undefined => {
     const text = typeof raw === 'string' ? raw.trim() : String(raw ?? '')
@@ -564,7 +485,7 @@ export function SafeZoneSettings(): ReactElement {
     const amount = Number(text)
     if (!Number.isFinite(amount) || amount < 0) return undefined
 
-    // 第一步：把显示数值换算成真实单位（字节 / 毫秒）。
+    // 第一步：把显示数值换算成真实单位（字节或整数）。
     let value: number
     if (spec.kind === 'bytes') {
       /*
@@ -584,23 +505,6 @@ export function SafeZoneSettings(): ReactElement {
           ? chosenBytesUnit
           : naturalBytesUnit(currentBytes)
       value = Math.round(amount * (bytesUnit === 'MB' ? MB : GB))
-    } else if (spec.kind === 'duration') {
-      // 单位来自独立的 `.unit` 键（用户在下拉里选）。
-      //
-      // 兜底必须与**显示侧**用同一个判定，否则会出现「显示 24 小时、保存成 24 天」
-      // 这种静默错位。显示侧用 `naturalDurationUnit(current)`，即"当前值能被整天
-      // 整除就用天"；输入框里没有当前值时按小时（更保守：小时不会放大 24 倍）。
-      const day = 24 * 60 * 60 * 1000
-      const chosen = values[`${spec.key}.unit`]
-      const unit =
-        chosen === 'day'
-          ? day
-          : chosen === 'hour'
-            ? 60 * 60 * 1000
-            : naturalDurationUnit(numericOf(values, spec.key, 0)) === 'day'
-              ? day
-              : 60 * 60 * 1000
-      value = Math.round(amount * unit)
     } else {
       /*
        * 纯数字字段（天数、条目数）一律取整。
@@ -654,15 +558,9 @@ export function SafeZoneSettings(): ReactElement {
      *            → 保存时按 GB 解释 → 500 GB，放大 1024 倍
      * ```
      *
-     * 现在显示侧把 `unit` 一起写进 values，保存侧再按它换算 ——
-     * 与 `duration` 用的是同一套"显示与保存共用单位状态"的做法。
+     * 现在显示侧把 `unit` 一起写进 values，保存侧再按它换算。
      */
     if (spec.kind === 'bytes') return toBytesInput(current).amount
-    if (spec.kind === 'duration') {
-      const chosen = source[`${spec.key}.unit`]
-      const unit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
-      return toDurationInput(current, unit)
-    }
     return String(current)
   }
 
@@ -781,11 +679,11 @@ export function SafeZoneSettings(): ReactElement {
     for (const spec of FIELDS) {
       const draft = values[`${spec.key}.draft`]
       const unitChanged = typeof values[`${spec.key}.unit`] === 'string'
-      if (typeof draft === 'string' || (unitChanged && (spec.kind === 'bytes' || spec.kind === 'duration'))) {
-        // 用户改过**数值或单位**：把当前显示值（单位下的数字）换算成字节/毫秒。
+      if (typeof draft === 'string' || (unitChanged && spec.kind === 'bytes')) {
+        // 用户改过**数值或单位**：把当前显示值换算成字节。
         //
         // 为什么单位变了也要走这条路：只切单位不改数值时，最终要保存的数**变了**
-        // （1 小时 → 1 天）。走下面的"没改过"分支会把旧值原样写回，用户的单位
+        // （1 GB → 1 MB）。走下面的"没改过"分支会把旧值原样写回，用户的单位
         // 选择被静默丢弃。
         const displayValue = typeof draft === 'string' ? draft : displayValueOf(spec, values)
         const value = coerce(spec, displayValue)
@@ -796,7 +694,7 @@ export function SafeZoneSettings(): ReactElement {
         payload[spec.key] = value
         continue
       }
-      // 没改过：`values[key]` 已经是配置里的真实值（字节/毫秒），原样写回。
+      // 没改过：`values[key]` 已经是配置里的真实值（字节或整数），原样写回。
       // 若也走 coerce，会被当成 GB 再乘一次 —— 直接放大 1073741824 倍。
       const current = numericOf(values, spec.key, spec.fallback)
       payload[spec.key] = current
@@ -1289,7 +1187,7 @@ export function SafeZoneSettings(): ReactElement {
   const fieldStyle = (invalid: boolean): Record<string, string> => ({
     width: '108px',
     // 固定高度：`<input>` 与 `<select>` 的默认内边距/行高不同，不锁高度时
-    // 「定时清理间隔」那一行的数字框和单位下拉会一高一低，看上去像行距错乱。
+    // 数字框与单位下拉的默认内边距/行高不同，锁高度避免一行高低不齐。
     height: '32px',
     padding: '0 10px',
     borderRadius: 'var(--dsw-radius-md, 8px)',
@@ -1339,37 +1237,17 @@ export function SafeZoneSettings(): ReactElement {
           // 显示值有两个来源，必须分清：
           //   - 用户正在输入的原始文本（`<key>.draft`）—— 原样显示，否则每敲一个
           //     字符就被换算一次，输入框会跳；
-          //   - 从配置读到的**字节/毫秒**值 —— 必须先换算成 GB/小时再显示，
+          //   - 从配置读到的**字节**值 —— 必须先换算成 GB/MB 再显示，
           //     否则用户会看到 `21474836480 GB` 这种东西。
           const draft = values[`${spec.key}.draft`]
           const current = numericOf(values, spec.key, spec.fallback)
           let display: string
-          let unit = ''
           if (typeof draft === 'string') {
             display = draft
           } else if (spec.kind === 'bytes') {
             display = toBytesInput(current).amount
-          } else if (spec.kind === 'duration') {
-            const chosen = values[`${spec.key}.unit`]
-            const durationUnit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
-            display = toDurationInput(current, durationUnit)
           } else {
             display = String(current)
-          }
-          if (spec.kind === 'bytes') {
-            unit = toBytesInput(current).unit
-          } else if (spec.kind === 'duration') {
-            // 这里**只决定单位后缀**，绝不能再赋值 `display`。
-            //
-            // 之前这里重复算了一遍 `display = toDurationInput(...)`，把上面
-            // "用户正在输入就原样显示"的那个分支覆盖掉了 —— 表现就是
-            // 「定时清理间隔输入时不显示，保存后才出现」：每敲一个字符都被
-            // 换回配置里的旧值，输入框看起来像只读。
-            const chosen = values[`${spec.key}.unit`]
-            const durationUnit = chosen === 'day' || chosen === 'hour' ? chosen : naturalDurationUnit(current)
-            unit = durationUnit === 'day' ? '天' : '小时'
-          } else if (spec.kind === 'percent') {
-            unit = '%'
           }
 
           /*
@@ -1432,9 +1310,7 @@ export function SafeZoneSettings(): ReactElement {
                    * 用户把 500 改成 501 并保存，得到 501 GB —— **放大 1024 倍**，
                    * 而他的本意是 501 MB。
                    *
-                   * 现在缺省时用 `naturalBytesUnit(current)` —— 与显示侧同一个
-                   * 判定。`duration` 分支一直是这么做的（见下面几行），
-                   * bytes 当时漏了。
+                   * 现在缺省时用 `naturalBytesUnit(current)` —— 与显示侧同一个判定。
                    */
                   <select
                     aria-label={`${spec.label}单位`}
@@ -1450,25 +1326,6 @@ export function SafeZoneSettings(): ReactElement {
                     <option value="GB">GB</option>
                     <option value="MB">MB</option>
                   </select>
-                ) : spec.kind === 'duration' ? (
-                  // 天/小时自选：只给小时的话「30 天」要写成 720，容易填错数量级。
-                  <select
-                    aria-label={`${spec.label}单位`}
-                    value={
-                      values[`${spec.key}.unit`] === 'day'
-                        ? 'day'
-                        : values[`${spec.key}.unit`] === 'hour'
-                          ? 'hour'
-                          : naturalDurationUnit(current)
-                    }
-                    onChange={(event) => setFieldUnit(spec.key, event.target.value)}
-                    style={{ ...fieldStyle(false), width: '86px' }}
-                  >
-                    <option value="hour">小时</option>
-                    <option value="day">天</option>
-                  </select>
-                ) : unit !== '' ? (
-                  <span style={{ fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>{unit}</span>
                 ) : null}
               </div>
               {/* 第二列（说明/错误）：放在网格第 2 列，自动与输入框左边缘对齐。 */}
@@ -1731,16 +1588,12 @@ export const inject = ['slots', 'locale']
  * 失败的那一步会被指名道姓地打出来，其余步骤照常。
  */
 export function apply(ctx: ClientContext): void {
-  note('apply() entered', true, `inject=[${inject.join(',')}]`)
-
   const guarded = (step: string, run: () => void): void => {
     try {
       run()
-      note(step, true)
     } catch (error) {
       // 用 console.error 而不是 warn：激活失败要能在控制台里一眼看到。
       console.error(`[dsh-safe-delete] ${step} failed:`, error)
-      note(step, false, error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -1754,7 +1607,6 @@ export function apply(ctx: ClientContext): void {
     const locale = (ctx as unknown as { locale?: { register?: (ns: string, dict: unknown) => unknown } }).locale
     if (typeof locale?.register !== 'function') {
       console.error('[dsh-safe-delete] locale.register is unavailable; slot labels may not resolve.')
-      note('locale.register', false, `locale=${typeof locale}, register=${typeof locale?.register}`)
       return
     }
     const dictionaries = {
@@ -1789,20 +1641,15 @@ export function apply(ctx: ClientContext): void {
       inject?: (services: string[], cb: (scoped: Record<string, unknown>) => void) => unknown
     }).inject
     if (typeof maybeInject !== 'function') {
-      note('capture settings remote', false, 'ctx.inject is unavailable')
+      console.error('[dsh-safe-delete] ctx.inject is unavailable; settings remote was not captured.')
       return
     }
     maybeInject(['remote', 'remote.settings'], (scoped) => {
       try {
         const remote = (scoped as { remote?: { settings?: SettingsRemote } }).remote
         settingsRemote = remote?.settings
-        note(
-          'capture settings remote',
-          settingsRemote !== undefined,
-          settingsRemote === undefined ? 'remote.settings is empty' : 'ok',
-        )
       } catch (error) {
-        note('capture settings remote', false, error instanceof Error ? error.message : String(error))
+        console.error('[dsh-safe-delete] settings remote capture failed:', error)
       }
     })
   })
@@ -1821,7 +1668,7 @@ export function apply(ctx: ClientContext): void {
     // `ctx.inject` 不可用时不能静默跳过 —— 诊断体系的意义就是不留盲区。
     const injectFn = (ctx as unknown as { inject?: ClientContext['inject'] }).inject
     if (typeof injectFn !== 'function') {
-      note('register the config page on the plugin page', false, 'ctx.inject is unavailable')
+      console.error('[dsh-safe-delete] ctx.inject is unavailable; the settings form was not registered.')
       return
     }
     injectFn(['configForms'], (scoped) => {
@@ -1842,10 +1689,8 @@ export function apply(ctx: ClientContext): void {
         console.error(
           '[dsh-safe-delete] configForms service is missing get()/whileServed(); the settings form will not appear.',
         )
-        note('configForms service', false, `get=${typeof forms?.get}, whileServed=${typeof forms?.whileServed}`)
         return
       }
-      note('configForms service', true)
       try {
         forms.get(NAMESPACE)
       } catch (error) {
@@ -1876,7 +1721,6 @@ export function apply(ctx: ClientContext): void {
           },
         )
         // 成功用 info 级别（不是 error）：控制台里红字会被读成失败。
-        // 诊断面板已经记了这一步，这行只是控制台里的方便标记。
         console.info('[dsh-safe-delete] registered plugins.bundle.config')
         return slot
       }
@@ -1893,28 +1737,5 @@ export function apply(ctx: ClientContext): void {
         runWhileServed()
       }
     })
-  })
-
-  // 把诊断结果写进页面标题栏。
-  //
-  // 为什么不用表单：槽位没渲染时表单根本不存在，那就没有任何地方能看到这些记录。
-  // 标题栏是宿主自己的，一定能碰 —— 这样即使注册被丢弃，也能确认 apply 跑过了。
-  guarded('publish diagnostics to the document title', () => {
-    const doc = (globalThis as { document?: Document }).document
-    if (doc === undefined) {
-      note('document unavailable', false)
-      return
-    }
-    const okCount = diagnostics.filter((d) => d.ok).length
-    const badCount = diagnostics.length - okCount
-    const suffix = badCount === 0 ? `✓${okCount}` : `✓${okCount} ✗${badCount}`
-    const timer = (globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown }).setTimeout
-    if (typeof timer === 'function') {
-      // 延后一点：让宿主的标题更新先生效，再覆盖，避免被冲掉。
-      timer(() => {
-        doc.title = `${doc.title.replace(/\s*·\s*dsh-safe-delete.*$/, '')} · dsh-safe-delete ${suffix}`
-      }, 1500)
-    }
-    note('publish diagnostics', true, suffix)
   })
 }
