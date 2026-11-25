@@ -10,7 +10,7 @@ pnpm install
 pnpm typecheck
 pnpm vitest run
 pnpm build                        # 产物到 lib/，需一起提交
-node scripts/clean-test-tmp.mjs   # 清测试遗留临时目录
+pnpm clean:tmp                     # 清测试遗留临时目录（默认 dry-run）
 pnpm gate                         # 12 项全跑
 ```
 
@@ -54,7 +54,7 @@ pnpm gate                         # 12 项全跑
 
 | 豁免 | 范围 | 为什么收窄 |
 |---|---|---|
-| 规则载体文件 | `scripts/privacy-audit.mjs` / `privacy-history-audit.mjs` / `verify-remote.mjs` 里的**上下文规则**（本机路径、对话痕迹、会话标识） | 那些行就是规则定义本身，不是数据 |
+| 规则载体文件 | `scripts/privacy-audit.mjs` / `privacy-history-audit.mjs` 里的**上下文规则**（本机路径、对话痕迹、会话标识） | 那些行就是规则定义本身，不是数据 |
 | 测试夹具路径 | `tests/` 与 `*.test.ts` 里的**上下文规则** | 那些命中是刻意构造的假数据 |
 
 **凭据 / Token 规则在这两类文件里照扫**（第三轮复审 R03）：不存在"这是测试夹具"
@@ -78,6 +78,6 @@ pnpm gate                         # 12 项全跑
 
 ## 插件页显示的文档
 
-DSH 的插件页会把**包的 `README.md` 整篇**渲染成正文（在 `package.json` 的
-description 之下、配置行之上）。所以 README 必须只写**使用说明** ——
-设计取舍放这里，实现交接放 [`HANDOVER.md`](../HANDOVER.md)。
+DSH 的插件页通过 `locale/<语言>.json` 的 `meta.detail` 渲染 `docs/DETAIL.md`。
+README 保留项目简介与快速上手；设计取舍放这里，实现交接放
+[`HANDOVER.md`](../HANDOVER.md)。

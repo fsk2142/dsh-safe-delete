@@ -98,7 +98,7 @@ Remove-Item -Recurse $tmp
 
 **预期**：
 - 输出含 `retention: 1d (time-only, no capacity cap)`
-- 到期条目在下一次 `safe_zone_*` 工具调用时移走
+- 到期条目由后台 worker 在下一轮清理时移走；`safe_zone_status` 显示任务状态
 - 移到系统回收站，不是永久删除
 
 **实测**：

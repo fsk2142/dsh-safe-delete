@@ -66,7 +66,7 @@ const BASELINE_FILE = 'scripts/privacy-history-baseline.json'
  *
  * - `scripts/privacy-audit.mjs` 里 `pattern: /用户原话|用户说[：:]…/` 这行
  *   本身会被"对话痕迹"规则命中；
- * - `scripts/verify-remote.mjs` 里 `session-[0-9a-f]{8}` 会被"会话标识"命中；
+ * - `scripts/privacy-audit.mjs` 里 `session-[0-9a-f]{8}` 会被"会话标识"命中；
  * - 测试里刻意构造的 `C:\Users\some-real-person\secret.txt` 会被"本机路径"命中。
  *
  * 这些是**规则与夹具**，不是数据。跳过它们而不是放宽正则是正确的取舍：
@@ -77,6 +77,10 @@ const BASELINE_FILE = 'scripts/privacy-history-baseline.json'
 const RULE_CARRIERS = new Set([
   'scripts/privacy-audit.mjs',
   'scripts/privacy-history-audit.mjs',
+  /*
+   * 已退役的脚本（2026-11-25 删除），但历史 diff 里仍有它的行。
+   * 历史扫描必须继续把它当规则载体，否则会把两行规则定义报成新增命中。
+   */
   'scripts/verify-remote.mjs',
 ])
 

@@ -119,14 +119,13 @@ function readStaged(file) {
  *
  * ## 它只对"规则载体"生效，不是给测试开的门（第三轮复审 R03）
  *
- * 名单里的三个文件**整份**都是规则文本 —— 除了一条真正的凭据出现在里面，
+ * 名单里的两个文件**整份**都是规则文本 —— 除了一条真正的凭据出现在里面，
  * 否则那儿的命中都不可能是数据。测试文件**不在**这里：它们的豁免是
  * `privacy-history-audit.mjs` 里按**规则**给的（凭据照样扫）。
  */
 const SCANNERS = new Set([
   'scripts/privacy-audit.mjs',
   'scripts/privacy-history-audit.mjs',
-  'scripts/verify-remote.mjs',
 ])
 
 /**
