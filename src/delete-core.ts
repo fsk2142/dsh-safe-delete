@@ -26,7 +26,7 @@ import {
   type PermanentDeleteRisk,
   type RecycleManyOutcome,
 } from './recycle'
-import type { BoundedMeasure, Classification, TargetDescription, TrashEntry } from './types'
+import type { BoundedMeasure, Classification, DeleteExecutionSnapshot, DeleteTargetSnapshot, TargetDescription, TrashEntry } from './types'
 
 /** 删除请求。 */
 export interface DeleteRequest {
@@ -101,6 +101,13 @@ export interface DeleteContext {
   now: () => number
   /** 移入安全区之后的清理钩子（可选）。 */
   afterMove?: () => Promise<TrashEntry[]>
+  /**
+   * `pre-execute` 为本次调用留下的审批快照。
+   *
+   * 存在时，执行体的二次门禁/风险检查只能使用快照里的批准范围；新出现的
+   * 风险必须拒绝，不能调用生产里恒放行的 `requestApproval` 桩。
+   */
+  executionSnapshot?: DeleteExecutionSnapshot
 }
 
 /** 审批结果。 */
@@ -128,6 +135,77 @@ export type DeleteDestination = 'safe-zone' | 'recycle-bin'
  */
 export function normalizeDestination(raw: unknown): DeleteDestination {
   return raw === 'recycle-bin' ? 'recycle-bin' : 'safe-zone'
+}
+
+/** 把一个目标的当前身份与规模固化为审批快照。 */
+export function captureTargetSnapshot(target: string, description: TargetDescription): DeleteTargetSnapshot | undefined {
+  try {
+    const st = lstatSync(target)
+    return {
+      target,
+      dev: st.dev,
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      mode: st.mode,
+      isDirectory: st.isDirectory(),
+      fileCount: description.fileCount,
+      bytes: description.bytes,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 核对执行时目标是否仍是审批时那一份。
+ *
+ * 目录同时比较规模；文件比较 inode/大小/时间。Windows 上 inode 不可靠时，
+ * 大小与两个时间戳仍能拦住最常见的"批准后替换成大文件"。
+ */
+export function verifyTargetSnapshot(
+  expected: DeleteTargetSnapshot,
+  target: string,
+  description: TargetDescription,
+): string | undefined {
+  if (expected.target !== target) return `approved target changed from "${expected.target}" to "${target}"`
+  let st
+  try {
+    st = lstatSync(target)
+  } catch {
+    return `approved target "${target}" is no longer accessible`
+  }
+  if (
+    st.dev !== expected.dev ||
+    st.ino !== expected.ino ||
+    st.size !== expected.size ||
+    st.mtimeMs !== expected.mtimeMs ||
+    st.ctimeMs !== expected.ctimeMs ||
+    st.mode !== expected.mode ||
+    st.isDirectory() !== expected.isDirectory ||
+    description.fileCount !== expected.fileCount ||
+    description.bytes !== expected.bytes
+  ) {
+    return `target "${target}" changed after approval; refusing to delete a different object`
+  }
+  return undefined
+}
+
+/** 门禁审批：快照存在时只认快照，不再调用生产恒放行桩。 */
+export async function approveGate(ctx: DeleteContext, reason: string): Promise<ApprovalOutcome> {
+  if (ctx.executionSnapshot !== undefined) {
+    return ctx.executionSnapshot.gateApproved ? 'allowed-once' : 'rejected'
+  }
+  return ctx.requestApproval(reason)
+}
+
+/** 不可恢复风险审批：快照存在时只认快照，新风险一律拒绝。 */
+export async function approveRecycleRisk(ctx: DeleteContext, reason: string): Promise<ApprovalOutcome> {
+  if (ctx.executionSnapshot !== undefined) {
+    return ctx.executionSnapshot.recycleRiskApproved ? 'allowed-once' : 'rejected'
+  }
+  return ctx.requestApproval(reason)
 }
 
 /** 删除结果。 */
@@ -377,6 +455,13 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     recycleMode ? { ...ctx, confirmFileCount: 0, confirmBytes: 0 } : ctx,
   )
 
+  if (ctx.executionSnapshot !== undefined && !ctx.executionSnapshot.pattern) {
+    const expected = ctx.executionSnapshot.targets.find((entry) => entry.target === target)
+    if (expected === undefined) return { ok: false, target, error: `target "${target}" was not covered by the approval` }
+    const changed = verifyTargetSnapshot(expected, target, description)
+    if (changed !== undefined) return { ok: false, target, error: changed }
+  }
+
   // 4. 预览：只说不做。
   if (request.preview === true) {
     return { ok: true, kind: 'preview', target, description, gate }
@@ -437,7 +522,7 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
   if (gate.needsApproval || risks.length > 0) {
     const base = describeApprovalRequest(target, description, gate, ctx.retentionDays)
     const text = risks.length === 0 ? base : `${base}\n\nSpace warning:\n- ${risks.join('\n- ')}`
-    const outcome = await ctx.requestApproval(text)
+    const outcome = await approveGate(ctx, text)
     if (outcome !== 'allowed-once') {
       return { ok: false, target, error: approvalFailureText(outcome, target) }
     }
@@ -471,13 +556,13 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
     const permStatus =
       ctx.permanentDeleteRisk?.status ?? (ctx.permanentDeleteRisk?.risky === true ? 'risky' : 'safe')
     if (permStatus !== 'safe') {
-      const outcome = await ctx.requestApproval(
+      const outcome = await approveRecycleRisk(ctx,
         `This delete will PERMANENTLY remove ${target} — the recycle bin is not in effect.\n\n` +
           `Reason: ${ctx.permanentDeleteRisk?.reason ?? 'the system is configured to delete permanently'}\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
-        return { ok: false, target, error: approvalFailureText(outcome, target) }
+        return { ok: false, target, error: approvalFailureText(outcome, target, ctx.executionSnapshot !== undefined) }
       }
     }
 
@@ -515,12 +600,12 @@ export async function deletePath(request: DeleteRequest, ctx: DeleteContext): Pr
       ...(isDir ? { measureBounded: (limitBytes: number) => measure(target, limitBytes) } : {}),
     })
     if (quota.status !== 'within') {
-      const outcome = await ctx.requestApproval(
+      const outcome = await approveRecycleRisk(ctx,
         `This delete may PERMANENTLY remove ${target} — ${quota.reason}.\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
-        return { ok: false, target, error: approvalFailureText(outcome, target) }
+        return { ok: false, target, error: approvalFailureText(outcome, target, ctx.executionSnapshot !== undefined) }
       }
     }
 
@@ -629,10 +714,12 @@ export function describeApprovalRequest(
 }
 
 /** 把审批结果翻译成可区分的错误文本。 */
-export function approvalFailureText(outcome: ApprovalOutcome, target: string): string {
+export function approvalFailureText(outcome: ApprovalOutcome, target: string, snapshotBound = false): string {
   switch (outcome) {
     case 'rejected':
-      return `the user rejected deleting "${target}". Do not retry; ask the user what they actually want.`
+      return snapshotBound
+        ? `refusing to delete "${target}": a new gate or permanent-delete risk appeared after approval and was not covered by the approved call.`
+        : `the user rejected deleting "${target}". Do not retry; ask the user what they actually want.`
     case 'cancelled':
       return `the approval request for "${target}" was cancelled.`
     case 'unavailable':

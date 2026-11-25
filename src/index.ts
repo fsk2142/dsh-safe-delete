@@ -29,13 +29,13 @@ import { isUnresolvableTarget, parseCommand } from './command'
 import { runCommand } from './commands'
 import { readCleanupJob, requestCleanup } from './cleanup'
 import { Config, unwrapConfig } from './config'
-import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, type DeleteDestination } from './delete-core'
+import { decideGate, deletePath, describeMoved, describePreview, describeRecycled, humanBytes, normalizeDestination, captureTargetSnapshot, type DeleteDestination } from './delete-core'
 import { detectPermanentDeleteRisk, assessQuota } from './recycle'
 import { createSharedMeasure, describeTarget } from './describe'
 import { appliesStop, recordDenial, stopClause } from './escalate'
 import { listSafeZone, restoreFromSafeZone } from './store'
 import { createTools, normaliseDeleteTargets, type ApprovalOutcome, type ToolDefinition } from './tools'
-import type { BoundedMeasure } from './types'
+import type { BoundedMeasure, DeleteExecutionSnapshot, DeleteTargetSnapshot } from './types'
 
 export const name = 'dsh-safe-delete'
 
@@ -281,6 +281,9 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
    */
   const hookPermanentDeleteRisk = detectPermanentDeleteRisk()
 
+  /** 本次工具调用的审批快照；键是宿主在 pre-execute 与 execute 间传递的同一对象。 */
+  const executionSnapshots = new WeakMap<object, DeleteExecutionSnapshot>()
+
   const requestApproval = async (): Promise<ApprovalOutcome> => 'allowed-once'
 
   /**
@@ -357,6 +360,8 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
      * 检测函数会被 tree-shake 掉，README 的承诺就成了空话。
      */
     permanentDeleteRisk: hookPermanentDeleteRisk,
+    executionSnapshot: (context) =>
+      context !== null && typeof context === 'object' ? executionSnapshots.get(context) : undefined,
     /*
      * 目录配额的下界不足以判定时去实测一次（2026-11-08）。
      *
@@ -564,6 +569,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
                 `\`safe-zone\` so the items stay restorable with safe_zone_restore.`,
             }
           }
+          executionSnapshots.set(exec, {
+            targets: [],
+            pattern: true,
+            gateApproved: true,
+            recycleRiskApproved: false,
+          })
           return next()
         }
 
@@ -607,6 +618,18 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 本插件自己的 `requestApproval` 恒返回 `allowed-once` —— 它的前提是
          * "管线已经问过了"。钩子这里必须走管线，否则等于没问。
          */
+        executionSnapshots.set(exec, {
+          targets: [],
+          pattern: true,
+          gateApproved: true,
+          recycleRiskApproved: true,
+        })
+        executionSnapshots.set(exec, {
+          targets: [],
+          pattern: true,
+          gateApproved: true,
+          recycleRiskApproved: true,
+        })
         return { kind: 'ask', reason: text }
       }
 
@@ -625,6 +648,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
           const dangerousPaths: string[] = []
           const dangerousReasons: string[] = []
           const resolved: string[] = []
+          const snapshots: DeleteTargetSnapshot[] = []
           const recycleMode = hookDestination === 'recycle-bin'
 
           /*
@@ -655,6 +679,8 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             bytes += description.bytes
             targetSizes.push(description.bytes)
             lowerBoundFlags.push(description.statsOmitted === true && description.isDirectory === true)
+            const snapshot = captureTargetSnapshot(target, description)
+            if (snapshot !== undefined) snapshots.push(snapshot)
             /*
              * 回收站模式下阈值归零（2026-11-04 第 24 次审查 R24-3）。
              *
@@ -693,6 +719,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
             statsOmitted,
             targetSizes,
             lowerBoundFlags,
+            snapshots,
             needsApproval: reasons.length > 0,
           }
         } catch {
@@ -701,6 +728,15 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       })()
 
       if (plan === undefined) return next()
+
+      const policy = approvalPolicy(session)
+      const remember = (gateApproved: boolean, recycleRiskApproved: boolean): void => {
+        executionSnapshots.set(exec, {
+          targets: plan.snapshots,
+          gateApproved,
+          recycleRiskApproved,
+        })
+      }
 
       /*
        * ## 不可恢复删除必须先问（R24-1）
@@ -726,7 +762,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 事件循环阻塞，那不是"慢一点"，是所有工具调用都停住。共享之后，超过
          * 预算的目标退回 `incomplete`（按风险处理），结论仍然保守。
          */
-        ...(approvalPolicy(session) === 'never' ? { measureBounded: createSharedMeasure() } : {}),
+        ...(policy === 'never' ? { measureBounded: createSharedMeasure() } : {}),
       })
       if (riskVerdict.kind === 'ask') {
         /*
@@ -734,7 +770,7 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
          * 但这里与「危险路径」不同：这次删除**不可恢复**，宁可不做也不能
          * 静默执行。所以 never 下明确拒绝，而不是降级放行。
          */
-        if (approvalPolicy(session) === 'never') {
+        if (policy === 'never') {
           return {
             kind: 'deny',
             reason:
@@ -742,10 +778,14 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
               `${riskVerdict.reason.split('\n')[0]}`,
           }
         }
+        remember(true, true)
         return { kind: 'ask', reason: riskVerdict.reason }
       }
 
-      if (!plan.needsApproval) return next()
+      if (!plan.needsApproval) {
+        remember(policy === 'never', false)
+        return next()
+      }
 
       // 审批策略是 never 时不要返回 ask：管线会直接驳回，卡片不会出现，
       // 结果是"什么都不许删"。此时降级为放行到安全删除 —— 文件仍然进安全区、
@@ -754,7 +794,12 @@ function applyInner(ctx: PluginContext, config: SafeDeleteConfig): void {
       // 这个降级有真实代价，必须说清楚：危险路径（家目录、profile 清单、node_modules）
       // 的删除失去了一次人类确认的机会，只剩"可恢复"这一层。降低风险的办法是把安全区
       // 保留期配长一些，以及定期用 `safe_zone_list` 看一眼。
-      if (approvalPolicy(session) === 'never') return next()
+      if (policy === 'never') {
+        remember(true, false)
+        return next()
+      }
+
+      remember(true, false)
 
       const isBatch = plan.resolved.length > 1
       const shown = plan.resolved.slice(0, 5)

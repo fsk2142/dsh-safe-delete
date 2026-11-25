@@ -20,6 +20,9 @@ import {
   describeMoved,
   describeRecycled,
   approvalFailureText,
+  approveGate,
+  approveRecycleRisk,
+  verifyTargetSnapshot,
   hardRefusal,
   normalizeDestination,
   type DeleteDestination,
@@ -37,7 +40,7 @@ import { assessQuota } from './recycle'
 import { recycleManyToSystemBin } from './recycle'
 import { canRecycle, moveToSystemRecycleBin } from './recycle'
 import { destroyEntry, isEmptySafeZone, listSafeZone, listSafeZoneDetailed, listSafeZoneUnordered, moveManyToSafeZone, moveToSafeZone, restoreFromSafeZone } from './store'
-import type { BoundedMeasure } from './types'
+import type { BoundedMeasure, DeleteExecutionSnapshot } from './types'
 
 /** 审批结果词汇（与 DSH `ApprovalOutcome` 一致）。 */
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
@@ -120,7 +123,7 @@ export interface ToolDefinition {
     schema: JsonSchemaSubset
     render: (args: Record<string, unknown>, value: ToolResult) => Array<{ type: 'text'; text: string }>
   }
-  execute(args: Record<string, unknown>): Promise<ToolResult>
+  execute(args: Record<string, unknown>, context?: unknown): Promise<ToolResult>
 }
 
 /** 工具依赖（由插件入口注入，便于测试）。 */
@@ -192,6 +195,8 @@ export interface ToolDeps {
   makeMeasureBounded?: () => (target: string, limitBytes: number) => BoundedMeasure
   /** 当前时间（测试可注入）。 */
   now?: () => number
+  /** 从宿主执行对象取出本次调用的审批快照。 */
+  executionSnapshot?: (context: unknown) => DeleteExecutionSnapshot | undefined
 }
 
 /** 参数 spec → JSON Schema 子集。 */
@@ -257,7 +262,7 @@ function makeTool(spec: {
   name: string
   description: string
   parameters: Record<string, JsonSchemaProperty & { required?: boolean }>
-  execute: (args: Record<string, unknown>) => Promise<ToolResult>
+  execute: (args: Record<string, unknown>, context?: unknown) => Promise<ToolResult>
   /** 每次执行前的钩子（用于按间隔触发清理）。钩子失败不影响工具本身。 */
   beforeExecute?: () => Promise<void>
 }): ToolDefinition {
@@ -269,7 +274,7 @@ function makeTool(spec: {
       schema: OUTPUT_SCHEMA,
       render: (_args, value) => [{ type: 'text', text: value.text !== '' ? value.text : (value.error ?? '(empty)') }],
     },
-    async execute(args: Record<string, unknown>): Promise<ToolResult> {
+    async execute(args: Record<string, unknown>, context?: unknown): Promise<ToolResult> {
       if (spec.beforeExecute !== undefined) {
         try {
           await spec.beforeExecute()
@@ -278,7 +283,7 @@ function makeTool(spec: {
         }
       }
       try {
-        return await spec.execute(args)
+        return await spec.execute(args, context)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { ok: false, text: '', error: `[dsh-safe-delete] ${message}` }
@@ -498,6 +503,20 @@ async function deleteMany(
     plans.push({ target: resolved, description, gate: decideGate(resolved, description, gateCtx) })
   }
 
+  if (ctx.executionSnapshot !== undefined && !ctx.executionSnapshot.pattern) {
+    if (ctx.executionSnapshot.targets.length !== paths.length) {
+      return { ok: false, text: '', error: 'the target list changed after approval; nothing was moved' }
+    }
+    for (const plan of plans) {
+      const expected = ctx.executionSnapshot.targets.find((entry) => entry.target === plan.target)
+      if (expected === undefined) {
+        return { ok: false, text: '', error: `target "${plan.target}" was not covered by the approval` }
+      }
+      const changed = verifyTargetSnapshot(expected, plan.target, plan.description)
+      if (changed !== undefined) return { ok: false, text: '', error: changed }
+    }
+  }
+
   // 2. 预览：只列出会移动什么、哪些需要确认。
   if (base.preview === true) {
     const lines: string[] = [`PREVIEW (nothing moved): ${plans.length} item(s)`]
@@ -602,7 +621,7 @@ async function deleteMany(
     void totalBytes
     void totalFiles
 
-    const outcome = await ctx.requestApproval(text)
+    const outcome = await approveGate(ctx, text)
     if (outcome !== 'allowed-once') {
       return {
         ok: false,
@@ -663,13 +682,13 @@ async function deleteMany(
     const permStatus =
       ctx.permanentDeleteRisk?.status ?? (ctx.permanentDeleteRisk?.risky === true ? 'risky' : 'safe')
     if (permStatus !== 'safe') {
-      const outcome = await ctx.requestApproval(
+      const outcome = await approveRecycleRisk(ctx,
         `This delete will PERMANENTLY remove ${plans.length} item(s) — the recycle bin is not in effect.\n\n` +
           `Reason: ${ctx.permanentDeleteRisk?.reason ?? 'the system is configured to delete permanently'}\n\n` +
           `Approve only if you accept that the data cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
-        return { ok: false, text: '', error: approvalFailureText(outcome, `${plans.length} item(s)`) }
+        return { ok: false, text: '', error: approvalFailureText(outcome, `${plans.length} item(s)`, ctx.executionSnapshot !== undefined) }
       }
     }
 
@@ -711,14 +730,14 @@ async function deleteMany(
       const sample = atRisk.slice(0, 3).map((entry) => entry.plan.target)
       const rest = atRisk.length > sample.length ? ` (+${atRisk.length - sample.length} more)` : ''
       const reasons = [...new Set(atRisk.map((e) => (e.quota.status === 'within' ? '' : e.quota.reason)))]
-      const outcome = await ctx.requestApproval(
+      const outcome = await approveRecycleRisk(ctx,
         `This delete may PERMANENTLY remove ${atRisk.length} item(s) — the recycle bin's capacity could not rule it out.\n\n` +
           `Items: ${sample.join(', ')}${rest}\n\n` +
           `Why: ${reasons.join('; ')}\n\n` +
           `Approve only if you accept that they cannot be recovered.`,
       )
       if (outcome !== 'allowed-once') {
-        return { ok: false, text: '', error: approvalFailureText(outcome, `${atRisk.length} item(s) at quota risk`) }
+        return { ok: false, text: '', error: approvalFailureText(outcome, `${atRisk.length} item(s) at quota risk`, ctx.executionSnapshot !== undefined) }
       }
     }
 
@@ -1128,9 +1147,17 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       force: { type: 'boolean', description: 'Ignored; a model-set flag is never user approval.' },
     },
     beforeExecute: pruneIfDue,
-    async execute(args) {
+    async execute(args, context) {
       const targets = normaliseDeleteTargets(args)
       if (targets.error !== undefined) return { ok: false, text: '', error: targets.error }
+      const executionSnapshot = deps.executionSnapshot?.(context)
+      if (deps.executionSnapshot !== undefined && executionSnapshot === undefined && args.preview !== true) {
+        return {
+          ok: false,
+          text: '',
+          error: 'missing approval snapshot for this safe_delete call; nothing was moved. Retry the call.',
+        }
+      }
 
       /*
        * 模式形态（`root` + `match`/`olderThan`/`exclude`）到这里才枚举。
@@ -1198,6 +1225,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
         ...(deps.makeMeasureBounded === undefined ? {} : { makeMeasureBounded: deps.makeMeasureBounded }),
         // 空间预告现在只剩"跨盘复制会不会写不下"这一项。
         requestApproval: deps.requestApproval,
+        ...(executionSnapshot === undefined ? {} : { executionSnapshot }),
         now,
         /*
          * 删除之后的顺带清理：同样只**投递**，不执行。

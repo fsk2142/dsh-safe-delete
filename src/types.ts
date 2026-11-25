@@ -92,3 +92,40 @@ export type BoundedMeasure =
   | { kind: 'over'; bytes: number }
   /** 没走完（错误 / 条目上限 / 根不可读），无法给出任何结论。 */
   | { kind: 'incomplete'; reason: string }
+
+/**
+ * `pre-execute` 为一次具体工具调用留下的审批快照。
+ *
+ * ## 为什么需要调用级绑定（2026-11-25 复审 TOCTOU）
+ *
+ * 钩子先描述目标并可能弹出审批；用户批准后到工具体真正执行之间还有一段
+ * 调度窗口。另一进程可以在窗口里把同名路径换成超配额文件，而执行体的
+ * `requestApproval` 在生产接线里是恒放行桩 —— 于是新风险没有真实授权。
+ *
+ * 快照按宿主的执行对象身份绑定（`WeakMap`），不进入会话日志，也不靠全局
+ * "当前调用"变量，因此并发工具调用不会串线。
+ */
+export interface DeleteExecutionSnapshot {
+  /** 钩子看到的每个目标身份；目录还记录当时统计出的条目数与字节数。 */
+  targets: DeleteTargetSnapshot[]
+  /** 模式删除在钩子阶段不枚举目标；这张卡明确覆盖执行时枚举出的集合。 */
+  pattern?: boolean
+  /** 本次是否已经覆盖"路径危险 / 超过确认阈值"这类门禁。 */
+  gateApproved: boolean
+  /** 本次是否已经覆盖"回收站策略或配额可能导致永久删除"这类风险。 */
+  recycleRiskApproved: boolean
+}
+
+/** 一个目标在审批时的身份与规模。 */
+export interface DeleteTargetSnapshot {
+  target: string
+  dev: number
+  ino: number
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  mode: number
+  isDirectory: boolean
+  fileCount: number
+  bytes: number
+}
