@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { __destinationFieldForTest, __fieldsForTest } from '../src/client/index'
+import { __destinationFieldForTest, __fieldsForTest, __translateForTest } from '../src/client/index'
 
 describe('settings form fields', () => {
   it('offers the delete destination as two buttons, not a dropdown', () => {
@@ -9,7 +9,10 @@ describe('settings form fields', () => {
     expect(field).toBeDefined()
     expect(field?.kind).toBe('choice')
     expect(field?.options?.map((o) => o.value)).toEqual(['safe-zone', 'recycle-bin'])
-    expect(field?.options?.map((o) => o.label)).toEqual(['放入安全区', '直接进回收站'])
+    expect(field?.options?.map((o) => __translateForTest('zh', o.label)))
+      .toEqual(['放入安全区', '直接进回收站'])
+    expect(field?.options?.map((o) => __translateForTest('en', o.label)))
+      .toEqual(['Move to safe zone', 'Send directly to Recycle Bin'])
   })
 
   it('keeps the safety-relevant trade-off in the hint', () => {
@@ -28,9 +31,11 @@ describe('settings form fields', () => {
      * 这层额外确认。那是用户在做这个选择时必须要知道的后果，属于操作说明，
      * 不属于设计文档。所以断言改成守住这一点。
      */
-    expect(field?.hint, '必须说明取回要去哪儿').toMatch(/回收站/)
-    expect(field?.hint, '必须说明还能不能取回').toMatch(/取回/)
-    expect(field?.hint, '必须说明会失去额外确认').toMatch(/确认/)
+    if (field === undefined) throw new Error('missing destination field')
+    const hint = __translateForTest('zh', field.hint)
+    expect(hint, '必须说明取回要去哪儿').toMatch(/回收站/)
+    expect(hint, '必须说明还能不能取回').toMatch(/取回/)
+    expect(hint, '必须说明会失去额外确认').toMatch(/确认/)
   })
 
   it('keeps the numeric fields working', () => {

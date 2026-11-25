@@ -119,14 +119,14 @@ describe('SD-22: the size threshold accepts 0 or at least 1 MB', () => {
    * 挂载组件并返回控件。
    *
    * @param initial 初始配置。
-   * @returns act、calls、输入框、单位下拉与保存按钮。
+   * @returns act、calls、输入框、单位下拉与容器。
    */
   async function mount(initial: Record<string, unknown>): Promise<{
     act: (cb: () => Promise<void>) => Promise<void>
     calls: MutateCall[]
     input: HTMLInputElement
     unit: HTMLSelectElement
-    save: HTMLButtonElement
+    container: HTMLElement
   }> {
     const React = await import('react')
     const { createRoot } = await import('react-dom/client')
@@ -154,11 +154,18 @@ describe('SD-22: the size threshold accepts 0 or at least 1 MB', () => {
     const selects = [...container.querySelectorAll('select')] as HTMLSelectElement[]
     const input = inputs[inputs.length - 1]
     const unit = selects[selects.length - 1]
-    const save = container.querySelector('button') as HTMLButtonElement | null
-    if (input === undefined || unit === undefined || save === null) {
+    if (input === undefined || unit === undefined) {
       throw new Error('missing bytes controls')
     }
-    return { act, calls, input, unit, save }
+    return { act, calls, input, unit, container }
+  }
+
+  /** 保存只在 dirty 后出现；按可见文本定位，避免命中删除去向按钮。 */
+  function saveButton(container: HTMLElement): HTMLButtonElement {
+    const save = [...container.querySelectorAll('button')]
+      .find((button) => (button.textContent ?? '').trim() === '保存')
+    if (save === undefined) throw new Error('保存按钮未出现')
+    return save
   }
 
   it('rejects 0.5 MB', async () => {
@@ -167,36 +174,39 @@ describe('SD-22: the size threshold accepts 0 or at least 1 MB', () => {
      *
      * 判定方式：输入 0.5 后点保存，宿主**不该**收到 confirmBytes 的写入。
      */
-    const { act, calls, input, save } = await mount({ confirmBytes: 2 * GB })
+    const { act, calls, input, unit, container } = await mount({ confirmBytes: 2 * GB })
 
+    await changeValue(act, unit, 'MB')
     await changeValue(act, input, '0.5')
+    const save = saveButton(container)
     await act(async () => {
       save.click()
       await new Promise((r) => setTimeout(r, 60))
     })
 
-    const setOp = calls.flatMap((c) => c.ops).find((o) => o.path[0] === 'confirmBytes')
-    if (setOp !== undefined) {
-      expect(setOp.value as number, '0.5 MB 不该被保存').toBeGreaterThanOrEqual(MB)
-    }
+    expect(calls, '0.5 MB 不合法，保存按钮不应调用 mutate').toHaveLength(0)
+    const setOps = calls.flatMap((c) => c.ops).filter((o) => o.path[0] === 'confirmBytes')
+    expect(setOps, '非法阈值不能写入 confirmBytes').toHaveLength(0)
   })
 
   it('accepts exactly 1 MB', async () => {
     // 边界：1 MB 合法。
-    const { act, calls, input, unit, save } = await mount({ confirmBytes: 2 * GB })
+    const { act, calls, input, unit, container } = await mount({ confirmBytes: 2 * GB })
 
     // 单位切到 MB，输入 1。
     await changeValue(act, unit, 'MB')
     await changeValue(act, input, '1')
+    const save = saveButton(container)
     await act(async () => {
       save.click()
       await new Promise((r) => setTimeout(r, 60))
     })
 
-    const setOp = calls.flatMap((c) => c.ops).find((o) => o.path[0] === 'confirmBytes')
-    if (setOp !== undefined) {
-      expect(setOp.value as number, '1 MB 应被接受').toBe(1 * MB)
-    }
+    expect(calls, '合法值必须调用 mutate').toHaveLength(1)
+    expect(calls[0]?.ns).toBe('dsh-safe-delete')
+    const setOp = calls[0]?.ops.find((o) => o.path[0] === 'confirmBytes')
+    expect(setOp, 'mutate 必须包含 confirmBytes').toBeDefined()
+    expect(setOp?.value, '1 MB 应被接受').toBe(1 * MB)
   })
 
   it('still accepts 0 as the off switch', async () => {
@@ -206,18 +216,20 @@ describe('SD-22: the size threshold accepts 0 or at least 1 MB', () => {
      * 不能简单把 min 设成 1 MB —— 那会把 0 也拒掉，
      * 而"关闭确认"是正常用法。
      */
-    const { act, calls, input, save } = await mount({ confirmBytes: 2 * GB })
+    const { act, calls, input, container } = await mount({ confirmBytes: 2 * GB })
 
     await changeValue(act, input, '0')
+    const save = saveButton(container)
     await act(async () => {
       save.click()
       await new Promise((r) => setTimeout(r, 60))
     })
 
-    const setOp = calls.flatMap((c) => c.ops).find((o) => o.path[0] === 'confirmBytes')
-    if (setOp !== undefined) {
-      expect(setOp.value as number, '0 必须仍是 0').toBe(0)
-    }
+    expect(calls, '关闭确认必须调用 mutate').toHaveLength(1)
+    expect(calls[0]?.ns).toBe('dsh-safe-delete')
+    const setOp = calls[0]?.ops.find((o) => o.path[0] === 'confirmBytes')
+    expect(setOp, 'mutate 必须包含 confirmBytes').toBeDefined()
+    expect(setOp?.value, '0 必须仍是 0').toBe(0)
   })
 
   it('enforces the same rule as the slash entry (structural)', async () => {

@@ -1,3 +1,4 @@
+import { JSDOM } from 'jsdom'
 import { describe, expect, it } from 'vitest'
 
 import { apply, inject } from '../src/client/index'
@@ -88,11 +89,71 @@ describe('client apply', () => {
     expect(ctx.registeredSlots).toHaveLength(0)
   })
 
-  it('renders a summary string and the form for the page view', () => {
+  it('retains the exact shared ConfigForm returned by forms.get', async () => {
     const ctx = makeFakeCtx()
-    apply(ctx as never)
-    const slot = ctx.registeredSlots.find((s) => s['name'] === 'plugins.bundle.config')
-    expect(slot).toBeDefined()
-    // 组件本身在 verify-client-render.mjs 里渲染验证。
+    let snapshot = {
+      status: 'ready' as const,
+      value: { retentionDays: 6, confirmFileCount: 5000, confirmBytes: 2 * 1024 ** 3 },
+      revision: 3,
+      writable: true,
+    }
+    const listeners = new Set<() => void>()
+    const form = {
+      getSnapshot: () => snapshot,
+      subscribe: (listener: () => void) => {
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+      mutate: async () => true,
+    }
+    const service = (ctx as unknown as { configForms: { get: (ns: string) => unknown } }).configForms
+    const original = service.get
+    service.get = (ns: string) => {
+      expect(ns).toBe('dsh-safe-delete')
+      return form
+    }
+    const dom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true })
+    const globals = globalThis as Record<string, unknown>
+    const previous = Object.fromEntries(['window', 'document', 'HTMLElement', 'Node', 'Event', 'MouseEvent', 'IS_REACT_ACT_ENVIRONMENT'].map((key) => [key, globals[key]]))
+    Object.assign(globals, {
+      window: dom.window,
+      document: dom.window.document,
+      HTMLElement: dom.window.HTMLElement,
+      Node: dom.window.Node,
+      Event: dom.window.Event,
+      MouseEvent: dom.window.MouseEvent,
+      IS_REACT_ACT_ENVIRONMENT: true,
+    })
+    try {
+      apply(ctx as never)
+      const React = await import('react')
+      const { createRoot } = await import('react-dom/client')
+      const { act } = await import('react')
+      const { SafeZoneSettings, __setConfigFormForTest } = await import('../src/client/index') as unknown as {
+        SafeZoneSettings: unknown
+        __setConfigFormForTest: (value: unknown) => void
+      }
+      const container = document.createElement('div')
+      document.body.append(container)
+      const root = createRoot(container)
+      try {
+        await act(async () => { root.render(React.createElement(SafeZoneSettings as never)) })
+        snapshot = { ...snapshot, value: { ...snapshot.value, retentionDays: 7 } }
+        await act(async () => {
+          for (const listener of [...listeners]) listener()
+        })
+        expect(container.querySelector<HTMLInputElement>('#dsd-retentionDays')?.value).toBe('7')
+      } finally {
+        await act(async () => { root.unmount() })
+        __setConfigFormForTest(undefined)
+      }
+    } finally {
+      service.get = original
+      dom.window.close()
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete globals[key]
+        else globals[key] = value
+      }
+    }
   })
 })

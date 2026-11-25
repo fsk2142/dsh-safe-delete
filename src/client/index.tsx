@@ -3,7 +3,7 @@
  *
  * ## 为什么放在插件页而不是设置页
  *
- * DSH 的插件页声明了 `plugins.row.config` 槽位，插件可以把自己的配置渲染在
+ * DSH 的插件页声明了 `plugins.bundle.config` 槽位，插件可以把自己的配置渲染在
  * 自己的详情页里。设置页需要额外处理 tab 挂载与切换，反而更绕。
  *
  * ## 为什么保存后提示「重启 DSH 生效」
@@ -15,8 +15,30 @@
  * @module dsh-safe-delete/client
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactElement } from 'react'
+import en from '../../locale/en.json'
+import zh from '../../locale/zh.json'
+
+/** 宿主 t 的最小形状；参数只用于把运行时错误嵌进本地化模板。 */
+type LocaleKey = Exclude<keyof typeof en, 'meta'>
+type Translate = (key: LocaleKey, params?: Record<string, string>) => string
+
+function dictionaryOf(resource: Record<string, unknown>): Record<LocaleKey, string> {
+  return Object.fromEntries(
+    Object.entries(resource)
+      .filter((entry): entry is [string, string] => entry[0] !== 'meta' && typeof entry[1] === 'string'),
+  ) as Record<LocaleKey, string>
+}
+
+const DICTIONARIES = { zh: dictionaryOf(zh), en: dictionaryOf(en) }
+
+/** 直接挂载（测试或非槽位调用）时的中文回退；真实槽位始终注入宿主 t。 */
+const defaultTranslate: Translate = (key, params) => {
+  const template = DICTIONARIES.zh[key]
+  if (params === undefined) return template
+  return template.replace(/\{(\w+)\}/g, (match, name: string) => params[name] ?? match)
+}
 
 /** 宿主侧设置的命名空间（= 插件在 profile 里的行 id）。 */
 const NAMESPACE = 'dsh-safe-delete'
@@ -28,8 +50,8 @@ const GB = 1024 * MB
 /** 一个可编辑字段的描述。 */
 interface FieldSpec {
   key: string
-  label: string
-  hint: string
+  label: LocaleKey
+  hint: LocaleKey
   /** 控件类型。 */
   kind: 'bytes' | 'number' | 'choice'
   /** 最小值（含）。 */
@@ -43,7 +65,7 @@ interface FieldSpec {
    * 刻意做成**并排按钮**而不是下拉框：两种删除去向的取舍（速度 vs 统计）
    * 需要被看见。下拉框会把替代项折叠起来，用户就只看得到当前值。
    */
-  options?: Array<{ value: string; label: string }>
+  options?: Array<{ value: string; label: LocaleKey }>
 }
 
 /**
@@ -69,12 +91,12 @@ interface FieldSpec {
  */
 const DESTINATION_FIELD: FieldSpec = {
   key: 'deleteDestination',
-  label: '删除去向',
-  hint: '放入安全区：可在插件内取回（大目录较慢）。直接进回收站：更快，但不再额外确认超大删除，取回要去系统回收站。',
+  label: 'destinationLabel',
+  hint: 'destinationHint',
   kind: 'choice',
   options: [
-    { value: 'safe-zone', label: '放入安全区' },
-    { value: 'recycle-bin', label: '直接进回收站' },
+    { value: 'safe-zone', label: 'destinationSafeZone' },
+    { value: 'recycle-bin', label: 'destinationRecycleBin' },
   ],
   fallback: 0,
 }
@@ -98,12 +120,12 @@ const DESTINATION_FIELD: FieldSpec = {
 const FIELDS: FieldSpec[] = [
   {
     key: 'retentionDays',
-    label: '安全区保留天数',
+    label: 'retentionDaysLabel',
     /*
      * 只留"填什么 + 边界"，机制说明交给 README（2026-11-06）。
      * 原来的"到期移入系统回收站"是在设置页复述实现细节。
      */
-    hint: '到期后自动移入系统回收站。至少 1 天。',
+    hint: 'retentionDaysHint',
     /*
      * 用 `number` 而不是新的 `'days'` 类型：天数本身就是整数、没有单位换算，
      * `number` 分支的渲染（`String(current)`）和写回（原值）正好合适。
@@ -116,16 +138,16 @@ const FIELDS: FieldSpec[] = [
   },
   {
     key: 'confirmFileCount',
-    label: '单次删除条目数确认',
-    hint: '超过这个数量就先问一次。0 = 关闭。',
+    label: 'confirmFileCountLabel',
+    hint: 'confirmFileCountHint',
     kind: 'number',
     min: 0,
     fallback: 5000,
   },
   {
     key: 'confirmBytes',
-    label: '单次删除大小确认',
-    hint: '超过这个大小就先问一次。0 = 关闭。',
+    label: 'confirmBytesLabel',
+    hint: 'confirmBytesHint',
     kind: 'bytes',
     min: 0,
     fallback: 2 * GB,
@@ -142,6 +164,45 @@ interface SettingsRemote {
     ops: readonly { op: 'set'; path: readonly string[]; value: unknown }[],
     revision?: number,
   ) => Promise<unknown>
+}
+
+/** `configForms.get()` 返回的同步快照（安装包 0.2.2-rc.5 契约）。 */
+interface ConfigFormSnapshot {
+  status: 'loading' | 'ready' | 'unavailable'
+  value: Record<string, unknown> | undefined
+  revision: number | undefined
+  writable: boolean
+}
+
+/** 本插件消费的 ConfigForm 面；服务持有控制器，组件只订阅自己的视图。 */
+interface ConfigForm {
+  getSnapshot(): ConfigFormSnapshot
+  subscribe(listener: () => void): () => void
+  mutate(
+    ops: readonly { op: 'set'; path: readonly string[]; value: unknown }[],
+    expectedRevision?: number,
+  ): Promise<boolean>
+}
+
+/** 没有 ConfigForm 时 useSyncExternalStore 的稳定空快照。 */
+const EMPTY_FORM_SNAPSHOT: ConfigFormSnapshot = {
+  status: 'loading', value: undefined, revision: undefined, writable: false,
+}
+
+function emptySubscribe(): () => void {
+  return () => {}
+}
+
+/** 合并外部快照时只覆盖宿主字段，本地草稿和显示单位继续归用户所有。 */
+function mergeExternalSnapshot(
+  previous: Record<string, unknown>,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...next }
+  for (const [key, value] of Object.entries(previous)) {
+    if (key.endsWith('.draft') || key.endsWith('.unit')) merged[key] = value
+  }
+  return merged
 }
 
 /** 客户端上下文的最小形状。 */
@@ -248,7 +309,10 @@ function pickNamespace(payload: unknown): NamespaceView {
  * 宿主契约：**失败不 reject，而是 resolve 成 `{ ok: false, error }`**。
  * 不拆就会把一次被拒绝的保存当成成功 —— 用户以为存上了，实际没有。
  */
-function unwrapRemote(result: unknown): { ok: true; value: unknown } | { ok: false; error: string } {
+function unwrapRemote(
+  result: unknown,
+  rejectedText = DICTIONARIES.zh.hostRejected,
+): { ok: true; value: unknown } | { ok: false; error: string } {
   if (result === null || typeof result !== 'object' || !('ok' in (result as object))) {
     return { ok: true, value: result }
   }
@@ -261,7 +325,7 @@ function unwrapRemote(result: unknown): { ok: true; value: unknown } | { ok: fal
         ? error
         : error !== null && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string'
           ? `${String((error as { code?: unknown }).code ?? '')} ${(error as { message: string }).message}`.trim()
-          : '宿主拒绝了这次保存'
+          : rejectedText
     return { ok: false, error: text }
   }
   return { ok: true, value: result }
@@ -283,6 +347,20 @@ function unwrapRemote(result: unknown): { ok: true; value: unknown } | { ok: fal
  */
 let settingsRemote: SettingsRemote | undefined
 
+/** `forms.get(NAMESPACE)` 的稳定控制器；由 apply 在注册槽位前保存。 */
+let settingsForm: ConfigForm | undefined
+
+function asConfigForm(value: unknown): ConfigForm | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const candidate = value as Partial<ConfigForm>
+  if (
+    typeof candidate.getSnapshot !== 'function'
+    || typeof candidate.subscribe !== 'function'
+    || typeof candidate.mutate !== 'function'
+  ) return undefined
+  return candidate as ConfigForm
+}
+
 /**
  * 注入 remote（**仅测试用**）。
  *
@@ -292,6 +370,11 @@ let settingsRemote: SettingsRemote | undefined
  *
  * @param remote 假的 settings remote。
  */
+/** 测试与诊断用本地化读取；生产渲染使用宿主传入的 t。 */
+export function __translateForTest(locale: 'zh' | 'en', key: LocaleKey): string {
+  return DICTIONARIES[locale][key]
+}
+
 /** 表单字段的只读视图（测试用：断言控件类型与候选项）。 */
 export function __fieldsForTest(): ReadonlyArray<FieldSpec> {
   return FIELDS
@@ -306,6 +389,11 @@ export function __setRemoteForTest(remote: SettingsRemote | undefined): void {
   settingsRemote = remote
 }
 
+/** 注入共享 ConfigForm（仅测试用；生产路径由 apply 捕获 forms.get）。 */
+export function __setConfigFormForTest(form: unknown): void {
+  settingsForm = asConfigForm(form)
+}
+
 /**
  * 表单组件里取 remote。
  *
@@ -315,8 +403,13 @@ function currentRemote(): SettingsRemote | undefined {
   return settingsRemote
 }
 
+/** @returns 当前共享 ConfigForm；不可用时 undefined。 */
+function currentForm(): ConfigForm | undefined {
+  return settingsForm
+}
+
 /** 表单组件。 */
-export function SafeZoneSettings(): ReactElement {
+export function SafeZoneSettings({ t = defaultTranslate }: { t?: Translate } = {}): ReactElement {
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const [message, setMessage] = useState('')
@@ -364,7 +457,53 @@ export function SafeZoneSettings(): ReactElement {
    */
   valuesRef.current = values
 
+  /*
+   * `plugins.bundle.config` 的 owner props 只有 `{ view: 'page' }`，不传 form。
+   * 配置值必须从 apply 保存的 `forms.get(NAMESPACE)` 控制器读取：快照是同步的，
+   * subscribe 才会让外部配置更新无需重挂载就进入表单。
+   */
+  const form = currentForm()
+  const subscribeForm = useCallback(
+    (listener: () => void) => form?.subscribe(listener) ?? emptySubscribe(),
+    [form],
+  )
+  const getFormSnapshot = useCallback(
+    () => form?.getSnapshot() ?? EMPTY_FORM_SNAPSHOT,
+    [form],
+  )
+  const formSnapshot = useSyncExternalStore(subscribeForm, getFormSnapshot, getFormSnapshot)
+
   useEffect(() => {
+    if (form === undefined) return
+    if (formSnapshot.status === 'loading') {
+      setStatus('loading')
+      return
+    }
+    setStatus('ready')
+    setRevision(formSnapshot.revision)
+    if (formSnapshot.value === undefined) {
+      setMessage(t('noConfig'))
+      return
+    }
+    setValues((previous) => mergeExternalSnapshot(previous, formSnapshot.value!))
+    if (Object.keys(formSnapshot.value).length === 0) {
+      setMessage(t('noConfig'))
+    }
+  }, [form, formSnapshot, t])
+
+  /** 保存后读取同一控制器的最新快照；旧宿主回退路径仍使用 settings remote。 */
+  const readActiveView = useCallback(async (remote: SettingsRemote | undefined): Promise<NamespaceView | undefined> => {
+    if (form !== undefined) {
+      const snapshot = form.getSnapshot()
+      return { value: snapshot.value ?? {}, revision: snapshot.revision }
+    }
+    if (remote?.describe === undefined) return undefined
+    const refreshed = unwrapRemote(await remote.describe(), t('hostRejected'))
+    return refreshed.ok ? pickNamespace(refreshed.value) : undefined
+  }, [form, t])
+
+  useEffect(() => {
+    if (form !== undefined) return
     let alive = true
     const load = async (): Promise<void> => {
       // 等 remote 就绪（最多约 2 秒）。用轮询而不是订阅：宿主没有暴露
@@ -381,7 +520,7 @@ export function SafeZoneSettings(): ReactElement {
       if (resolved?.describe === undefined) {
         setStatus('error')
         setMessage(
-          '这个宿主没有暴露设置接口（remote.settings 不可用），配置请改用 cordis.patch.yml。',
+          t('remoteUnavailable'),
         )
         return
       }
@@ -394,11 +533,11 @@ export function SafeZoneSettings(): ReactElement {
         // describe 没拆，于是 pickNamespace 在 `{ok,value}` 这一层找 `namespaces`
         // —— 永远找不到，界面只能回落到默认值。
         // 诊断截图里的 `host namespaces — empty list` 是直接证据。
-        const unwrapped = unwrapRemote(raw)
+        const unwrapped = unwrapRemote(raw, t('hostRejected'))
         const payload = unwrapped.ok ? unwrapped.value : undefined
         if (!unwrapped.ok) {
           setStatus('error')
-          setMessage(`读取配置失败：${unwrapped.error}`)
+          setMessage(t('readFailed', { error: unwrapped.error }))
           return
         }
         const view = pickNamespace(payload)
@@ -410,7 +549,7 @@ export function SafeZoneSettings(): ReactElement {
         const namespaceSeen = Object.keys(view.value).length > 0
         setStatus('ready')
         if (!namespaceSeen) {
-          setMessage('没有读到本插件的配置（显示的是默认值）。若刚安装，重启 DSH 后再看。')
+          setMessage(t('noConfig'))
         }
       } catch (error) {
         if (!alive) return
@@ -422,7 +561,7 @@ export function SafeZoneSettings(): ReactElement {
     return () => {
       alive = false
     }
-  }, [remote])
+  }, [remote, form, t])
 
   const setField = useCallback((key: string, raw: string): void => {
     // 用 `<key>.draft` 保存用户的原始输入：不要覆盖从配置读到的真实值，
@@ -582,8 +721,9 @@ export function SafeZoneSettings(): ReactElement {
     remote: SettingsRemote,
     ops: Parameters<NonNullable<SettingsRemote['mutate']>>[1],
   ): Promise<unknown> => {
+    if (form !== undefined) return form.mutate(ops, revision)
     const result = await remote.mutate!(NAMESPACE, ops, revision)
-    const reply = unwrapRemote(result)
+    const reply = unwrapRemote(result, t('hostRejected'))
     if (reply.ok) {
       const ack = reply.value
       if (ack !== null && typeof ack === 'object' && 'revision' in ack && typeof ack.revision === 'number') {
@@ -591,7 +731,7 @@ export function SafeZoneSettings(): ReactElement {
       }
     } else if (reply.error.includes('settings/conflict') && remote.describe !== undefined) {
       try {
-        const snapshot = unwrapRemote(await remote.describe())
+        const snapshot = unwrapRemote(await remote.describe(), t('hostRejected'))
         if (snapshot.ok) {
           const view = pickNamespace(snapshot.value)
           if (view.revision !== undefined) {
@@ -618,10 +758,10 @@ export function SafeZoneSettings(): ReactElement {
       } catch { /* Retain the conflict and the user's draft when refresh fails. */ }
     }
     return result
-  }, [revision])
+  }, [form, revision, t])
 
   const save = useCallback(async (): Promise<void> => {
-    if (remote?.mutate === undefined) return
+    if (form?.mutate === undefined && remote?.mutate === undefined) return
     /*
      * ## 提交快照（2026-11-01 定版复核第 3 项）
      *
@@ -688,7 +828,7 @@ export function SafeZoneSettings(): ReactElement {
         const displayValue = typeof draft === 'string' ? draft : displayValueOf(spec, values)
         const value = coerce(spec, displayValue)
         if (value === undefined) {
-          nextErrors[spec.key] = '填一个不小于下限的数字'
+          nextErrors[spec.key] = t('invalidNumber')
           continue
         }
         payload[spec.key] = value
@@ -701,7 +841,7 @@ export function SafeZoneSettings(): ReactElement {
     }
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length > 0) {
-      setMessage('有字段不合法，没有保存。')
+      setMessage(t('invalidFields'))
       return
     }
 
@@ -712,8 +852,8 @@ export function SafeZoneSettings(): ReactElement {
     setMessage('')
     try {
       const activeRemote = currentRemote()
-      if (activeRemote?.mutate === undefined) {
-        setMessage('这个宿主没有暴露设置接口，无法保存。配置请改用 cordis.patch.yml。')
+      if (form === undefined && activeRemote?.mutate === undefined) {
+        setMessage(t('saveUnavailable'))
         return
       }
       // 真实契约：`mutate(ns, ops, revision)`，ops 是 `{ op:'set', path:[key], value }`
@@ -723,12 +863,16 @@ export function SafeZoneSettings(): ReactElement {
         path: [key],
         value,
       }))
-      const result = await mutateSettings(activeRemote, ops)
-      // 宿主契约：失败**不 reject**，而是 resolve 成 `{ ok:false, error }`。
-      // 不拆信封就会把被拒绝的保存当成成功。
-      const unwrapped = unwrapRemote(result)
+      const result = await mutateSettings(activeRemote ?? {}, ops)
+      // ConfigForm.mutate 返回 boolean；settings remote 返回 `{ ok, value/error }`。
+      // 两条通道都必须把拒绝当作失败，不能把 false 当成成功信封。
+      const unwrapped = form === undefined
+        ? unwrapRemote(result, t('hostRejected'))
+        : result === true
+          ? { ok: true as const, value: result }
+          : { ok: false as const, error: t('hostRejected') }
       if (!unwrapped.ok) {
-        setMessage(`保存失败：${unwrapped.error}`)
+        setMessage(t('saveFailed', { error: unwrapped.error }))
         return
       }
       // 成功后重新读一次，拿到新的修订号；否则连续两次保存会撞上自己上一次
@@ -745,11 +889,8 @@ export function SafeZoneSettings(): ReactElement {
       // 覆盖界面；否则只更新 revision，保留用户眼前的输入。宁可显示"未确认"，
       // 也不要把用户刚改的值抹掉。
       try {
-        const refreshed = activeRemote.describe === undefined ? undefined : await activeRemote.describe()
-        if (refreshed !== undefined) {
-          // 同样要拆信封（见上方 describe 的说明）。
-          const refreshedUnwrapped = unwrapRemote(refreshed)
-          const view = pickNamespace(refreshedUnwrapped.ok ? refreshedUnwrapped.value : undefined)
+        const view = await readActiveView(activeRemote)
+        if (view !== undefined) {
           setRevision((prev) => view.revision === undefined ? prev : Math.max(prev ?? view.revision, view.revision))
           const wroteSomething = Object.keys(payload).length > 0
           const confirmed =
@@ -918,12 +1059,12 @@ export function SafeZoneSettings(): ReactElement {
 
             setMessage(
               hasNewerEdit || hasNewerUnit
-                ? '已保存。保存期间还有新的修改尚未提交。重启 DSH 生效。'
-                : '已保存。重启 DSH 生效。',
+                ? t('savedWithNewer')
+                : t('savedRestart'),
             )
           } else {
             // 没读到新值：保留用户输入，并如实说明「已写入但未能回读确认」。
-            setMessage('已提交保存，但宿主回读到的仍是旧值。重启 DSH 后再确认。')
+            setMessage(t('saveUnconfirmed'))
           }
         }
       } catch {
@@ -931,13 +1072,13 @@ export function SafeZoneSettings(): ReactElement {
       }
       setSaved(true)
     } catch (error) {
-      setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
+      setMessage(t('saveFailed', { error: error instanceof Error ? error.message : String(error) }))
     } finally {
       // 两处都要复位：state 驱动按钮外观，ref 驱动同步守卫。
       savingRef.current = false
       setSaving(false)
     }
-  }, [coerce, remote, revision, values, mutateSettings])
+  }, [coerce, form, readActiveView, remote, revision, t, values, mutateSettings])
 
   /**
    * 是否有未保存的改动。
@@ -982,8 +1123,8 @@ export function SafeZoneSettings(): ReactElement {
   const chooseValue = useCallback(
     async (key: string, value: string): Promise<void> => {
       const remote = currentRemote()
-      if (remote?.mutate === undefined) {
-        setMessage('这个宿主没有暴露设置接口，无法保存。')
+      if (form?.mutate === undefined && remote?.mutate === undefined) {
+        setMessage(t('saveUnavailable'))
         return
       }
       if (savingRef.current) return
@@ -992,35 +1133,36 @@ export function SafeZoneSettings(): ReactElement {
       setMessage('')
       setSaved(false)
       try {
-        const result = await mutateSettings(remote, [{ op: 'set', path: [key], value }])
-        const unwrapped = unwrapRemote(result)
+        const result = await mutateSettings(remote ?? {}, [{ op: 'set', path: [key], value }])
+        const unwrapped = form === undefined
+          ? unwrapRemote(result, t('hostRejected'))
+          : result === true
+            ? { ok: true as const, value: result }
+            : { ok: false as const, error: t('hostRejected') }
         if (!unwrapped.ok) {
-          setMessage(`保存失败：${unwrapped.error}`)
+          setMessage(t('saveFailed', { error: unwrapped.error }))
           return
         }
         try {
-          const refreshed = remote.describe === undefined ? undefined : await remote.describe()
-          if (refreshed !== undefined) {
-            const unwrappedRefresh = unwrapRemote(refreshed)
-            if (unwrappedRefresh.ok) {
-              const next = pickNamespace(unwrappedRefresh.value).revision
-              if (typeof next === 'number') setRevision((prev) => Math.max(prev ?? next, next))
-            }
+          const view = await readActiveView(remote)
+          if (view?.revision !== undefined) {
+            const next = view.revision
+            setRevision((prev) => Math.max(prev ?? next, next))
           }
         } catch {
           /* 刷新 revision 失败不影响这次写入 */
         }
         setValues((prev) => ({ ...prev, [key]: value }))
-        setMessage('已保存，重启 DSH 后生效。')
+        setMessage(t('savedRestart'))
         setSaved(true)
       } catch (error) {
-        setMessage(`保存失败：${error instanceof Error ? error.message : String(error)}`)
+        setMessage(t('saveFailed', { error: error instanceof Error ? error.message : String(error) }))
       } finally {
         savingRef.current = false
         setSaving(false)
       }
     },
-    [mutateSettings],
+    [form, readActiveView, t, mutateSettings],
   )
 
 
@@ -1046,7 +1188,7 @@ export function SafeZoneSettings(): ReactElement {
           alignItems: 'start',
         }}
       >
-        <span style={{ fontSize: '13px', lineHeight: '1.4' }}>{spec.label}</span>
+        <span style={{ fontSize: '13px', lineHeight: '1.4' }}>{t(spec.label)}</span>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
           <div style={{ display: 'flex', gap: '8px' }}>
             {(spec.options ?? []).map((option) => {
@@ -1070,12 +1212,12 @@ export function SafeZoneSettings(): ReactElement {
                     fontWeight: active ? 600 : 400,
                   }}
                 >
-                  {option.label}
+                  {t(option.label)}
                 </button>
               )
             })}
           </div>
-          <span style={{ fontSize: '12px', opacity: 0.7, lineHeight: '1.5' }}>{spec.hint}</span>
+          <span style={{ fontSize: '12px', opacity: 0.7, lineHeight: '1.5' }}>{t(spec.hint)}</span>
         </div>
       </div>
     )
@@ -1093,8 +1235,8 @@ export function SafeZoneSettings(): ReactElement {
    */
   const runClean = useCallback(async (): Promise<void> => {
     const activeRemote = currentRemote()
-    if (activeRemote?.mutate === undefined) {
-      setMessage('这个宿主没有暴露设置接口，无法触发清理。')
+    if (form?.mutate === undefined && activeRemote?.mutate === undefined) {
+      setMessage(t('cleanUnavailable'))
       return
     }
     // 清理也写同一个命名空间：与保存/去向共用同步守卫，避免旧 revision 竞争。
@@ -1106,27 +1248,30 @@ export function SafeZoneSettings(): ReactElement {
     try {
       // 用时间戳而不是布尔：连续两次点也能区分（同一个值写两次不会触发变更）。
       const stamp = Date.now()
-      const result = await mutateSettings(activeRemote, [{ op: 'set', path: ['cleanRequestedAt'], value: stamp }])
-      const unwrapped = unwrapRemote(result)
+      const result = await mutateSettings(activeRemote ?? {}, [{ op: 'set', path: ['cleanRequestedAt'], value: stamp }])
+      const unwrapped = form === undefined
+        ? unwrapRemote(result, t('hostRejected'))
+        : result === true
+          ? { ok: true as const, value: result }
+          : { ok: false as const, error: t('hostRejected') }
       if (!unwrapped.ok) {
-        setMessage(`清理请求失败：${unwrapped.error}`)
+        setMessage(t('cleanFailed', { error: unwrapped.error }))
         return
       }
       // 刷新 revision，避免下一次保存撞上冲突。
       try {
-        const refreshed = activeRemote.describe === undefined ? undefined : await activeRemote.describe()
-        if (refreshed !== undefined) {
-          const unwrappedRefresh = unwrapRemote(refreshed)
-          const view = pickNamespace(unwrappedRefresh.ok ? unwrappedRefresh.value : undefined)
-          setRevision((prev) => view.revision === undefined ? prev : Math.max(prev ?? view.revision, view.revision))
+        const view = await readActiveView(activeRemote)
+        if (view?.revision !== undefined) {
+          const next = view.revision
+          setRevision((prev) => Math.max(prev ?? next, next))
         }
       } catch {
         /* revision 刷新失败不影响清理已触发 */
       }
-      setMessage('已提交清理请求：安全区条目正在移入系统回收站。插件会重载一次，稍后刷新即可看到结果。')
+      setMessage(t('cleanSubmitted'))
       setSaved(true)
     } catch (error) {
-      setMessage(`清理请求失败：${error instanceof Error ? error.message : String(error)}`)
+      setMessage(t('cleanFailed', { error: error instanceof Error ? error.message : String(error) }))
     } finally {
       savingRef.current = false
       setCleaning(false)
@@ -1134,7 +1279,7 @@ export function SafeZoneSettings(): ReactElement {
       // 重新走一遍确认，而不是停在那里、再点一下就又发一次请求。
       setConfirmingClean(false)
     }
-  }, [cleaning, revision, mutateSettings])
+  }, [cleaning, form, readActiveView, revision, t, mutateSettings])
 
   /**
    * 状态卡片：加载中/出错也用同一套容器，避免布局跳动。 */
@@ -1159,9 +1304,9 @@ export function SafeZoneSettings(): ReactElement {
       <div style={{ padding: '4px 0' }}>
         {statusCard(
           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <span style={{ fontWeight: 600, fontSize: '14px' }}>安全区设置</span>
+            <span style={{ fontWeight: 600, fontSize: '14px' }}>{t('settingsTitle')}</span>
             <span style={{ fontSize: '12px', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
-              正在读取配置…
+              {t('loading')}
             </span>
           </div>,
         )}
@@ -1173,7 +1318,7 @@ export function SafeZoneSettings(): ReactElement {
       <div style={{ padding: '4px 0' }}>
         {statusCard(
           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <span style={{ fontWeight: 600, fontSize: '14px' }}>安全区设置</span>
+            <span style={{ fontWeight: 600, fontSize: '14px' }}>{t('settingsTitle')}</span>
             <span style={{ fontSize: '12px', lineHeight: '1.6', color: 'var(--dsw-alias-label-secondary, #5c6779)' }}>
               {message}
             </span>
@@ -1226,10 +1371,10 @@ export function SafeZoneSettings(): ReactElement {
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
           <span style={{ fontWeight: 600, fontSize: '13px', color: 'var(--dsw-alias-label-primary, inherit)' }}>
-            安全区设置
+            {t('settingsTitle')}
           </span>
           <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
-            保存后需重启 DSH 生效。
+            {t('restartNotice')}
           </span>
         </div>
 
@@ -1281,12 +1426,12 @@ export function SafeZoneSettings(): ReactElement {
                   lineHeight: '1.4',
                 }}
               >
-                {spec.label}
+                {t(spec.label)}
               </label>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                 <input
                   id={`dsd-${spec.key}`}
-                  aria-label={spec.label}
+                  aria-label={t(spec.label)}
                   aria-invalid={errors[spec.key] !== undefined}
                   value={display}
                   onChange={(event) => setField(spec.key, event.target.value)}
@@ -1313,7 +1458,7 @@ export function SafeZoneSettings(): ReactElement {
                    * 现在缺省时用 `naturalBytesUnit(current)` —— 与显示侧同一个判定。
                    */
                   <select
-                    aria-label={`${spec.label}单位`}
+                    aria-label={t('bytesUnitLabel', { label: t(spec.label) })}
                     value={
                       values[`${spec.key}.unit`] === 'MB' ||
                       values[`${spec.key}.unit`] === 'GB'
@@ -1338,7 +1483,7 @@ export function SafeZoneSettings(): ReactElement {
                   marginTop: '1px',
                 }}
               >
-                {spec.hint}
+                {t(spec.hint)}
               </span>
               {errors[spec.key] !== undefined ? (
                 <span
@@ -1386,7 +1531,7 @@ export function SafeZoneSettings(): ReactElement {
               opacity: saving ? 0.6 : 1,
             }}
           >
-            {saving ? '保存中…' : '保存'}
+            {saving ? t('saving') : t('save')}
           </button>
         ) : null}
         {message !== '' ? (
@@ -1453,6 +1598,7 @@ export function SafeZoneSettings(): ReactElement {
           确认状态在以下情况自动撤销：点"取消"、切换配置项、或 8 秒内没再点。
           最后一条避免用户离开后按钮一直停在"确认"，下次回来误触。
         */}
+        {/* 确定要清空安全区？确认态提供“确定清理”与“取消”。 */}
         {confirmingClean ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
             <span
@@ -1463,7 +1609,7 @@ export function SafeZoneSettings(): ReactElement {
                 color: 'var(--dsw-alias-state-warn-primary, #b45309)',
               }}
             >
-              确定要清空安全区？
+              {t('cleanConfirmPrompt')}
             </span>
             <button
               type="button"
@@ -1482,7 +1628,7 @@ export function SafeZoneSettings(): ReactElement {
                 opacity: cleaning ? 0.6 : 1,
               }}
             >
-              {cleaning ? '清理中…' : '确定清理'}
+              {cleaning ? t('cleaning') : t('cleanConfirm')}
             </button>
             <button
               type="button"
@@ -1500,10 +1646,11 @@ export function SafeZoneSettings(): ReactElement {
                 opacity: cleaning ? 0.6 : 1,
               }}
             >
-              取消
+              {t('cancel')}
             </button>
           </div>
         ) : (
+          // 立即清理安全区：与保存分块，避免被读成另一个保存动作。
           <button
             type="button"
             onClick={() => armClean()}
@@ -1521,11 +1668,11 @@ export function SafeZoneSettings(): ReactElement {
               opacity: status !== 'ready' || cleaning ? 0.55 : 1,
             }}
           >
-            立即清理安全区
+            {t('cleanNow')}
           </button>
         )}
         <span style={{ fontSize: '12px', lineHeight: '1.45', color: 'var(--dsw-alias-label-caption, #8a94a6)' }}>
-          把安全区里的条目全部移入系统回收站。
+          {t('cleanHint')}
         </span>
       </div>
     </div>
@@ -1609,12 +1756,8 @@ export function apply(ctx: ClientContext): void {
       console.error('[dsh-safe-delete] locale.register is unavailable; slot labels may not resolve.')
       return
     }
-    const dictionaries = {
-      zh: { settings: '安全区设置', title: '安全区' },
-      en: { settings: 'Safe-zone settings', title: 'Safe zone' },
-    }
     const register = (): void => {
-      locale.register?.(NAMESPACE, dictionaries)
+      locale.register?.(NAMESPACE, DICTIONARIES)
     }
     if (typeof ctx.effect === 'function') {
       ctx.effect(register, 'dsh-safe-delete: dictionaries')
@@ -1692,8 +1835,11 @@ export function apply(ctx: ClientContext): void {
         return
       }
       try {
-        forms.get(NAMESPACE)
+        // get() 返回服务持有的稳定控制器。必须保留同一对象并让组件订阅它；
+        // 只在挂载时 describe 一次会错过后续配置文档变更。
+        settingsForm = asConfigForm(forms.get(NAMESPACE))
       } catch (error) {
+        settingsForm = undefined
         console.error(`[dsh-safe-delete] configForms.get("${NAMESPACE}") threw:`, error)
       }
 
@@ -1714,10 +1860,10 @@ export function apply(ctx: ClientContext): void {
             key: NAMESPACE,
             locale: NAMESPACE,
           },
-          // 第二个参数必须是**组件函数**，签名 `({ t, view }) => element`。
-          ({ view }: { view?: string }) => {
-            if (view === 'summary') return '安全区设置'
-            return <SafeZoneSettings />
+          // 宿主为这个 locale 命名空间注入 t；文案随宿主语言切换重渲染。
+          ({ t, view }: { t: Translate; view: 'summary' | 'page' }) => {
+            if (view === 'summary') return t('settingsSummary')
+            return <SafeZoneSettings t={t} />
           },
         )
         // 成功用 info 级别（不是 error）：控制台里红字会被读成失败。
