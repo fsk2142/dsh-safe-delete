@@ -35,6 +35,7 @@
       "default": "./lib/tools.js"
     },
     "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
@@ -46,7 +47,9 @@
     "bin/",
     "cordis.patch.yml",
     "locale/",
-    "docs/",
+    "docs/DETAIL.md",
+    "docs/REFERENCE.md",
+    "docs/BOUNDARIES.md",
     "icon.svg",
     "README.md",
     "LICENSE"

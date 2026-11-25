@@ -51,6 +51,11 @@ describe('manifest: what the host needs to find the plugin', () => {
     expect(coversLib).toBe(true)
   })
 
+  it('exposes locale resources through package exports', () => {
+    expect(manifest.exports?.['./locale/*.json']).toBe('./locale/*.json')
+    expect(import.meta.resolve('dsh-safe-delete/locale/en.json')).toMatch(/locale[\\/]en\.json$/)
+  })
+
   it('declares an icon the plugin page can render', () => {
     expect(manifest.icon).toBeTruthy()
   })
