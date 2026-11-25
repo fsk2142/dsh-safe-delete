@@ -11,7 +11,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'dsd-release-stage-'))
   originalCwd = process.cwd()
   execFileSync('git', ['init', '--quiet'], { cwd: root })
-  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+  execFileSync('git', ['config', 'user.email', 'test'], { cwd: root })
   execFileSync('git', ['config', 'user.name', 'test'], { cwd: root })
   mkdirSync(join(root, 'lib'))
   writeFileSync(join(root, 'package.json'), '{"version":"1.0.0"}\n')
